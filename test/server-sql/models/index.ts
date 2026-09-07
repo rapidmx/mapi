@@ -1,0 +1,5 @@
+// Re-exports just the library's SQL model classes MAPI needs so the test Server's ClassLoader (rooted at
+// `test/server-sql`) can discover their `@DataStore` metadata alongside the test routes that use them.
+// Deliberately a NAMED (not wildcard) re-export - see the identical rationale in
+// test/server-mongo/models/index.ts.
+export { CalendarEventSQL, ContactSQL, FolderSQL, MailboxSQL, MessageSQL } from "@rapidmx/restapi/sql";
