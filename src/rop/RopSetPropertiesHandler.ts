@@ -47,6 +47,15 @@ const PID_TAG_DISPLAY_BCC = 0x0e02;
 const PID_TAG_DISPLAY_CC = 0x0e03;
 const PID_TAG_DISPLAY_TO = 0x0e04;
 const PID_TAG_BODY = 0x1000;
+/** `PidTagReadReceiptRequested` (`PT_BOOLEAN`) - a client checking "Request a read receipt" before Submit sets
+ * this; `RopSubmitMessageHandler` reads it back to attach a real `Disposition-Notification-To` header, mirroring
+ * `BaseMessageRoute.send()`'s own explicit-`Message.requestReceipt` handling (see `util/ReceiptUtils.ts`). */
+export const PID_TAG_READ_RECEIPT_REQUESTED = 0x0029;
+/** `PidTagDeferredSendTime` (`PT_SYSTIME`) - real Outlook's "Do not deliver before" compose option;
+ * `RopSubmitMessageHandler` reads it back to defer relay exactly like `BaseMessageRoute.send()`'s own
+ * `Message.scheduledSendTime` branch does (moving the message to Outbox for `ScheduledSendJob` to relay later)
+ * instead of sending immediately. */
+export const PID_TAG_DEFERRED_SEND_TIME = 0x3fef;
 const TRACKED_PROPERTY_IDS: ReadonlySet<number> = new Set([
     PID_TAG_SUBJECT,
     PID_TAG_MESSAGE_CLASS,
@@ -54,6 +63,8 @@ const TRACKED_PROPERTY_IDS: ReadonlySet<number> = new Set([
     PID_TAG_DISPLAY_CC,
     PID_TAG_DISPLAY_TO,
     PID_TAG_BODY,
+    PID_TAG_READ_RECEIPT_REQUESTED,
+    PID_TAG_DEFERRED_SEND_TIME,
 ]);
 
 /** The Calendar named-property LIDs this handler tracks when set under the correct property-set GUID (per

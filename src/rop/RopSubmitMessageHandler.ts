@@ -34,6 +34,8 @@ const PID_TAG_DISPLAY_BCC = 0x0e02;
 const PID_TAG_DISPLAY_CC = 0x0e03;
 const PID_TAG_DISPLAY_TO = 0x0e04;
 const PID_TAG_BODY = 0x1000;
+const PID_TAG_READ_RECEIPT_REQUESTED = 0x0029;
+const PID_TAG_DEFERRED_SEND_TIME = 0x3fef;
 
 /** `PidTagMessageClass` values starting with this prefix (`IPM.Appointment`, `IPM.Appointment.*`) route through
  * `submitAppointment()` instead of the ordinary mail compose/send path below - see that method's own doc
@@ -85,6 +87,14 @@ export function parseAddressList(value: string | undefined): string[] {
  *
  * `SubmitFlags` (`PreprocessOnly`, ...) is decoded to advance past it correctly but not honored - this
  * pragmatic subset has no transport-agent preprocessing distinction to vary by flag.
+ *
+ * **`PidTagDeferredSendTime`** ("Do not deliver before"), if set to a future time via `RopSetProperties`,
+ * parks the message in Outbox with `Message.scheduledSendTime` set instead of relaying immediately - mirroring
+ * `BaseMessageRoute.send()`'s own identical branch - for `ScheduledSendJob` to relay later via this same
+ * `scanAndRelay()` pipeline. **`PidTagReadReceiptRequested`**, if `true`, attaches a real
+ * `Disposition-Notification-To` header (see `util/ReceiptUtils.ts`) and is recorded on the persisted message's
+ * own `requestReceipt` field - honored only when the client explicitly sets it, not this mailbox's
+ * `alwaysRequestReceiptInternal`/`External` defaults (those apply to the REST/webmail compose path only).
  *
  * **Calendar branches**: a draft whose `PidTagMessageClass` starts with `"IPM.Appointment"` is routed to
  * `submitAppointment()` instead of the mail path below - see that method's own doc comment. One starting with
@@ -140,12 +150,74 @@ export class RopSubmitMessageHandler implements RopHandler {
 
         const subject = properties[String(PID_TAG_SUBJECT)] ?? "";
         const bodyText = resolveDraftBody(context, inputHandleIndex, properties);
+        const requestReceipt = properties[String(PID_TAG_READ_RECEIPT_REQUESTED)] === "true";
+        // "Do not deliver before" - a real Outlook compose option, tracked as a plain ISO-8601 string by
+        // RopSetPropertiesHandler.stringifyValue()'s PtypTime encoding.
+        const deferredSendTimeRaw = properties[String(PID_TAG_DEFERRED_SEND_TIME)];
+        const deferredSendTime: Date | undefined = deferredSendTimeRaw ? new Date(deferredSendTimeRaw) : undefined;
+        const isDeferred = deferredSendTime !== undefined && deferredSendTime.getTime() > Date.now();
 
-        const raw: Buffer = await new MailComposer({ from: envelopeFrom, to, cc, bcc, subject, text: bodyText }).compile().build();
+        const raw: Buffer = await new MailComposer({
+            from: envelopeFrom,
+            to,
+            cc,
+            bcc,
+            subject,
+            text: bodyText,
+            // A real Disposition-Notification-To request, mirroring BaseMessageRoute.send()'s own explicit
+            // Message.requestReceipt handling (see util/ReceiptUtils.ts) - honored here only when the client
+            // itself asked for one via PidTagReadReceiptRequested, not this mailbox's own
+            // alwaysRequestReceiptInternal/External defaults (those apply to the REST/webmail compose path,
+            // which already goes through BaseMessageRoute.send() directly).
+            ...(requestReceipt ? { headers: [{ key: "Disposition-Notification-To", value: envelopeFrom }] } : {}),
+        })
+            .compile()
+            .build();
         const envelopeTo = [...to, ...cc, ...bcc];
-        const { sanitizedHtmlBlobKey } = await scanAndRelay(raw, envelopeFrom, envelopeTo, context.scanPipeline, context.mailTransport, context.blobStore);
 
         const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
+        const recipients = [
+            ...to.map((address) => ({ address, type: RecipientType.TO })),
+            ...cc.map((address) => ({ address, type: RecipientType.CC })),
+            ...bcc.map((address) => ({ address, type: RecipientType.BCC })),
+        ];
+
+        if (isDeferred) {
+            // Mirrors BaseMessageRoute.send()'s own scheduledSendTime branch: park the message in Outbox,
+            // unscanned/unrelayed, for the same ScheduledSendJob to pick up and relay (via this exact
+            // scanAndRelay() pipeline) once due - see that job's own doc comment.
+            await context.blobStore.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
+            const outbox = await findOrCreateWellKnownFolder(context.folderRepo, context.folderClass, context.mailboxUid, FolderType.OUTBOX);
+            await context.messageRepo.create(
+                new context.messageClass({
+                    folderUid: outbox.uid,
+                    mailboxUid: context.mailboxUid,
+                    messageId: `${crypto.randomUUID()}@mapi`,
+                    subject,
+                    from: { address: envelopeFrom, type: RecipientType.TO },
+                    recipients,
+                    sentDate: new Date(),
+                    receivedDate: new Date(),
+                    bodyBlobKey,
+                    bodyPreview: bodyText.slice(0, 200),
+                    flags: { read: true, flagged: false, answered: false, forwarded: false },
+                    importance: MessageImportance.NORMAL,
+                    references: [],
+                    hasAttachments: false,
+                    scheduledSendTime: deferredSendTime,
+                    requestReceipt,
+                }),
+                { ignoreACL: true },
+            );
+
+            writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt32LE(0); // ReturnValue - success
+            return;
+        }
+
+        const { sanitizedHtmlBlobKey } = await scanAndRelay(raw, envelopeFrom, envelopeTo, context.scanPipeline, context.mailTransport, context.blobStore);
+
         await context.blobStore.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
         const sentFolder = await findOrCreateWellKnownFolder(context.folderRepo, context.folderClass, context.mailboxUid, FolderType.SENT_ITEMS);
         await context.messageRepo.create(
@@ -155,11 +227,7 @@ export class RopSubmitMessageHandler implements RopHandler {
                 messageId: `${crypto.randomUUID()}@mapi`,
                 subject,
                 from: { address: envelopeFrom, type: RecipientType.TO },
-                recipients: [
-                    ...to.map((address) => ({ address, type: RecipientType.TO })),
-                    ...cc.map((address) => ({ address, type: RecipientType.CC })),
-                    ...bcc.map((address) => ({ address, type: RecipientType.BCC })),
-                ],
+                recipients,
                 sentDate: new Date(),
                 receivedDate: new Date(),
                 bodyBlobKey,
@@ -169,6 +237,7 @@ export class RopSubmitMessageHandler implements RopHandler {
                 importance: MessageImportance.NORMAL,
                 references: [],
                 hasAttachments: false,
+                requestReceipt,
             }),
             { ignoreACL: true },
         );

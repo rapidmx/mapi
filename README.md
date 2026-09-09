@@ -6,9 +6,11 @@
 
 MAPI over HTTP protocol support for a [`@rapidmx/restapi`](https://github.com/RapidMX/restapi)-based mail
 server — covers the pragmatic subset a real Outlook desktop client (and the "New Outlook"/Monarch client, for
-on-prem/hybrid mailboxes) needs: mailbox logon, folder/message browsing, compose/send, full Calendar CRUD
-including meeting invites/responses, deletion, a pragmatic (full-dump, not byte-perfect ICS) incremental
-sync, and a minimal NSPI address-book endpoint (`Bind`/`Unbind`/`GetMatches`) for GAL "search as you type."
+on-prem/hybrid mailboxes) needs: mailbox logon, folder/message browsing, read-only Contacts/Tasks folder
+browsing, compose/send (including deferred/"do not deliver before" send and read-receipt requests), full
+Calendar CRUD including meeting invites/responses, deletion, a pragmatic (full-dump, not byte-perfect ICS)
+incremental sync, and a minimal NSPI address-book endpoint (`Bind`/`Unbind`/`GetMatches`) for GAL "search as
+you type."
 
 Like ActiveSync, it authenticates with the same JWT the rest of a RapidREST app's routes already use — no
 MAPI-specific auth code — which means a real native Outlook client needs an OAuth 2.0 Authorization Server
@@ -20,7 +22,9 @@ less efficiently); no counter-proposals, meeting-forwarding, delegate scheduling
 auto-accept; no DST-aware timezones (fixed-offset approximation only); no recurrence exceptions; no
 `RopModifyRecipients`; no public-folder support; no delegate/shared-mailbox access; no
 rules/permissions/search-folder ROPs; no client-certificate enrollment; NSPI limited to
-`Bind`/`Unbind`/`GetMatches` only.
+`Bind`/`Unbind`/`GetMatches` only; Contacts/Tasks are browse-only (no create/edit via MAPI - use the REST API
+for that); no Focused Inbox (`PidTagInferenceClassification`) exposure, since its real wire encoding isn't
+publicly documented closely enough to implement with confidence.
 
 A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets real Outlook clients find
 this package's endpoints from just an email address.

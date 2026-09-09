@@ -97,6 +97,62 @@ describe("RopOpenMessageHandler Tests", () => {
         expect((context.calendarEventRepo as any).findOne).toHaveBeenCalledWith("evt1", { ignoreACL: true });
     });
 
+    it("Opens a known MID for a contact target, using the contact's displayName as the subject.", async () => {
+        const context = makeContext({ "1": "contact:c1" });
+        context.contactRepo = { findOne: vi.fn().mockResolvedValue({ uid: "c1", displayName: "Jane Doe" }) } as any;
+        const handler = new RopOpenMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ outputHandleIndex: 5, messageId: 1n })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8(); // RopId
+        response.readUInt8(); // OutputHandleIndex
+        expect(response.readUInt32LE()).toBe(0); // ReturnValue
+        response.readUInt8(); // HasNamedProperties
+        expect(readTypedString(response)).toBeUndefined(); // SubjectPrefix
+        expect(readTypedString(response)).toBe("Jane Doe"); // NormalizedSubject
+
+        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "contact:c1" });
+        expect((context.contactRepo as any).findOne).toHaveBeenCalledWith("c1", { ignoreACL: true });
+    });
+
+    it("Opens a contact target as an empty subject when contactRepo is absent from the context.", async () => {
+        const context = makeContext({ "1": "contact:c1" });
+        const handler = new RopOpenMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ outputHandleIndex: 5, messageId: 1n })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        response.readUInt32LE();
+        response.readUInt8();
+        expect(readTypedString(response)).toBeUndefined(); // SubjectPrefix
+        expect(readTypedString(response)).toBe(""); // NormalizedSubject falls back to empty
+    });
+
+    it("Opens a known MID for a task target, using the task's title as the subject.", async () => {
+        const context = makeContext({ "1": "task:t1" });
+        context.taskRepo = { findOne: vi.fn().mockResolvedValue({ uid: "t1", title: "Ship it" }) } as any;
+        const handler = new RopOpenMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ outputHandleIndex: 5, messageId: 1n })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0);
+        response.readUInt8();
+        expect(readTypedString(response)).toBeUndefined();
+        expect(readTypedString(response)).toBe("Ship it");
+
+        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "task:t1" });
+        expect((context.taskRepo as any).findOne).toHaveBeenCalledWith("t1", { ignoreACL: true });
+    });
+
     it("Returns MAPI_E_NOT_FOUND for an unrecognized MID, without creating a handle.", async () => {
         const context = makeContext({});
         const handler = new RopOpenMessageHandler();

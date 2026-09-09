@@ -26,6 +26,14 @@ import type { MapiSessionContext } from "../MapiSessionManager.js";
  * `messageRepo.create()` calls when persisting a submitted message's Sent Items copy. `scanPipeline`/
  * `mailTransport` back the same `scanAndRelay()` compose/send pipeline `BaseMessageRoute.send()`/EAS's
  * `ComposeMailCommand` already share via `MailSendUtils.ts`.
+ *
+ * `contactRepo`/`taskRepo`/`contactClass`/`taskClass` are **optional**, unlike every other repo/class pair
+ * here - `BaseMapiEmsmdbRoute` always populates them in real use (see its own `@Init`), but making them
+ * required would force every one of this codebase's many existing `RopContext`-literal test fixtures (most
+ * predating Contacts/Tasks folder support) to grow four new fields each for no behavioral reason. Every
+ * consumer (`PropertyResolvers.ts`, `RopGetContentsTableHandler.ts`, `RopOpenMessageHandler.ts`) already
+ * degrades a `"contact:"`/`"task:"` target to empty/no-rows when the corresponding repo is absent, the same
+ * "missing data, not a crash" stance `resolveContactInfo`/`resolveTaskInfo` take for a vanished row.
  */
 export interface RopContext {
     mailboxUid: string;
@@ -35,9 +43,13 @@ export interface RopContext {
     folderRepo: RepoUtils<any>;
     messageRepo: RepoUtils<any>;
     calendarEventRepo: RepoUtils<any>;
+    contactRepo?: RepoUtils<any>;
+    taskRepo?: RepoUtils<any>;
     folderClass: any;
     messageClass: any;
     calendarEventClass: any;
+    contactClass?: any;
+    taskClass?: any;
     blobStore: BlobStore;
     scanPipeline: ScanPipeline;
     mailTransport: any;

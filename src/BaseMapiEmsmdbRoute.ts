@@ -71,6 +71,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
     protected abstract folderClass: any;
     protected abstract messageClass: any;
     protected abstract calendarEventClass: any;
+    protected abstract contactClass: any;
+    protected abstract taskClass: any;
 
     /** ROP handler classes to instantiate (one each) in `@Init`, keyed by their own `ropId`. Empty until a
      * concrete `RopHandler` lands - every ROP is then simply left unprocessed (see `RopDispatcher`'s own doc
@@ -84,6 +86,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
     private folderRepo?: RepoUtils<Folder>;
     private messageRepo?: RepoUtils<any>;
     private calendarEventRepo?: RepoUtils<any>;
+    private contactRepo?: RepoUtils<any>;
+    private taskRepo?: RepoUtils<any>;
     private sessionManager?: MapiSessionManager;
     private readonly ropHandlers = new Map<number, RopHandler>();
 
@@ -117,6 +121,14 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             name: this.calendarEventClass.name,
             args: [this.calendarEventClass],
         });
+        this.contactRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+            name: this.contactClass.name,
+            args: [this.contactClass],
+        });
+        this.taskRepo = await this._objectFactory!.newInstance(RecoverableRepoUtils, {
+            name: this.taskClass.name,
+            args: [this.taskClass],
+        });
         this.sessionManager = await this._objectFactory!.newInstance(MapiSessionManager);
         for (const HandlerClass of this.ropHandlerClasses) {
             const handler: RopHandler = await this._objectFactory!.newInstance(HandlerClass);
@@ -136,6 +148,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             !this.folderRepo ||
             !this.messageRepo ||
             !this.calendarEventRepo ||
+            !this.contactRepo ||
+            !this.taskRepo ||
             !this.sessionManager ||
             !this.blobStore ||
             !this.scanPipeline ||
@@ -251,9 +265,13 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             folderRepo: this.folderRepo!,
             messageRepo: this.messageRepo!,
             calendarEventRepo: this.calendarEventRepo!,
+            contactRepo: this.contactRepo!,
+            taskRepo: this.taskRepo!,
             folderClass: this.folderClass,
             messageClass: this.messageClass,
             calendarEventClass: this.calendarEventClass,
+            contactClass: this.contactClass,
+            taskClass: this.taskClass,
             blobStore: this.blobStore!,
             scanPipeline: this.scanPipeline!,
             mailTransport: this.mailTransport!,

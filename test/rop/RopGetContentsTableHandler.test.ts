@@ -103,6 +103,134 @@ describe("RopGetContentsTableHandler Tests", () => {
         expect(messageRepo.find).not.toHaveBeenCalled();
     });
 
+    it("Creates a table handle listing a CONTACTS folder's contacts, resolved via the contact repo instead of the message repo.", async () => {
+        const messageRepo = { find: vi.fn() };
+        const contactRepo = {
+            find: vi.fn().mockResolvedValue([
+                { uid: "c1", folderUid: "contacts1" },
+                { uid: "c2", folderUid: "contacts1" },
+            ]),
+        };
+        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "contacts1", type: "contacts" }) };
+        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+        session.handles[5] = { type: "folder", entityUid: "folder:contacts1" };
+        const context: RopContext = {
+            mailboxUid: "mailbox-1",
+            userUid: "user-1",
+            session,
+            folderRepo: folderRepo as any,
+            messageRepo: messageRepo as any,
+            calendarEventRepo: {} as any,
+            contactRepo: contactRepo as any,
+            mailboxRepo: {} as any,
+            folderClass: {} as any,
+            messageClass: {} as any,
+            calendarEventClass: {} as any,
+            scanPipeline: {} as any,
+            mailTransport: {} as any,
+            blobStore: {} as any,
+        };
+
+        const handler = new RopGetContentsTableHandler();
+        const writer = new BufferWriter();
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(session.handles[6]?.rows).toEqual(["contact:c1", "contact:c2"]);
+        expect(contactRepo.find).toHaveBeenCalledWith({ folderUid: "contacts1" }, { ignoreACL: true });
+        expect(messageRepo.find).not.toHaveBeenCalled();
+    });
+
+    it("Returns an empty table for a CONTACTS folder when contactRepo is absent from the context.", async () => {
+        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "contacts1", type: "contacts" }) };
+        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+        session.handles[5] = { type: "folder", entityUid: "folder:contacts1" };
+        const context: RopContext = {
+            mailboxUid: "mailbox-1",
+            userUid: "user-1",
+            session,
+            folderRepo: folderRepo as any,
+            messageRepo: {} as any,
+            calendarEventRepo: {} as any,
+            mailboxRepo: {} as any,
+            folderClass: {} as any,
+            messageClass: {} as any,
+            calendarEventClass: {} as any,
+            scanPipeline: {} as any,
+            mailTransport: {} as any,
+            blobStore: {} as any,
+        };
+
+        const handler = new RopGetContentsTableHandler();
+        const writer = new BufferWriter();
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(session.handles[6]?.rows).toEqual([]);
+    });
+
+    it("Creates a table handle listing a TASKS folder's tasks, resolved via the task repo instead of the message repo.", async () => {
+        const messageRepo = { find: vi.fn() };
+        const taskRepo = {
+            find: vi.fn().mockResolvedValue([
+                { uid: "t1", folderUid: "tasks1" },
+                { uid: "t2", folderUid: "tasks1" },
+            ]),
+        };
+        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "tasks1", type: "tasks" }) };
+        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+        session.handles[5] = { type: "folder", entityUid: "folder:tasks1" };
+        const context: RopContext = {
+            mailboxUid: "mailbox-1",
+            userUid: "user-1",
+            session,
+            folderRepo: folderRepo as any,
+            messageRepo: messageRepo as any,
+            calendarEventRepo: {} as any,
+            taskRepo: taskRepo as any,
+            mailboxRepo: {} as any,
+            folderClass: {} as any,
+            messageClass: {} as any,
+            calendarEventClass: {} as any,
+            scanPipeline: {} as any,
+            mailTransport: {} as any,
+            blobStore: {} as any,
+        };
+
+        const handler = new RopGetContentsTableHandler();
+        const writer = new BufferWriter();
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(session.handles[6]?.rows).toEqual(["task:t1", "task:t2"]);
+        expect(taskRepo.find).toHaveBeenCalledWith({ folderUid: "tasks1" }, { ignoreACL: true });
+        expect(messageRepo.find).not.toHaveBeenCalled();
+    });
+
+    it("Returns an empty table for a TASKS folder when taskRepo is absent from the context.", async () => {
+        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "tasks1", type: "tasks" }) };
+        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+        session.handles[5] = { type: "folder", entityUid: "folder:tasks1" };
+        const context: RopContext = {
+            mailboxUid: "mailbox-1",
+            userUid: "user-1",
+            session,
+            folderRepo: folderRepo as any,
+            messageRepo: {} as any,
+            calendarEventRepo: {} as any,
+            mailboxRepo: {} as any,
+            folderClass: {} as any,
+            messageClass: {} as any,
+            calendarEventClass: {} as any,
+            scanPipeline: {} as any,
+            mailTransport: {} as any,
+            blobStore: {} as any,
+        };
+
+        const handler = new RopGetContentsTableHandler();
+        const writer = new BufferWriter();
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(session.handles[6]?.rows).toEqual([]);
+    });
+
     it("Returns an empty table for a virtual folder, without querying the message repo.", async () => {
         const messageRepo = { find: vi.fn() };
         const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });

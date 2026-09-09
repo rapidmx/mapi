@@ -25,10 +25,21 @@ import {
     RESPONSE_STATUS_ORGANIZED,
 } from "./CalendarNamedProperties.js";
 import { CalendarEventTargetInfo, resolveCalendarEventInfo } from "./CalendarEventTarget.js";
+import { ContactTargetInfo, resolveContactInfo } from "./ContactTarget.js";
 import { assignOrGetFid, FolderTargetInfo, resolveFolderInfo } from "./FolderTarget.js";
 import { assignOrGetMid, MessageTargetInfo, resolveMessageInfo } from "./MessageTarget.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
 import type { RopContext } from "./RopHandler.js";
+import {
+    LID_PERCENT_COMPLETE,
+    LID_TASK_COMPLETE,
+    LID_TASK_DUE_DATE,
+    LID_TASK_STATUS,
+    PSETID_TASK,
+    TASK_STATUS_COMPLETE,
+    TASK_STATUS_NOT_STARTED,
+} from "./TaskNamedProperties.js";
+import { resolveTaskInfo, TaskTargetInfo } from "./TaskTarget.js";
 
 // Well-known folder property IDs this pragmatic subset supports - the small set a real client needs to render
 // a folder-hierarchy view. Add more as a real need arises, not speculatively.
@@ -47,6 +58,15 @@ const PID_TAG_MESSAGE_DELIVERY_TIME = 0x0e06;
 const PID_TAG_MID = 0x674a;
 /** `MSGFLAG_READ`, the one `PidTagMessageFlags` bit this pragmatic subset ever sets. */
 const MSGFLAG_READ = 0x01;
+
+// Well-known Contact property IDs this pragmatic subset supports - all plain (non-named) PidTags, per
+// [MS-OXOCNTC], since a Contact needs no PSETID/LID lookup the way Calendar/Task properties do.
+const PID_TAG_GIVEN_NAME = 0x3a06;
+const PID_TAG_SURNAME = 0x3a11;
+const PID_TAG_EMAIL_ADDRESS = 0x3003;
+const PID_TAG_BUSINESS_TELEPHONE_NUMBER = 0x3a08;
+const PID_TAG_COMPANY_NAME = 0x3a16;
+const PID_TAG_TITLE = 0x3a17;
 
 // Calendar named-property identity (`(PropertySet GUID, LID)` pairs) this pragmatic subset supports - see
 // CalendarNamedProperties.ts's own doc comment. A calendar item's property IDs `>= 0x8000` are resolved back
@@ -204,21 +224,103 @@ function responseStatusFor(info: CalendarEventTargetInfo, callerAddress: string)
     return attendee ? RESPONSE_STATUS_CODES[attendee.responseStatus] : RESPONSE_STATUS_NONE;
 }
 
+/** Resolves one requested property's value for a `"contact:<uid>"` target - a `Folder` of type `CONTACTS`'s
+ * content-table rows/opened items. Every field here is a plain fixed `PidTag` (`[MS-OXOCNTC]`), unlike Calendar/
+ * Task's named-property tables, since Contact's own well-known fields all have real numeric IDs. */
+export function contactValueFor(
+    session: MapiSessionContext,
+    propertyId: number,
+    propertyType: PropertyType,
+    target: string,
+    info: ContactTargetInfo,
+): PropertyValueData {
+    switch (propertyId) {
+        case PID_TAG_SUBJECT:
+            return info.displayName;
+        case PID_TAG_MID:
+            return BigInt(assignOrGetMid(session, target));
+        case PID_TAG_GIVEN_NAME:
+            return info.givenName ?? "";
+        case PID_TAG_SURNAME:
+            return info.surname ?? "";
+        case PID_TAG_EMAIL_ADDRESS:
+            return info.email ?? "";
+        case PID_TAG_BUSINESS_TELEPHONE_NUMBER:
+            return info.businessPhone ?? "";
+        case PID_TAG_COMPANY_NAME:
+            return info.companyName ?? "";
+        case PID_TAG_TITLE:
+            return info.jobTitle ?? "";
+        default:
+            return defaultValueForType(propertyType);
+    }
+}
+
+/** Resolves one requested property's value for a `"task:<uid>"` target - a `Folder` of type `TASKS`'s
+ * content-table rows/opened items. Almost every Task-specific property is a *named* property (`PidLid*`) under
+ * `PSETID_Task`, resolved back to its `(PropertySet GUID, LID)` identity via `resolveNamedProperty` exactly the
+ * same way `calendarEventValueFor` handles `PSETID_Appointment`/`PSETID_Common` - see `TaskNamedProperties.ts`'s
+ * own doc comment for the LID table this switch implements. */
+export function taskValueFor(
+    session: MapiSessionContext,
+    propertyId: number,
+    propertyType: PropertyType,
+    target: string,
+    info: TaskTargetInfo,
+): PropertyValueData {
+    if (propertyId === PID_TAG_SUBJECT) {
+        return info.title;
+    }
+    if (propertyId === PID_TAG_MID) {
+        return BigInt(assignOrGetMid(session, target));
+    }
+    if (propertyId < 0x8000) {
+        return defaultValueForType(propertyType);
+    }
+
+    const namedProperty = resolveNamedProperty(session, propertyId);
+    if (!namedProperty || namedProperty.kind !== "lid" || namedProperty.guid.toLowerCase() !== PSETID_TASK) {
+        return defaultValueForType(propertyType);
+    }
+
+    switch (namedProperty.lid) {
+        case LID_TASK_STATUS:
+            return info.completed ? TASK_STATUS_COMPLETE : TASK_STATUS_NOT_STARTED;
+        case LID_PERCENT_COMPLETE:
+            return info.completed ? 1.0 : 0.0;
+        case LID_TASK_DUE_DATE:
+            return info.dueDate ?? defaultValueForType(propertyType);
+        case LID_TASK_COMPLETE:
+            return info.completed;
+        default:
+            return defaultValueForType(propertyType);
+    }
+}
+
 /** Resolves every column in `columns` for a single `target` (a `"folder:"`/`"virtual:"`/`"message:"`/
- * `"calendarEvent:"` target string), in order - the shared implementation behind both `RopQueryRowsHandler`
- * (one call per table row) and `RopGetPropertiesSpecificHandler` (one call for the single object a handle
- * refers to). */
+ * `"calendarEvent:"`/`"contact:"`/`"task:"` target string), in order - the shared implementation behind both
+ * `RopQueryRowsHandler` (one call per table row) and `RopGetPropertiesSpecificHandler` (one call for the single
+ * object a handle refers to). */
 export async function resolvePropertyValues(
     target: string,
     columns: { propertyId: number; propertyType: PropertyType }[],
-    context: Pick<RopContext, "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo">,
+    context: Pick<
+        RopContext,
+        "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo" | "contactRepo" | "taskRepo"
+    >,
 ): Promise<PropertyValueData[]> {
     const isMessage = target.startsWith("message:");
     const isCalendarEvent = target.startsWith("calendarEvent:");
+    const isContact = target.startsWith("contact:");
+    const isTask = target.startsWith("task:");
     const folderInfo =
-        isMessage || isCalendarEvent ? undefined : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo);
+        isMessage || isCalendarEvent || isContact || isTask
+            ? undefined
+            : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo);
     const messageInfo = isMessage ? await resolveMessageInfo(target, context.messageRepo) : undefined;
     const calendarEventInfo = isCalendarEvent ? await resolveCalendarEventInfo(target, context.calendarEventRepo) : undefined;
+    const contactInfo = isContact && context.contactRepo ? await resolveContactInfo(target, context.contactRepo) : undefined;
+    const taskInfo = isTask && context.taskRepo ? await resolveTaskInfo(target, context.taskRepo) : undefined;
 
     let callerAddress = "";
     if (isCalendarEvent) {
@@ -230,8 +332,21 @@ export async function resolvePropertyValues(
         if (calendarEventInfo) {
             return calendarEventValueFor(context.session, column.propertyId, column.propertyType, target, calendarEventInfo, callerAddress);
         }
+        if (contactInfo) {
+            return contactValueFor(context.session, column.propertyId, column.propertyType, target, contactInfo);
+        }
+        if (taskInfo) {
+            return taskValueFor(context.session, column.propertyId, column.propertyType, target, taskInfo);
+        }
         if (messageInfo) {
             return messageValueFor(context.session, column.propertyId, column.propertyType, target, messageInfo);
+        }
+        if (isContact || isTask) {
+            // contactRepo/taskRepo absent (see RopHandler.ts's own doc comment on why they're optional) - no
+            // real data to resolve against, so every column degrades to its type-appropriate default rather
+            // than falling through to the folder-info branch below (folderInfo is never populated for these
+            // target prefixes, see above - forcing that branch would throw on the `!` assertion).
+            return defaultValueForType(column.propertyType);
         }
         return folderValueFor(context.session, column.propertyId, column.propertyType, target, folderInfo!);
     });

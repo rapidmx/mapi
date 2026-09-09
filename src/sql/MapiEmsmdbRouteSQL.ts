@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { CalendarEventSQL, FolderSQL, MailboxSQL, MessageSQL } from "@rapidmx/restapi/sql";
+import { CalendarEventSQL, ContactSQL, FolderSQL, MailboxSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
 import { BaseMapiEmsmdbRoute } from "../BaseMapiEmsmdbRoute.js";
 import { RopLogonHandler } from "../rop/RopLogonHandler.js";
 import { RopReleaseHandler } from "../rop/RopReleaseHandler.js";
@@ -38,6 +38,8 @@ export class MapiEmsmdbRouteSQL extends BaseMapiEmsmdbRoute<MailboxSQL> {
     protected folderClass: any = FolderSQL;
     protected messageClass: any = MessageSQL;
     protected calendarEventClass: any = CalendarEventSQL;
+    protected contactClass: any = ContactSQL;
+    protected taskClass: any = TaskSQL;
     protected ropHandlerClasses: any[] = [
         RopLogonHandler,
         RopReleaseHandler,

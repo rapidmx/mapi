@@ -21,7 +21,7 @@
         "release": "rapidrest release"
     },
     "peerDependencies": {
-        "@rapidmx/restapi": "0.1.x",
+        "@rapidmx/restapi": "^0.3.0",
         "@rapidrest/core": "5.x",
         "@rapidrest/service-core": "1.x"
     },
@@ -30,7 +30,7 @@
         "nodemailer": "^10.0.1"
     },
     "devDependencies": {
-        "@rapidmx/restapi": "^0.3.0",
+        "@rapidmx/restapi": "^0.3.1",
         "@rapidrest/cli": "^1.0.1",
         "@rapidrest/core": "^5.2.2",
         "@rapidrest/service-core": "^1.7.2",

@@ -24,6 +24,11 @@ function makeScanPipeline() {
             spam: { verdict: SpamVerdict.CLEAN },
             av: { verdict: AvVerdict.CLEAN },
             attachments: [],
+            // @rapidmx/restapi ^0.3.0's scanAndRelay() unconditionally derives a conversationId from these -
+            // a real ScanPipeline.run() always populates them (see restapi's ScanPipelineResult), so this
+            // mock must too, or deriveConversationId()'s references[0] throws on undefined.
+            references: [],
+            inReplyTo: undefined,
         }),
     };
 }
@@ -231,6 +236,103 @@ describe("RopSubmitMessageHandler Tests", () => {
         const [rawSent] = scanPipeline.run.mock.calls[0];
         const parsed = await simpleParser(rawSent as Buffer);
         expect(parsed.text?.trim()).toBe(streamText);
+    });
+
+    it("Attaches a Disposition-Notification-To header and records requestReceipt when PidTagReadReceiptRequested is true.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            draftProperties: { "55": "Subj", "3588": "to@example.com", "41": "true" },
+        };
+        const handler = new RopSubmitMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const scanPipeline = context.scanPipeline as any;
+        const [rawSent] = scanPipeline.run.mock.calls[0];
+        const parsed = await simpleParser(rawSent as Buffer);
+        expect(parsed.headers.get("disposition-notification-to")).toMatchObject({ value: [{ address: "owner@example.com" }] });
+
+        const messageRepo = context.messageRepo as any;
+        const [savedMessage] = messageRepo.create.mock.calls[0];
+        expect(savedMessage.requestReceipt).toBe(true);
+    });
+
+    it("Does not attach a Disposition-Notification-To header when PidTagReadReceiptRequested is absent.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            draftProperties: { "55": "Subj", "3588": "to@example.com" },
+        };
+        const handler = new RopSubmitMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const scanPipeline = context.scanPipeline as any;
+        const [rawSent] = scanPipeline.run.mock.calls[0];
+        const parsed = await simpleParser(rawSent as Buffer);
+        expect(parsed.headers.get("disposition-notification-to")).toBeUndefined();
+
+        const messageRepo = context.messageRepo as any;
+        const [savedMessage] = messageRepo.create.mock.calls[0];
+        expect(savedMessage.requestReceipt).toBe(false);
+    });
+
+    it("Defers relay when PidTagDeferredSendTime is in the future, parking the message in Outbox instead of sending.", async () => {
+        const context = makeContext();
+        const future = new Date(Date.now() + 60 * 60 * 1000);
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            draftProperties: {
+                "55": "Later",
+                "3588": "to@example.com",
+                "16367": future.toISOString(),
+            },
+        };
+        const handler = new RopSubmitMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        expect(response.readUInt8()).toBe(0x32);
+        expect(response.readUInt8()).toBe(5);
+        expect(response.readUInt32LE()).toBe(0); // ReturnValue - success
+
+        expect((context.scanPipeline as any).run).not.toHaveBeenCalled();
+        expect(context.mailTransport.send).not.toHaveBeenCalled();
+
+        const messageRepo = context.messageRepo as any;
+        expect(messageRepo.create).toHaveBeenCalledTimes(1);
+        const [savedMessage] = messageRepo.create.mock.calls[0];
+        expect(savedMessage.subject).toBe("Later");
+        expect(savedMessage.scheduledSendTime).toEqual(future);
+    });
+
+    it("Sends immediately when PidTagDeferredSendTime is already in the past.", async () => {
+        const context = makeContext();
+        const past = new Date(Date.now() - 60 * 60 * 1000);
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            draftProperties: {
+                "55": "Now",
+                "3588": "to@example.com",
+                "16367": past.toISOString(),
+            },
+        };
+        const handler = new RopSubmitMessageHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect((context.scanPipeline as any).run).toHaveBeenCalledTimes(1);
+        expect(context.mailTransport.send).toHaveBeenCalledTimes(1);
     });
 
     describe("Calendar branch (PidTagMessageClass starts with IPM.Appointment)", () => {

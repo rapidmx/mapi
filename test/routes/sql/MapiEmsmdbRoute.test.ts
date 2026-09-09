@@ -9,7 +9,7 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource, ACLAction, A
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
-import { FolderSQL, MailboxSQL, MessageSQL } from "@rapidmx/restapi/sql";
+import { ContactSQL, FolderSQL, MailboxSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
 import { FolderType, MessageImportance, RecipientType } from "@rapidmx/restapi";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 import { cookieHeaderFrom, mapiRequest } from "../../mapiTestClient.js";
@@ -26,6 +26,8 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
     let mailboxRepo: Repository<MailboxSQL>;
     let folderRepo: Repository<FolderSQL>;
     let messageRepo: Repository<MessageSQL>;
+    let contactRepo: Repository<ContactSQL>;
+    let taskRepo: Repository<TaskSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -82,6 +84,16 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         );
     };
 
+    const createContact = async function (mailboxUid: string, folderUid: string, data?: Partial<ContactSQL>): Promise<ContactSQL> {
+        return await contactRepo.save(
+            new ContactSQL({ mailboxUid, folderUid, displayName: "Test Contact", emails: [], phones: [], addresses: [], ...data } as any),
+        );
+    };
+
+    const createTask = async function (mailboxUid: string, folderUid: string, data?: Partial<TaskSQL>): Promise<TaskSQL> {
+        return await taskRepo.save(new TaskSQL({ mailboxUid, folderUid, title: "Test Task", ...data } as any));
+    };
+
     const execute = async function (cookie: string, ropBuffer: Buffer) {
         const body = new BufferWriter();
         body.writeUInt32LE(0);
@@ -133,6 +145,8 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
             mailboxRepo = conn.getRepository(MailboxSQL);
             folderRepo = conn.getRepository(FolderSQL);
             messageRepo = conn.getRepository(MessageSQL);
+            contactRepo = conn.getRepository(ContactSQL);
+            taskRepo = conn.getRepository(TaskSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -153,6 +167,8 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         await mailboxRepo.clear();
         await folderRepo.clear();
         await messageRepo.clear();
+        await contactRepo.clear();
+        await taskRepo.clear();
         await aclRepo.clear();
     });
 
@@ -441,6 +457,222 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
             subjects.push(readPropertyValue(rowsReader, PropertyType.PtypString) as string);
         }
         expect(subjects.sort()).toEqual(["Hello World", "Second Message"]);
+    });
+
+    /** Discovers `wellKnownFolderName`'s real FID via the root folder's own hierarchy table - Contacts/Tasks
+     * aren't part of RopLogon's fixed 13-folder `FolderIds` list (see RopLogonHandler's own doc comment), so a
+     * real client (and this test) finds them the same way it finds any other top-level folder: OpenFolder(root)
+     * -> GetHierarchyTable -> SetColumns([DisplayName, FolderId]) -> QueryRows. */
+    async function discoverFolderId(cookie: string, wellKnownFolderName: string): Promise<bigint> {
+        const logonRops = new BufferWriter();
+        logonRops.writeUInt8(0xfe);
+        logonRops.writeUInt8(0);
+        logonRops.writeUInt8(0);
+        logonRops.writeUInt8(0x01);
+        logonRops.writeUInt32LE(0);
+        logonRops.writeUInt32LE(0);
+        logonRops.writeUInt16LE(0);
+        const logonResult = await execute(cookie, encodeRopBuffer({ ropsList: logonRops.toBuffer(), handleTable: [0xffffffff] }));
+        const logonReader = new BufferReader(logonResult.body);
+        logonReader.readUInt32LE();
+        logonReader.readUInt32LE();
+        logonReader.readUInt32LE();
+        const { ropsList: logonRopsList } = decodeRopBuffer(logonReader.readBytes(logonReader.readUInt32LE()));
+        const logonRopsReader = new BufferReader(logonRopsList);
+        logonRopsReader.readUInt8();
+        logonRopsReader.readUInt8();
+        logonRopsReader.readUInt32LE();
+        logonRopsReader.readUInt8();
+        const rootFid = logonRopsReader.readBigUInt64LE();
+
+        const openFolderRops = new BufferWriter();
+        openFolderRops.writeUInt8(0x02);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeUInt8(0); // InputHandleIndex (logon)
+        openFolderRops.writeUInt8(1); // OutputHandleIndex
+        openFolderRops.writeUInt8(0); // OpenModeFlags
+        openFolderRops.writeBigUInt64LE(rootFid);
+        await execute(cookie, encodeRopBuffer({ ropsList: openFolderRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff] }));
+
+        const tableRops = new BufferWriter();
+        tableRops.writeUInt8(0x04);
+        tableRops.writeUInt8(0);
+        tableRops.writeUInt8(1); // InputHandleIndex (folder)
+        tableRops.writeUInt8(2); // OutputHandleIndex
+        tableRops.writeUInt8(0); // TableFlags
+        await execute(cookie, encodeRopBuffer({ ropsList: tableRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+
+        const setColumnsRops = new BufferWriter();
+        setColumnsRops.writeUInt8(0x12);
+        setColumnsRops.writeUInt8(0);
+        setColumnsRops.writeUInt8(2); // InputHandleIndex (table)
+        setColumnsRops.writeUInt8(0); // SetColumnsFlags
+        setColumnsRops.writeUInt16LE(2);
+        writePropertyTag(setColumnsRops, { propertyId: 0x3001, propertyType: PropertyType.PtypString }); // DisplayName
+        writePropertyTag(setColumnsRops, { propertyId: 0x6748, propertyType: PropertyType.PtypInteger64 }); // FolderId
+        await execute(cookie, encodeRopBuffer({ ropsList: setColumnsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsRops = new BufferWriter();
+        queryRowsRops.writeUInt8(0x15);
+        queryRowsRops.writeUInt8(0);
+        queryRowsRops.writeUInt8(2); // InputHandleIndex (table)
+        queryRowsRops.writeUInt8(0); // QueryRowsFlags
+        queryRowsRops.writeUInt8(1); // ForwardRead
+        queryRowsRops.writeUInt16LE(10);
+        const queryRowsResult = await execute(cookie, encodeRopBuffer({ ropsList: queryRowsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsReader = new BufferReader(queryRowsResult.body);
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        const { ropsList: queryRowsList } = decodeRopBuffer(queryRowsReader.readBytes(queryRowsReader.readUInt32LE()));
+        const rowsReader = new BufferReader(queryRowsList);
+        rowsReader.readUInt8();
+        rowsReader.readUInt8();
+        rowsReader.readUInt32LE();
+        rowsReader.readUInt8();
+        const rowCount = rowsReader.readUInt16LE();
+        for (let i = 0; i < rowCount; i++) {
+            rowsReader.readUInt8(); // PropertyRow Flags
+            const name = readPropertyValue(rowsReader, PropertyType.PtypString) as string;
+            const fid = readPropertyValue(rowsReader, PropertyType.PtypInteger64) as bigint;
+            if (name === wellKnownFolderName) {
+                return fid;
+            }
+        }
+        throw new Error(`Folder named "${wellKnownFolderName}" was not found in the root hierarchy table.`);
+    }
+
+    it("Lists a CONTACTS folder's contacts end to end, resolved by displayName via ContactTarget.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const contactsFolder = await createFolder(mailbox.uid, FolderType.CONTACTS, "Contacts");
+        await createContact(mailbox.uid, contactsFolder.uid, { displayName: "Jane Doe" });
+        await createContact(mailbox.uid, contactsFolder.uid, { displayName: "John Smith" });
+        const connectResult = await connect();
+        const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+
+        const contactsFid = await discoverFolderId(cookie, "Contacts");
+
+        const openFolderRops = new BufferWriter();
+        openFolderRops.writeUInt8(0x02);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeUInt8(0); // InputHandleIndex (logon)
+        openFolderRops.writeUInt8(3); // OutputHandleIndex
+        openFolderRops.writeUInt8(0); // OpenModeFlags
+        openFolderRops.writeBigUInt64LE(contactsFid);
+        await execute(cookie, encodeRopBuffer({ ropsList: openFolderRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff] }));
+
+        const tableRops = new BufferWriter();
+        tableRops.writeUInt8(0x05);
+        tableRops.writeUInt8(0);
+        tableRops.writeUInt8(3); // InputHandleIndex (folder)
+        tableRops.writeUInt8(4); // OutputHandleIndex
+        tableRops.writeUInt8(0); // TableFlags
+        await execute(cookie, encodeRopBuffer({ ropsList: tableRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+
+        const setColumnsRops = new BufferWriter();
+        setColumnsRops.writeUInt8(0x12);
+        setColumnsRops.writeUInt8(0);
+        setColumnsRops.writeUInt8(4); // InputHandleIndex (table)
+        setColumnsRops.writeUInt8(0); // SetColumnsFlags
+        setColumnsRops.writeUInt16LE(1);
+        writePropertyTag(setColumnsRops, { propertyId: 0x0037, propertyType: PropertyType.PtypString }); // PidTagSubject -> displayName
+        await execute(cookie, encodeRopBuffer({ ropsList: setColumnsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsRops = new BufferWriter();
+        queryRowsRops.writeUInt8(0x15);
+        queryRowsRops.writeUInt8(0);
+        queryRowsRops.writeUInt8(4); // InputHandleIndex (table)
+        queryRowsRops.writeUInt8(0); // QueryRowsFlags
+        queryRowsRops.writeUInt8(1); // ForwardRead
+        queryRowsRops.writeUInt16LE(10);
+        const queryRowsResult = await execute(cookie, encodeRopBuffer({ ropsList: queryRowsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsReader = new BufferReader(queryRowsResult.body);
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        const { ropsList: queryRowsList } = decodeRopBuffer(queryRowsReader.readBytes(queryRowsReader.readUInt32LE()));
+        const rowsReader = new BufferReader(queryRowsList);
+        rowsReader.readUInt8();
+        rowsReader.readUInt8();
+        expect(rowsReader.readUInt32LE()).toBe(0);
+        rowsReader.readUInt8();
+        const rowCount = rowsReader.readUInt16LE();
+        expect(rowCount).toBe(2);
+
+        const names: string[] = [];
+        for (let i = 0; i < rowCount; i++) {
+            rowsReader.readUInt8();
+            names.push(readPropertyValue(rowsReader, PropertyType.PtypString) as string);
+        }
+        expect(names.sort()).toEqual(["Jane Doe", "John Smith"]);
+    });
+
+    it("Lists a TASKS folder's tasks end to end, resolved by title via TaskTarget.", async () => {
+        const mailbox = await createMailbox(owner.uid);
+        const tasksFolder = await createFolder(mailbox.uid, FolderType.TASKS, "Tasks");
+        await createTask(mailbox.uid, tasksFolder.uid, { title: "Ship it" });
+        await createTask(mailbox.uid, tasksFolder.uid, { title: "Write docs" });
+        const connectResult = await connect();
+        const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+
+        const tasksFid = await discoverFolderId(cookie, "Tasks");
+
+        const openFolderRops = new BufferWriter();
+        openFolderRops.writeUInt8(0x02);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeUInt8(0); // InputHandleIndex (logon)
+        openFolderRops.writeUInt8(3); // OutputHandleIndex
+        openFolderRops.writeUInt8(0); // OpenModeFlags
+        openFolderRops.writeBigUInt64LE(tasksFid);
+        await execute(cookie, encodeRopBuffer({ ropsList: openFolderRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff] }));
+
+        const tableRops = new BufferWriter();
+        tableRops.writeUInt8(0x05);
+        tableRops.writeUInt8(0);
+        tableRops.writeUInt8(3); // InputHandleIndex (folder)
+        tableRops.writeUInt8(4); // OutputHandleIndex
+        tableRops.writeUInt8(0); // TableFlags
+        await execute(cookie, encodeRopBuffer({ ropsList: tableRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+
+        const setColumnsRops = new BufferWriter();
+        setColumnsRops.writeUInt8(0x12);
+        setColumnsRops.writeUInt8(0);
+        setColumnsRops.writeUInt8(4); // InputHandleIndex (table)
+        setColumnsRops.writeUInt8(0); // SetColumnsFlags
+        setColumnsRops.writeUInt16LE(1);
+        writePropertyTag(setColumnsRops, { propertyId: 0x0037, propertyType: PropertyType.PtypString }); // PidTagSubject -> title
+        await execute(cookie, encodeRopBuffer({ ropsList: setColumnsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsRops = new BufferWriter();
+        queryRowsRops.writeUInt8(0x15);
+        queryRowsRops.writeUInt8(0);
+        queryRowsRops.writeUInt8(4); // InputHandleIndex (table)
+        queryRowsRops.writeUInt8(0); // QueryRowsFlags
+        queryRowsRops.writeUInt8(1); // ForwardRead
+        queryRowsRops.writeUInt16LE(10);
+        const queryRowsResult = await execute(cookie, encodeRopBuffer({ ropsList: queryRowsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsReader = new BufferReader(queryRowsResult.body);
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        const { ropsList: queryRowsList } = decodeRopBuffer(queryRowsReader.readBytes(queryRowsReader.readUInt32LE()));
+        const rowsReader = new BufferReader(queryRowsList);
+        rowsReader.readUInt8();
+        rowsReader.readUInt8();
+        expect(rowsReader.readUInt32LE()).toBe(0);
+        rowsReader.readUInt8();
+        const rowCount = rowsReader.readUInt16LE();
+        expect(rowCount).toBe(2);
+
+        const titles: string[] = [];
+        for (let i = 0; i < rowCount; i++) {
+            rowsReader.readUInt8();
+            titles.push(readPropertyValue(rowsReader, PropertyType.PtypString) as string);
+        }
+        expect(titles.sort()).toEqual(["Ship it", "Write docs"]);
     });
 
     it("Reads a real message end to end: OpenMessage, GetPropertiesSpecific(Subject), OpenStream+ReadStream(Body).", async () => {

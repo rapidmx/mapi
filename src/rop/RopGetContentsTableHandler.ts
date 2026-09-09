@@ -5,8 +5,10 @@
 import { Folder, FolderType } from "@rapidmx/restapi";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { resolveFolderCalendarEvents } from "./CalendarEventTarget.js";
+import { resolveFolderContacts } from "./ContactTarget.js";
 import { resolveFolderMessages } from "./MessageTarget.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
+import { resolveFolderTasks } from "./TaskTarget.js";
 
 const ROP_ID_GET_CONTENTS_TABLE = 0x05;
 
@@ -31,7 +33,10 @@ const ERROR_INVALID_OBJECT = 0x80070005;
  * **Calendar folders** (`Folder.type === FolderType.CALENDAR`) list `"calendarEvent:<uid>"` rows resolved via
  * `calendarEventRepo` instead of `"message:<uid>"` rows - a single table handle only ever holds one kind of
  * row, decided once here by checking the folder's own `type`, exactly the same "resolve by target-string
- * prefix downstream" design `MessageTarget`/`FolderTarget` already use for their own rows.
+ * prefix downstream" design `MessageTarget`/`FolderTarget` already use for their own rows. **Contacts and
+ * Tasks** folders (`FolderType.CONTACTS`/`TASKS`) list `"contact:<uid>"`/`"task:<uid>"` rows the same way, via
+ * `contactRepo`/`taskRepo` - empty (rather than an error) when the context has neither wired up, the same
+ * optional-repo degradation `RopContext`'s own doc comment describes.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -66,6 +71,12 @@ export class RopGetContentsTableHandler implements RopHandler {
         const folder: Folder | undefined = await context.folderRepo.findOne(folderUid, { ignoreACL: true });
         if (folder?.type === FolderType.CALENDAR) {
             return resolveFolderCalendarEvents(folderUid, context.calendarEventRepo);
+        }
+        if (folder?.type === FolderType.CONTACTS) {
+            return context.contactRepo ? resolveFolderContacts(folderUid, context.contactRepo) : [];
+        }
+        if (folder?.type === FolderType.TASKS) {
+            return context.taskRepo ? resolveFolderTasks(folderUid, context.taskRepo) : [];
         }
         return resolveFolderMessages(folderUid, context.messageRepo);
     }

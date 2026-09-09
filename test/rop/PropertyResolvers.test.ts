@@ -7,8 +7,11 @@ import { encodeTimeZoneStruct } from "../../src/codec/MapiTimeZone.js";
 import { PropertyType } from "../../src/codec/PropertyValue.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { assignOrGetNamedPropertyId } from "../../src/rop/NamedPropertyRegistry.js";
-import { calendarEventValueFor, resolvePropertyValues } from "../../src/rop/PropertyResolvers.js";
+import { calendarEventValueFor, contactValueFor, resolvePropertyValues, taskValueFor } from "../../src/rop/PropertyResolvers.js";
 import type { CalendarEventTargetInfo } from "../../src/rop/CalendarEventTarget.js";
+import type { ContactTargetInfo } from "../../src/rop/ContactTarget.js";
+import { LID_PERCENT_COMPLETE, LID_TASK_COMPLETE, LID_TASK_DUE_DATE, LID_TASK_STATUS, PSETID_TASK } from "../../src/rop/TaskNamedProperties.js";
+import type { TaskTargetInfo } from "../../src/rop/TaskTarget.js";
 import {
     AttendeeResponseStatus,
     AttendeeRole,
@@ -304,6 +307,217 @@ describe("PropertyResolvers Tests", () => {
             );
 
             expect(values).toEqual([0]); // respNone
+        });
+    });
+
+    describe("contactValueFor", () => {
+        function baseContactInfo(overrides: Partial<ContactTargetInfo> = {}): ContactTargetInfo {
+            return {
+                displayName: "Jane Doe",
+                givenName: "Jane",
+                surname: "Doe",
+                email: "jane@example.com",
+                businessPhone: "555-1234",
+                companyName: "Acme",
+                jobTitle: "Engineer",
+                ...overrides,
+            };
+        }
+
+        it("Resolves PidTagSubject to the contact's displayName.", () => {
+            const session = makeSession();
+            expect(contactValueFor(session, PID_TAG_SUBJECT, PropertyType.PtypString, "contact:c1", baseContactInfo())).toBe("Jane Doe");
+        });
+
+        it("Resolves PidTagMid via assignOrGetMid.", () => {
+            const session = makeSession();
+            const value = contactValueFor(session, PID_TAG_MID, PropertyType.PtypInteger64, "contact:c1", baseContactInfo());
+            expect(value).toBe(1n);
+            expect(session.messageIds["1"]).toBe("contact:c1");
+        });
+
+        it("Resolves PidTagGivenName/Surname/EmailAddress/BusinessTelephoneNumber/CompanyName/Title.", () => {
+            const session = makeSession();
+            const info = baseContactInfo();
+            expect(contactValueFor(session, 0x3a06, PropertyType.PtypString, "contact:c1", info)).toBe("Jane");
+            expect(contactValueFor(session, 0x3a11, PropertyType.PtypString, "contact:c1", info)).toBe("Doe");
+            expect(contactValueFor(session, 0x3003, PropertyType.PtypString, "contact:c1", info)).toBe("jane@example.com");
+            expect(contactValueFor(session, 0x3a08, PropertyType.PtypString, "contact:c1", info)).toBe("555-1234");
+            expect(contactValueFor(session, 0x3a16, PropertyType.PtypString, "contact:c1", info)).toBe("Acme");
+            expect(contactValueFor(session, 0x3a17, PropertyType.PtypString, "contact:c1", info)).toBe("Engineer");
+        });
+
+        it("Defaults every optional field to empty string when unset.", () => {
+            const session = makeSession();
+            const info = baseContactInfo({ givenName: undefined, surname: undefined, email: undefined, businessPhone: undefined, companyName: undefined, jobTitle: undefined });
+            expect(contactValueFor(session, 0x3a06, PropertyType.PtypString, "contact:c1", info)).toBe("");
+            expect(contactValueFor(session, 0x3a11, PropertyType.PtypString, "contact:c1", info)).toBe("");
+            expect(contactValueFor(session, 0x3003, PropertyType.PtypString, "contact:c1", info)).toBe("");
+            expect(contactValueFor(session, 0x3a08, PropertyType.PtypString, "contact:c1", info)).toBe("");
+            expect(contactValueFor(session, 0x3a16, PropertyType.PtypString, "contact:c1", info)).toBe("");
+            expect(contactValueFor(session, 0x3a17, PropertyType.PtypString, "contact:c1", info)).toBe("");
+        });
+
+        it("Falls back to a type-appropriate default for an unrecognized property tag.", () => {
+            const session = makeSession();
+            expect(contactValueFor(session, 0x0e07, PropertyType.PtypInteger32, "contact:c1", baseContactInfo())).toBe(0);
+        });
+    });
+
+    describe("taskValueFor", () => {
+        function baseTaskInfo(overrides: Partial<TaskTargetInfo> = {}): TaskTargetInfo {
+            return { title: "Ship it", completed: false, dueDate: new Date("2026-09-10T00:00:00.000Z"), ...overrides };
+        }
+
+        it("Resolves PidTagSubject to the task's title.", () => {
+            const session = makeSession();
+            expect(taskValueFor(session, PID_TAG_SUBJECT, PropertyType.PtypString, "task:t1", baseTaskInfo())).toBe("Ship it");
+        });
+
+        it("Resolves PidTagMid via assignOrGetMid.", () => {
+            const session = makeSession();
+            const value = taskValueFor(session, PID_TAG_MID, PropertyType.PtypInteger64, "task:t1", baseTaskInfo());
+            expect(value).toBe(1n);
+            expect(session.messageIds["1"]).toBe("task:t1");
+        });
+
+        it("Falls back to a default for an unrecognized plain (< 0x8000) property tag.", () => {
+            const session = makeSession();
+            expect(taskValueFor(session, 0x0e07, PropertyType.PtypInteger32, "task:t1", baseTaskInfo())).toBe(0);
+        });
+
+        it("Falls back to a default when the property ID was never assigned by RopGetPropertyIdsFromNames.", () => {
+            const session = makeSession();
+            expect(taskValueFor(session, 0x8000, PropertyType.PtypString, "task:t1", baseTaskInfo())).toBe("");
+        });
+
+        it("Falls back to a default for a recognized LID under the wrong property-set GUID.", () => {
+            const session = makeSession();
+            const id = namedId(session, "11111111-0000-0000-c000-000000000046", LID_TASK_STATUS);
+            expect(taskValueFor(session, id, PropertyType.PtypInteger32, "task:t1", baseTaskInfo())).toBe(0);
+        });
+
+        it("Resolves PidLidTaskStatus/PercentComplete/Complete from Task.completed.", () => {
+            const session = makeSession();
+            const statusId = namedId(session, PSETID_TASK, LID_TASK_STATUS);
+            const percentId = namedId(session, PSETID_TASK, LID_PERCENT_COMPLETE);
+            const completeId = namedId(session, PSETID_TASK, LID_TASK_COMPLETE);
+
+            expect(taskValueFor(session, statusId, PropertyType.PtypInteger32, "task:t1", baseTaskInfo({ completed: false }))).toBe(0);
+            expect(taskValueFor(session, statusId, PropertyType.PtypInteger32, "task:t1", baseTaskInfo({ completed: true }))).toBe(2);
+            expect(taskValueFor(session, percentId, PropertyType.PtypFloating64, "task:t1", baseTaskInfo({ completed: false }))).toBe(0.0);
+            expect(taskValueFor(session, percentId, PropertyType.PtypFloating64, "task:t1", baseTaskInfo({ completed: true }))).toBe(1.0);
+            expect(taskValueFor(session, completeId, PropertyType.PtypBoolean, "task:t1", baseTaskInfo({ completed: false }))).toBe(false);
+            expect(taskValueFor(session, completeId, PropertyType.PtypBoolean, "task:t1", baseTaskInfo({ completed: true }))).toBe(true);
+        });
+
+        it("Resolves PidLidTaskDueDate, defaulting when unset.", () => {
+            const session = makeSession();
+            const dueId = namedId(session, PSETID_TASK, LID_TASK_DUE_DATE);
+            const dueDate = new Date("2026-09-10T00:00:00.000Z");
+            expect(taskValueFor(session, dueId, PropertyType.PtypTime, "task:t1", baseTaskInfo({ dueDate }))).toBe(dueDate);
+            expect(taskValueFor(session, dueId, PropertyType.PtypTime, "task:t1", baseTaskInfo({ dueDate: undefined }))).toEqual(new Date(0));
+        });
+
+        it("Falls back to a type-appropriate default for an unrecognized LID under PSETID_Task.", () => {
+            const session = makeSession();
+            const id = namedId(session, PSETID_TASK, 0x9999);
+            expect(taskValueFor(session, id, PropertyType.PtypInteger32, "task:t1", baseTaskInfo())).toBe(0);
+        });
+    });
+
+    describe("resolvePropertyValues (contact/task dispatch)", () => {
+        it("Resolves contact columns via contactRepo, without touching folderRepo/messageRepo.", async () => {
+            const session = makeSession();
+            const contactRepo = { findOne: vi.fn().mockResolvedValue({ uid: "c1", displayName: "Jane Doe", emails: [], phones: [] }) };
+            const folderRepo = { findOne: vi.fn(), find: vi.fn() };
+            const messageRepo = { findOne: vi.fn(), find: vi.fn() };
+
+            const values = await resolvePropertyValues(
+                "contact:c1",
+                [{ propertyId: PID_TAG_SUBJECT, propertyType: PropertyType.PtypString }],
+                {
+                    mailboxUid: "mailbox-1",
+                    session,
+                    folderRepo: folderRepo as any,
+                    messageRepo: messageRepo as any,
+                    calendarEventRepo: {} as any,
+                    mailboxRepo: {} as any,
+                    contactRepo: contactRepo as any,
+                },
+            );
+
+            expect(values).toEqual(["Jane Doe"]);
+            expect(contactRepo.findOne).toHaveBeenCalledWith("c1", { ignoreACL: true });
+            expect(folderRepo.findOne).not.toHaveBeenCalled();
+            expect(messageRepo.findOne).not.toHaveBeenCalled();
+        });
+
+        it("Resolves task columns via taskRepo, without touching folderRepo/messageRepo.", async () => {
+            const session = makeSession();
+            const taskRepo = { findOne: vi.fn().mockResolvedValue({ uid: "t1", title: "Ship it", completed: true }) };
+            const folderRepo = { findOne: vi.fn(), find: vi.fn() };
+            const messageRepo = { findOne: vi.fn(), find: vi.fn() };
+
+            const values = await resolvePropertyValues(
+                "task:t1",
+                [{ propertyId: PID_TAG_SUBJECT, propertyType: PropertyType.PtypString }],
+                {
+                    mailboxUid: "mailbox-1",
+                    session,
+                    folderRepo: folderRepo as any,
+                    messageRepo: messageRepo as any,
+                    calendarEventRepo: {} as any,
+                    mailboxRepo: {} as any,
+                    taskRepo: taskRepo as any,
+                },
+            );
+
+            expect(values).toEqual(["Ship it"]);
+            expect(taskRepo.findOne).toHaveBeenCalledWith("t1", { ignoreACL: true });
+            expect(folderRepo.findOne).not.toHaveBeenCalled();
+            expect(messageRepo.findOne).not.toHaveBeenCalled();
+        });
+
+        it("Degrades a contact target to type-appropriate defaults when contactRepo is absent from the context.", async () => {
+            const session = makeSession();
+
+            const values = await resolvePropertyValues(
+                "contact:c1",
+                [
+                    { propertyId: PID_TAG_SUBJECT, propertyType: PropertyType.PtypString },
+                    { propertyId: 0x3602, propertyType: PropertyType.PtypInteger32 },
+                ],
+                {
+                    mailboxUid: "mailbox-1",
+                    session,
+                    folderRepo: {} as any,
+                    messageRepo: {} as any,
+                    calendarEventRepo: {} as any,
+                    mailboxRepo: {} as any,
+                },
+            );
+
+            expect(values).toEqual(["", 0]);
+        });
+
+        it("Degrades a task target to type-appropriate defaults when taskRepo is absent from the context.", async () => {
+            const session = makeSession();
+
+            const values = await resolvePropertyValues(
+                "task:t1",
+                [{ propertyId: PID_TAG_SUBJECT, propertyType: PropertyType.PtypString }],
+                {
+                    mailboxUid: "mailbox-1",
+                    session,
+                    folderRepo: {} as any,
+                    messageRepo: {} as any,
+                    calendarEventRepo: {} as any,
+                    mailboxRepo: {} as any,
+                },
+            );
+
+            expect(values).toEqual([""]);
         });
     });
 });

@@ -5,8 +5,10 @@
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { writeTypedString } from "../codec/TypedString.js";
 import { resolveCalendarEventInfo } from "./CalendarEventTarget.js";
+import { resolveContactInfo } from "./ContactTarget.js";
 import { resolveMessageInfo } from "./MessageTarget.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
+import { resolveTaskInfo } from "./TaskTarget.js";
 
 const ROP_ID_OPEN_MESSAGE = 0x03;
 
@@ -58,11 +60,19 @@ export class RopOpenMessageHandler implements RopHandler {
             return;
         }
 
-        // A calendar item's "subject" is its title (PidTagSubject, the same tag a Message uses) - see
-        // CalendarEventTarget.ts's own doc comment for why no separate MID-registry mechanism is needed here.
-        const subject = target.startsWith("calendarEvent:")
-            ? (await resolveCalendarEventInfo(target, context.calendarEventRepo)).title
-            : (await resolveMessageInfo(target, context.messageRepo)).subject;
+        // A calendar/contact/task item's "subject" is its title/display name (PidTagSubject, the same tag a
+        // Message uses) - see CalendarEventTarget.ts's own doc comment for why no separate MID-registry
+        // mechanism is needed for any of these target kinds.
+        let subject: string;
+        if (target.startsWith("calendarEvent:")) {
+            subject = (await resolveCalendarEventInfo(target, context.calendarEventRepo)).title;
+        } else if (target.startsWith("contact:")) {
+            subject = context.contactRepo ? (await resolveContactInfo(target, context.contactRepo)).displayName : "";
+        } else if (target.startsWith("task:")) {
+            subject = context.taskRepo ? (await resolveTaskInfo(target, context.taskRepo)).title : "";
+        } else {
+            subject = (await resolveMessageInfo(target, context.messageRepo)).subject;
+        }
         context.session.handles[outputHandleIndex] = { type: "message", entityUid: target };
 
         writer.writeUInt8(ROP_ID_OPEN_MESSAGE);
