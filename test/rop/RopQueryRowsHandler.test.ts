@@ -77,6 +77,28 @@ describe("RopQueryRowsHandler Tests", () => {
         expect(context.session.handles[7]?.cursor).toBe(1);
     });
 
+    it("Fetches the mailbox's full folder list at most once across many rows when Subfolders is a requested column, not once per row.", async () => {
+        const folderRepo = {
+            findOne: vi.fn().mockImplementation(async (uid: string) => ({ uid, name: uid, unreadCount: 0, totalCount: 0 })),
+            find: vi.fn().mockResolvedValue([]),
+        };
+        const context = makeContext(folderRepo);
+        const rows = Array.from({ length: 5 }, (_, i) => `folder:f${i}`);
+        context.session.handles[7] = {
+            type: "table",
+            entityUid: "virtual:root",
+            rows,
+            columns: [{ propertyId: 0x360a, propertyType: PropertyType.PtypBoolean }], // PidTagSubfolders
+        };
+        const handler = new RopQueryRowsHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ rowCount: 10 })), writer, context);
+
+        expect(folderRepo.findOne).toHaveBeenCalledTimes(5); // once per distinct folder, as expected
+        expect(folderRepo.find).toHaveBeenCalledTimes(1); // the whole-mailbox list for hasChildren, shared across all 5 rows
+    });
+
     it("Builds rows with DisplayName/FolderId/ContentCount/UnreadCount/Subfolders columns and advances the cursor.", async () => {
         const folderRepo = {
             findOne: vi.fn().mockResolvedValue({ uid: "f1", name: "Inbox", unreadCount: 3, totalCount: 10 }),

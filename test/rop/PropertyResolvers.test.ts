@@ -308,6 +308,28 @@ describe("PropertyResolvers Tests", () => {
 
             expect(values).toEqual([0]); // respNone
         });
+
+        it("Fetches the mailbox at most once across multiple calls sharing the same ResolutionCache.", async () => {
+            const session = makeSession();
+            const calendarEventRepo = { findOne: vi.fn().mockResolvedValue({ uid: "e1", organizer: { address: "organizer@example.com" }, attendees: [] }) };
+            const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "owner@example.com" }) };
+            const responseId = namedId(session, PSETID_APPOINTMENT, LID_RESPONSE_STATUS);
+            const cache = {};
+
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: {} as any,
+                calendarEventRepo: calendarEventRepo as any,
+                mailboxRepo: mailboxRepo as any,
+            };
+            await resolvePropertyValues("calendarEvent:e1", [{ propertyId: responseId, propertyType: PropertyType.PtypInteger32 }], context, cache);
+            await resolvePropertyValues("calendarEvent:e1", [{ propertyId: responseId, propertyType: PropertyType.PtypInteger32 }], context, cache);
+
+            expect(mailboxRepo.findOne).toHaveBeenCalledTimes(1);
+            expect(cache).toEqual({ callerAddress: "owner@example.com" });
+        });
     });
 
     describe("contactValueFor", () => {

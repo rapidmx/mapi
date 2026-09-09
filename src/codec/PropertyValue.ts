@@ -205,8 +205,19 @@ export function writePropertyValue(writer: BufferWriter, type: PropertyType, val
     }
 }
 
+/** `count` is a fully client-controlled `uint32` (up to ~4.29 billion). Every element type this reads needs at
+ * least 1 byte on the wire, so a `count` exceeding the buffer's actual remaining bytes can never be genuine -
+ * rejecting it immediately, before looping at all, turns a client lying about the count into an instant, clear
+ * `RangeError` instead of a loop that runs until either the heap is exhausted or (for the two `PtypMultipleString*`
+ * variants specifically, whose element reader used to tolerate running past the buffer's end - see
+ * `BufferCursor.ts`'s own doc comment) it simply never terminates. Defense in depth alongside that fix, not a
+ * replacement for it - this also fails fast for a merely-oversized-but-technically-satisfiable count instead of
+ * allocating a huge array first. */
 function readCountedArray<T>(reader: BufferReader, readOne: () => T): T[] {
     const count = reader.readUInt32LE();
+    if (count > reader.remaining) {
+        throw new RangeError(`PropertyValue.readCountedArray(): element count ${count} exceeds the remaining buffer size (${reader.remaining}).`);
+    }
     const values: T[] = [];
     for (let i = 0; i < count; i++) {
         values.push(readOne());

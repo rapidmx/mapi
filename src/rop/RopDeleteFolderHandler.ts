@@ -30,10 +30,17 @@ const DELETE_HARD_DELETE = 0x10;
  *
  * **Real spec semantics honored, not simplified away**: per `[MS-OXCFOLD]`, `RopDeleteFolder` only operates on
  * an empty folder by default - `DEL_MESSAGES` must be set to also delete the folder's own messages/calendar
- * events, and `DEL_FOLDERS` to also delete (recursively) its subfolders; a non-empty folder deleted without the
- * matching flag fails rather than silently cascading. `DELETE_HARD_DELETE` maps directly onto
- * `RepoDeleteOptions.purge` - real, exact semantic overlap with this library's own soft-delete model, not a
- * coincidence this codec papers over.
+ * events/contacts/tasks, and `DEL_FOLDERS` to also delete (recursively) its subfolders; a non-empty folder
+ * deleted without the matching flag fails rather than silently cascading. `DELETE_HARD_DELETE` maps directly
+ * onto `RepoDeleteOptions.purge` - real, exact semantic overlap with this library's own soft-delete model, not
+ * a coincidence this codec papers over.
+ *
+ * **Contacts/Tasks folders**: emptiness is checked against `contactRepo`/`taskRepo` alongside `messageRepo`/
+ * `calendarEventRepo`, and both are included in the delete cascade - a `CONTACTS`/`TASKS` folder's real content
+ * lives in those repos (see `ContactTarget.ts`/`TaskTarget.ts`), not `messageRepo`, so checking only the latter
+ * would let a non-empty Contacts/Tasks folder be deleted without `DEL_MESSAGES` and orphan its rows. Guarded
+ * with `context.contactRepo`/`taskRepo` presence checks the same way `RopGetContentsTableHandler` does, since
+ * `RopContext`'s doc comment documents both as optional.
  *
  * The request's own `InputHandleIndex` (nominally the *parent* folder of the one being deleted) is validated to
  * be a real, open folder handle but not cross-checked against the target folder's actual `parentFolderUid` -
@@ -71,9 +78,14 @@ export class RopDeleteFolderHandler implements RopHandler {
 
         const messages = await context.messageRepo.find({ folderUid: uid }, { ignoreACL: true });
         const events = await context.calendarEventRepo.find({ folderUid: uid }, { ignoreACL: true });
+        const contacts = context.contactRepo ? await context.contactRepo.find({ folderUid: uid }, { ignoreACL: true }) : [];
+        const tasks = context.taskRepo ? await context.taskRepo.find({ folderUid: uid }, { ignoreACL: true }) : [];
         const childFolders = await context.folderRepo.find({ parentFolderUid: uid }, { ignoreACL: true });
 
-        if ((messages.length > 0 || events.length > 0) && (deleteFolderFlags & DEL_MESSAGES) === 0) {
+        if (
+            (messages.length > 0 || events.length > 0 || contacts.length > 0 || tasks.length > 0) &&
+            (deleteFolderFlags & DEL_MESSAGES) === 0
+        ) {
             writer.writeUInt8(ROP_ID_DELETE_FOLDER);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
@@ -91,6 +103,12 @@ export class RopDeleteFolderHandler implements RopHandler {
         }
         for (const event of events) {
             await context.calendarEventRepo.delete(event.uid, { ignoreACL: true, purge });
+        }
+        for (const contact of contacts) {
+            await context.contactRepo!.delete(contact.uid, { ignoreACL: true, purge });
+        }
+        for (const task of tasks) {
+            await context.taskRepo!.delete(task.uid, { ignoreACL: true, purge });
         }
         for (const childFolder of childFolders) {
             await this.deleteFolderRecursive(childFolder.uid, context, purge);
@@ -110,6 +128,8 @@ export class RopDeleteFolderHandler implements RopHandler {
     private async deleteFolderRecursive(folderUid: string, context: RopContext, purge: boolean): Promise<void> {
         const messages = await context.messageRepo.find({ folderUid }, { ignoreACL: true });
         const events = await context.calendarEventRepo.find({ folderUid }, { ignoreACL: true });
+        const contacts = context.contactRepo ? await context.contactRepo.find({ folderUid }, { ignoreACL: true }) : [];
+        const tasks = context.taskRepo ? await context.taskRepo.find({ folderUid }, { ignoreACL: true }) : [];
         const childFolders = await context.folderRepo.find({ parentFolderUid: folderUid }, { ignoreACL: true });
 
         for (const message of messages) {
@@ -117,6 +137,12 @@ export class RopDeleteFolderHandler implements RopHandler {
         }
         for (const event of events) {
             await context.calendarEventRepo.delete(event.uid, { ignoreACL: true, purge });
+        }
+        for (const contact of contacts) {
+            await context.contactRepo!.delete(contact.uid, { ignoreACL: true, purge });
+        }
+        for (const task of tasks) {
+            await context.taskRepo!.delete(task.uid, { ignoreACL: true, purge });
         }
         for (const childFolder of childFolders) {
             await this.deleteFolderRecursive(childFolder.uid, context, purge);

@@ -11,8 +11,12 @@
  * with automatic offset advancement - reimplementing that per file would be pure repetition across the dozens
  * of ROP handlers this phase's plan calls for, unlike EAS's WBXML codec, which only needed one such reader.
  *
- * Underlying `Buffer` methods already bounds-check and throw `RangeError` on overflow/truncation - a malformed
- * or truncated ROP buffer legitimately failing loudly is the correct behavior, not something to swallow here.
+ * Underlying `Buffer` methods already bounds-check and throw `RangeError` on overflow/truncation for every
+ * fixed-width primitive read - a malformed or truncated ROP buffer legitimately failing loudly is the correct
+ * behavior, not something to swallow here. `readBytes`/`readNullTerminatedUtf16LE`/`readNullTerminatedString8`
+ * are the three exceptions: `Buffer.subarray` silently clamps instead of throwing, and a null-terminated scan
+ * has no fixed width to bounds-check against `Buffer` methods at all, so those three enforce the same
+ * "malformed/truncated input throws" contract explicitly below instead of relying on it happening for free.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -92,7 +96,17 @@ export class BufferReader {
         return value;
     }
 
+    /** Unlike every fixed-width `readXxxLE` above, `Buffer.prototype.subarray` never throws - an out-of-range
+     * `length` (negative, or reaching past the buffer's end) silently clamps instead, which would otherwise let
+     * a malformed/truncated ROP buffer produce garbage-but-not-erroring reads (a negative `length` even rewinds
+     * `offset` backwards) instead of failing loudly the way this class's own doc comment promises. Explicitly
+     * bounds-checked here for that reason. */
     public readBytes(length: number): Buffer {
+        if (length < 0 || this.offset + length > this.buffer.length) {
+            throw new RangeError(
+                `BufferReader.readBytes(${length}): out of range at offset ${this.offset} (buffer length ${this.buffer.length}).`,
+            );
+        }
         const value = this.buffer.subarray(this.offset, this.offset + length);
         this.offset += length;
         return value;
@@ -100,11 +114,22 @@ export class BufferReader {
 
     /** Reads a UTF-16LE string up to (and consuming) its terminating `0x0000` code unit - `PtypString`'s wire
      * encoding. Scans on 2-byte boundaries, since a null code unit's low/high byte pair can't be mistaken for
-     * one half of a non-null UTF-16 code unit at an odd offset the way a naive single-byte scan could. */
+     * one half of a non-null UTF-16 code unit at an odd offset the way a naive single-byte scan could.
+     *
+     * Throws if no terminator is found before running out of buffer, rather than silently returning whatever
+     * content preceded the truncation and leaving `offset` past the buffer's actual end - a truncated/malformed
+     * string is exactly the kind of input this class's own doc comment says should fail loudly. This also
+     * closes a real DoS: `PropertyValue.ts`'s `readCountedArray` loops a client-controlled element count with
+     * no independent cap, trusting each element's own reader to terminate the loop early against a too-small
+     * buffer the way every fixed-width reader already does - without this, `PtypMultipleString`'s
+     * `readNullTerminatedUtf16LE` calls kept silently returning `""` past the buffer's end forever instead. */
     public readNullTerminatedUtf16LE(): string {
         let end = this.offset;
         while (end + 1 < this.buffer.length && !(this.buffer[end] === 0 && this.buffer[end + 1] === 0)) {
             end += 2;
+        }
+        if (end + 1 >= this.buffer.length) {
+            throw new RangeError("BufferReader.readNullTerminatedUtf16LE(): no null terminator found before the end of the buffer.");
         }
         const value = this.buffer.toString("utf16le", this.offset, end);
         this.offset = end + 2;
@@ -113,11 +138,17 @@ export class BufferReader {
 
     /** Reads a single-byte-terminated 8-bit string (`PtypString8`'s wire encoding). Multibyte string content
      * itself is treated as UTF-8, a pragmatic choice documented in `PropertyValue.ts` rather than the
-     * "externally specified encoding" the spec leaves open-ended. */
+     * "externally specified encoding" the spec leaves open-ended.
+     *
+     * Throws if no terminator is found before running out of buffer - see `readNullTerminatedUtf16LE`'s own
+     * doc comment for why (identical reasoning, including the `readCountedArray` DoS this closes). */
     public readNullTerminatedString8(): string {
         let end = this.offset;
         while (end < this.buffer.length && this.buffer[end] !== 0) {
             end += 1;
+        }
+        if (end >= this.buffer.length) {
+            throw new RangeError("BufferReader.readNullTerminatedString8(): no null terminator found before the end of the buffer.");
         }
         const value = this.buffer.toString("utf-8", this.offset, end);
         this.offset = end + 1;

@@ -88,7 +88,7 @@ describe("FolderTarget Tests", () => {
     describe("assignOrGetFid", () => {
         it("Assigns sequential FIDs and reuses an existing assignment for the same target.", () => {
             const session = new MapiSessionContext({ mailboxUid: MAILBOX_UID, userUid: "user-1" });
-            session.folderIds = { "1": "virtual:root" };
+            expect(assignOrGetFid(session, "virtual:root")).toBe(1);
 
             const newFid = assignOrGetFid(session, "folder:child1");
             expect(newFid).toBe(2);

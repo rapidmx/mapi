@@ -55,6 +55,26 @@ describe("BufferCursor Tests", () => {
             expect(reader.readUInt8()).toBe(0xff);
         });
 
+        it("readNullTerminatedUtf16LE() throws instead of silently returning truncated content when no terminator is found.", () => {
+            const reader = new BufferReader(Buffer.from("no terminator here", "utf16le"));
+            expect(() => reader.readNullTerminatedUtf16LE()).toThrow(/null terminator/i);
+        });
+
+        it("readNullTerminatedString8() throws instead of silently returning truncated content when no terminator is found.", () => {
+            const reader = new BufferReader(Buffer.from("no terminator here", "utf-8"));
+            expect(() => reader.readNullTerminatedString8()).toThrow(/null terminator/i);
+        });
+
+        it("readBytes() throws instead of silently clamping when length runs past the buffer's end.", () => {
+            const reader = new BufferReader(Buffer.from([1, 2, 3]));
+            expect(() => reader.readBytes(4)).toThrow(RangeError);
+        });
+
+        it("readBytes() throws instead of silently rewinding the cursor for a negative length.", () => {
+            const reader = new BufferReader(Buffer.from([1, 2, 3]), 2);
+            expect(() => reader.readBytes(-2)).toThrow(RangeError);
+        });
+
         it("Reads signed/floating/64-bit primitives.", () => {
             const writer = new BufferWriter();
             writer.writeInt32LE(-5);

@@ -52,15 +52,32 @@ describe("RopSetColumnsHandler Tests", () => {
         expect(context.session.handles[7]?.columns).toEqual(tags);
     });
 
-    it("Does not throw when the referenced handle doesn't exist, still returning success.", () => {
+    it("Returns MAPI_E_INVALID_OBJECT when the referenced handle doesn't exist, instead of silently succeeding.", () => {
         const context = makeContext();
         const handler = new RopSetColumnsHandler();
         const writer = new BufferWriter();
 
-        expect(() => handler.handle(new BufferReader(buildRequest(0, 42, [])), writer, context)).not.toThrow();
+        handler.handle(new BufferReader(buildRequest(0, 42, [])), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        expect(response.readUInt8()).toBe(0x12);
+        expect(response.readUInt8()).toBe(42);
+        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(response.hasMore()).toBe(false);
+    });
+
+    it("Returns MAPI_E_INVALID_OBJECT when the referenced handle exists but isn't a table (e.g. a message handle).", () => {
+        const context = makeContext();
+        context.session.handles[7] = { type: "message", entityUid: "message:m1" };
+        const handler = new RopSetColumnsHandler();
+        const writer = new BufferWriter();
+
+        handler.handle(new BufferReader(buildRequest(0, 7, [])), writer, context);
+
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
-        expect(response.readUInt32LE()).toBe(0);
+        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(context.session.handles[7]?.columns).toBeUndefined();
     });
 });

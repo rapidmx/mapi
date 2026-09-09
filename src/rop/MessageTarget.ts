@@ -40,19 +40,25 @@ export async function resolveFolderMessages(folderUid: string, messageRepo: Repo
 }
 
 /**
- * Returns `target`'s existing MID if an earlier `RopQueryRows` row already assigned one (a linear scan of
- * `session.messageIds` - there is no reverse index, but a single table's row count in this pragmatic subset is
- * never large enough for this to be a real cost), otherwise assigns and remembers the next free small integer
- * MID. The exact `FolderTarget.assignOrGetFid` pattern, adapted for messages: this is what lets a client
- * `RopOpenMessage` a message it only ever learned about via a `RopQueryRows` row's `PidTagMid` column.
+ * Returns `target`'s existing MID if an earlier `RopQueryRows` row already assigned one, otherwise assigns and
+ * remembers the next free small integer MID. The exact `FolderTarget.assignOrGetFid` pattern, adapted for
+ * messages: this is what lets a client `RopOpenMessage` a message it only ever learned about via a
+ * `RopQueryRows` row's `PidTagMid` column.
+ *
+ * Backed by `session.messageTargetIds` (target -> MID) and `session.nextMessageId`, an O(1) reverse index/
+ * counter pair rather than a linear scan of `session.messageIds` plus a `Math.max(...spread)` over its keys -
+ * see `FolderTarget.assignOrGetFid`'s own doc comment for why both of those were real costs (not just
+ * theoretical ones) at real mailbox/session scale: `messageIds` only ever grows for a session's lifetime as a
+ * client pages through a mailbox, so a linear-scan lookup repeated once per row is quadratic over a session
+ * that pages through many messages.
  */
 export function assignOrGetMid(session: MapiSessionContext, target: string): number {
-    for (const [mid, existingTarget] of Object.entries(session.messageIds)) {
-        if (existingTarget === target) {
-            return Number(mid);
-        }
+    const existing = session.messageTargetIds[target];
+    if (existing !== undefined) {
+        return existing;
     }
-    const nextMid = Math.max(0, ...Object.keys(session.messageIds).map(Number)) + 1;
-    session.messageIds[String(nextMid)] = target;
-    return nextMid;
+    const mid = session.nextMessageId++;
+    session.messageIds[String(mid)] = target;
+    session.messageTargetIds[target] = mid;
+    return mid;
 }

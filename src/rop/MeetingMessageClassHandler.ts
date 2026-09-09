@@ -54,6 +54,21 @@ function findNamedPropertyValue(session: MapiSessionContext, properties: Record<
  * response - the same "don't fail the whole ROP over a stale/unresolvable reference" principle this pragmatic
  * subset applies throughout (e.g. `MessageTarget.resolveMessageInfo`'s own doc comment). A response that can't
  * be correlated or applied is simply dropped, not a reason to reject the client's `RopSubmitMessage` call.
+ *
+ * **The one query in this package that isn't `mailboxUid`-scoped, and why that's unavoidable here**: unlike
+ * every other `ignoreACL: true` repo call in this codebase (all transitively scoped to the caller's own
+ * mailbox via a session FID/MID registry that itself only ever gets populated from mailbox-scoped queries),
+ * `calendarEventRepo.find({ icalUid })` below deliberately searches *every* mailbox on this server - the
+ * `CalendarEvent` being responded to belongs to the meeting's *organizer*, who is very often a different
+ * mailbox than the attendee submitting this response, and the caller's own session has no way to know which
+ * mailbox that is. Safety instead comes from two independent properties: `icalUid` is a server-generated
+ * `crypto.randomUUID()` (see `RopSaveChangesMessageHandler.saveAppointment`), for all practical purposes
+ * globally unique, so this can't be used to enumerate or collide with another organizer's events; and the
+ * actual authorization gate is the attendee-membership check a few lines down (`callerAddresses.has(...)`),
+ * derived entirely from *this* caller's own resolved mailbox record, not from anything the client supplied -
+ * a crafted `PidLidGlobalObjectId` can at best name a real `icalUid` it doesn't already know the value of
+ * (astronomically unlikely against a random UUID) and still can't mutate an event unless the caller's own
+ * mailbox is genuinely a listed attendee on it.
  */
 export async function submitMeetingResponse(messageClass: string, draftProperties: Record<string, string>, context: RopContext): Promise<void> {
     const responseStatus = RESPONSE_STATUS_BY_MESSAGE_CLASS[messageClass];
@@ -67,7 +82,10 @@ export async function submitMeetingResponse(messageClass: string, draftPropertie
     }
     const icalUid = decodeGlobalObjectId(new BufferReader(Buffer.from(globalObjectIdBase64, "base64")));
 
-    const events: (CalendarEvent & { uid: string; version: number })[] = await context.calendarEventRepo.find({ icalUid }, { ignoreACL: true });
+    const events: (CalendarEvent & { uid: string; version: number })[] = await context.calendarEventRepo.find(
+        { icalUid },
+        { ignoreACL: true, limit: 1 },
+    );
     const event = events[0];
     if (!event) {
         return;

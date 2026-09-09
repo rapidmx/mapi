@@ -57,7 +57,10 @@ function valueForColumn(contact: ContactRow, column: PropertyTag): PropertyValue
         case PID_TAG_DISPLAY_NAME:
             return contact.displayName;
         case PID_TAG_EMAIL_ADDRESS:
-            return contact.emails[0]?.address ?? "";
+            // Optional-chained on `emails` itself, not just its first element - a Contact predating this field
+            // (or otherwise missing it) would throw on a bare `contact.emails[0]` before the `?.` on `.address`
+            // ever gets a chance to help.
+            return contact.emails?.[0]?.address ?? "";
         default:
             return defaultValueForType(column.propertyType);
     }

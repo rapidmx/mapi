@@ -26,7 +26,7 @@ import {
 } from "./CalendarNamedProperties.js";
 import { CalendarEventTargetInfo, resolveCalendarEventInfo } from "./CalendarEventTarget.js";
 import { ContactTargetInfo, resolveContactInfo } from "./ContactTarget.js";
-import { assignOrGetFid, FolderTargetInfo, resolveFolderInfo } from "./FolderTarget.js";
+import { assignOrGetFid, FolderResolutionCache, FolderTargetInfo, resolveFolderInfo } from "./FolderTarget.js";
 import { assignOrGetMid, MessageTargetInfo, resolveMessageInfo } from "./MessageTarget.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
 import type { RopContext } from "./RopHandler.js";
@@ -297,6 +297,19 @@ export function taskValueFor(
     }
 }
 
+/** An optional, purely request-scoped (never persisted) memo shared across every `resolvePropertyValues` call
+ * within one ROP handler invocation - e.g. one `RopQueryRows` call resolving many table rows, or the (rarer)
+ * case of `RopGetPropertiesSpecific` resolving many columns for one object. Without it, both `allFolders` (via
+ * `resolveFolderInfo`'s own `hasChildren` computation) and `callerAddress` (the calendar organizer/attendee
+ * lookup below) would be re-fetched from the repo on every single row even though they can only ever have one
+ * value for the whole batch (this mailbox's folder list, this mailbox's own primary address) - a real,
+ * measurable cost for a hierarchy/calendar table with many rows, not just a theoretical one. A caller that
+ * resolves only a single target (`RopGetPropertiesSpecificHandler`) can simply omit this - resolving without a
+ * cache is still correct, just not deduplicated across calls it doesn't make anyway. */
+export interface ResolutionCache extends FolderResolutionCache {
+    callerAddress?: string;
+}
+
 /** Resolves every column in `columns` for a single `target` (a `"folder:"`/`"virtual:"`/`"message:"`/
  * `"calendarEvent:"`/`"contact:"`/`"task:"` target string), in order - the shared implementation behind both
  * `RopQueryRowsHandler` (one call per table row) and `RopGetPropertiesSpecificHandler` (one call for the single
@@ -308,6 +321,7 @@ export async function resolvePropertyValues(
         RopContext,
         "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo" | "contactRepo" | "taskRepo"
     >,
+    cache?: ResolutionCache,
 ): Promise<PropertyValueData[]> {
     const isMessage = target.startsWith("message:");
     const isCalendarEvent = target.startsWith("calendarEvent:");
@@ -316,7 +330,7 @@ export async function resolvePropertyValues(
     const folderInfo =
         isMessage || isCalendarEvent || isContact || isTask
             ? undefined
-            : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo);
+            : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo, cache);
     const messageInfo = isMessage ? await resolveMessageInfo(target, context.messageRepo) : undefined;
     const calendarEventInfo = isCalendarEvent ? await resolveCalendarEventInfo(target, context.calendarEventRepo) : undefined;
     const contactInfo = isContact && context.contactRepo ? await resolveContactInfo(target, context.contactRepo) : undefined;
@@ -324,8 +338,16 @@ export async function resolvePropertyValues(
 
     let callerAddress = "";
     if (isCalendarEvent) {
-        const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
-        callerAddress = mailbox?.primarySmtpAddress ?? "";
+        if (cache) {
+            if (cache.callerAddress === undefined) {
+                const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
+                cache.callerAddress = mailbox?.primarySmtpAddress ?? "";
+            }
+            callerAddress = cache.callerAddress ?? "";
+        } else {
+            const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
+            callerAddress = mailbox?.primarySmtpAddress ?? "";
+        }
     }
 
     return columns.map((column) => {

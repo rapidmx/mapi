@@ -45,6 +45,25 @@ describe("NamedPropertyRegistry Tests", () => {
             const upper = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT.toUpperCase(), kind: "lid", lid: 1 });
             expect(upper).toBe(lower);
         });
+
+        it("Returns 0x0000 for a new name once the session's entire 0x8000-0xFFFF ID space is exhausted, without throwing.", () => {
+            const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+            session.nextNamedPropertyId = 0xffff;
+            const last = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 1 });
+            expect(last).toBe(0xffff);
+
+            const overflowed = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 2 });
+            expect(overflowed).toBe(0x0000);
+        });
+
+        it("Still returns a name's real ID after exhaustion if it was registered before the registry filled up.", () => {
+            const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+            const early = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 1 });
+            session.nextNamedPropertyId = 0x10000;
+
+            expect(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 1 })).toBe(early);
+            expect(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 2 })).toBe(0x0000);
+        });
     });
 
     describe("resolveNamedProperty", () => {

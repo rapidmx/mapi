@@ -155,3 +155,102 @@ against `MailFilterRule` in particular was considered and set aside as a separat
   net +35 new tests), 100% statement/function/line coverage, 98.82% branch (comfortably above this package's own
   95% floor). `yarn build`/`yarn tsc --noEmit`/`yarn lint` all clean. Not committed - left staged/unstaged per
   the standing commit-discipline rule.
+
+### 2026-09-09 — Two-agent adversarial review + fix pass: DoS, correctness, and O(n²) session-registry bugs
+
+Prompted by "review this codebase using two adversarial agents, look for correctness, bugs, vulnerabilities and
+bottlenecks" followed by "fix everything." Ran two independent `general-purpose` agents in parallel (one
+correctness/security-focused, one performance/independent-correctness-focused, neither seeing the other's
+output), then personally verified every high/critical claim by reading the actual source before trusting it -
+one claimed bug (recurrence/location silently cleared on `RopSaveChangesMessage` update) turned out to be
+backend-dependent when traced through `RepoUtils.update()` (SQL's TypeORM skips `undefined` fields; Mongo's
+behavior depends on a third-party BSON default I couldn't pin down statically) - only the `title` half of that
+claim was unconditionally true, so that's what got reported as CONFIRMED, and the fix (below) closes both
+regardless of the backend nuance by making it correct-by-construction instead of relying on undefined-skipping.
+
+**Fixed, in order of severity:**
+- **Critical DoS**: `PropertyValue.ts`'s `readCountedArray()` looped a client-controlled `uint32` element count
+  with no cap, and `BufferCursor.ts`'s `readNullTerminatedUtf16LE`/`readNullTerminatedString8` never threw at
+  end-of-buffer (returned `""` and kept going) despite the class's own doc comment claiming every read "bounds-
+  checks and throws" - together, one `RopSetProperties` call (reachable before the handler even validates its
+  target handle) with a `PtypMultipleString` count of `0xFFFFFFFF` could hang or OOM the whole process. Both
+  string readers now throw when no terminator is found before the buffer ends; `readCountedArray` independently
+  rejects any count exceeding the buffer's actual remaining bytes, since every element needs ≥1 byte.
+- **`readBytes()` silently clamping instead of throwing** on a negative or oversized length - `Buffer.subarray`
+  doesn't throw, so a malformed `RopSize < 2` rewound `decodeRopBuffer`'s cursor backwards and mis-parsed the
+  handle table instead of failing loudly. Now bounds-checked explicitly.
+- **Four separate uint16-response-field overflows** that turned ordinary (not just malicious) client usage into
+  a 500: `RopBuffer.ts`'s `encodeRopBuffer` writes `RopSize` as a uint16 with no cap on `ropsList.length`
+  (`RopQueryRows` against a few hundred messages already exceeds it), `RopReadStreamHandler`'s `DataSize` and
+  `RopFastTransferSourceGetBufferHandler`'s `TransferBufferSize` both used a 32-bit requested/remaining size
+  unclamped before a 16-bit write. Fixed `RopReadStream`/`FastTransferSourceGetBuffer` by clamping to `0xFFFF`
+  and letting the client page for the rest (spec-legal - real Exchange does exactly this). **Not** fixed at the
+  `encodeRopBuffer` level itself (would need a shared byte-budget threaded through every ROP in an `Execute`
+  batch, a materially bigger change) - `RopQueryRows` was the one call site actually exercising this, and it's
+  now addressed by the same pattern as the other two if it ever needs it; flagged as a narrower remaining gap
+  in that handler's own doc comment rather than silently left unaddressed.
+- **`RopSetColumns` silently succeeding for a missing/wrong-type handle** (`if (handle) {...}` with no `else` -
+  every sibling ROP validates and returns `MAPI_E_INVALID_OBJECT`). Now matches the sibling pattern.
+- **`RopLogon` wholesale-replacing `session.folderIds`** on every call, discarding child-folder FIDs a client
+  had already learned via `RopGetHierarchyTable`/`RopQueryRows` on a re-logon (spec-legal within one session) -
+  and risking a re-issued FID silently pointing at a *different* folder. Fixed by having `RopLogon` assign its
+  13 special-folder FIDs through the exact same `FolderTarget.assignOrGetFid` reuse-or-mint logic child folders
+  already use, instead of a bespoke always-reset-to-1 counter.
+- **`RopSaveChangesMessage` blanking a calendar event's title** (unconditionally, any backend) whenever an
+  update touched some other property without resending `PidTagSubject` - `decodeCalendarFieldsFromDraft`
+  defaulted an absent `PidTagSubject` to `""` instead of leaving it `undefined` the way every other optional
+  field already did, and the update path had no existing-value fallback for it (unlike `startDate`/`endDate`/
+  `busyStatus`/`timezone`, which already did). Fixed `title` to stay `undefined` when absent and added the same
+  `?? existing.xxx` fallback to `location`/`recurrenceRule`/`reminderMinutesBeforeStart` too, closing the
+  backend-dependent uncertainty on those by making the fallback explicit rather than relying on `update()`'s
+  undefined-handling.
+- **`RopDeleteFolder` not knowing about Contacts/Tasks folder content** - emptiness was checked only against
+  `messageRepo`/`calendarEventRepo`, so a non-empty Contacts/Tasks folder could be deleted without `DEL_MESSAGES`
+  and orphan its `Contact`/`Task` rows (a real regression from the 2026-09-08 Contacts/Tasks feature work, not
+  the documented "browse-only" limitation). Both repos now participate in the emptiness check and delete
+  cascade, including the recursive subfolder path - guarded the same optional-repo way `RopGetContentsTableHandler`
+  already does.
+- **Meeting-response correlation was unreachable by a real Outlook client, not just a documented limitation**:
+  `GlobalObjectId.ts`'s own doc comment claimed this server always embeds the `GlobalObjectId` it generates into
+  the invites it sends - but `RopSubmitMessageHandler.submitAppointment()`'s ICS only ever emits a bare `UID:`
+  line (invites go out as plain SMTP/iCalendar, not native MAPI Store objects), and `encodeGlobalObjectId` had
+  zero call sites outside its own test file. A real client therefore always *synthesizes* its own
+  `PidLidGlobalObjectId` from that bare UID using the standard `"vCal-Uid"`-wrapped `VCALID` form
+  (`[MS-ASEMAIL]` §2.2.2.37 / the equivalent `[MS-OXCICAL]` algorithm - verified against Microsoft's own docs
+  before implementing, the same bar applied to every other spec claim in this codebase), which the codec's
+  bare-UTF8-bytes decode didn't recognize. Rewrote `encodeGlobalObjectId`/`decodeGlobalObjectId` to build/parse
+  the real `VCALID` wire form (falling back to raw bytes for the `OutlookID` case a native Exchange server
+  produces, which this server's own SMTP-based flow never does but decodes for completeness) - this is a real
+  functional fix, not just documentation, since accept/decline responses from a genuine Outlook client would
+  never have correlated back to the right `CalendarEvent` before this.
+- **NSPI `GetMatches` `TypeError`** on a `Contact` whose `emails` field is missing entirely (optional-chained
+  the array element, not the array itself) - low real-world likelihood (`@rapidmx/restapi`'s `Contact` always
+  initializes `emails: []`) but cheap to close and inconsistent with `ContactTarget.ts`'s own fully-guarded
+  version of the identical lookup.
+- **O(n²) session registries**: `FolderTarget.assignOrGetFid`/`MessageTarget.assignOrGetMid` did a linear scan
+  of a session-lifetime-cumulative map on every single table row, and `NamedPropertyRegistry
+  .assignOrGetNamedPropertyId` did the same plus a `Math.max(...spread)` id-allocation that risked
+  `RangeError: Maximum call stack size exceeded` on a session that registered enough named properties (past
+  V8's argument-spread limit) - the code's own prior comments claimed these scans were "never a real cost,"
+  which wasn't true once you account for the registry being cumulative across a whole session's worth of table
+  paging, not reset per page. All three now use an O(1) reverse-index/counter pair (`session.folderTargetIds`/
+  `nextFolderId`, `messageTargetIds`/`nextMessageId`, `namedPropertyIds`/`nextNamedPropertyId` - new
+  `MapiSessionContext` fields, small and purely additive to session-cache size, unlike the alternative of
+  caching whole resolved entities would have been). `assignOrGetNamedPropertyId` also now returns `0x0000`
+  ("unmappable," a real spec-defined value already used for `Kind = 0xFF`) once the `0x8000`-`0xFFFF` ID space
+  is exhausted, instead of assigning an out-of-range id that later crashed a 16-bit write.
+- **Redundant identical per-row queries**: `RopQueryRowsHandler`/`RopGetPropertiesSpecificHandler` now share one
+  request-scoped `ResolutionCache` (`PropertyResolvers.ts`) across every row/column resolved in one call, so a
+  hierarchy table's `hasChildren` (which re-fetched the mailbox's *entire* folder list per row via
+  `resolveFolderChildren`) and a calendar table's organizer/attendee mailbox lookup each happen at most once per
+  call instead of once per row. **Deliberately not fixed**: the deeper per-row `repo.findOne(uid)` N+1 for
+  distinct message/calendarEvent/contact/task rows - a real batched fix needs a backend-agnostic "fetch these
+  uids" query this codebase's `RepoUtils<T>` abstraction doesn't expose (Mongo's `$in` and TypeORM's `In()`
+  aren't interchangeable at a call site that doesn't know which backend it's running against), and caching
+  whole resolved entities in session state instead would make the already-flagged session-serialization-size
+  problem (large `session.handles`/`messageIds` re-`JSON.stringify`'d on every `Execute`) significantly worse -
+  documented as a known limitation in `RopQueryRowsHandler`'s own doc comment rather than attempted blind.
+  Also parallelized `RopLogonHandler`'s four sequential per-special-folder repo lookups via `Promise.all`.
+- Full suite: 472/472 passing (up from 447, +25 net new tests targeting each fix specifically - not just
+  "still passes" coverage). 100% statement/function/line, 99.14% branch. `yarn build`/`yarn tsc --noEmit`/
+  `yarn lint` clean. Not committed - left staged/unstaged per the standing commit-discipline rule.

@@ -149,6 +149,111 @@ describe("RopDeleteFolderHandler Tests", () => {
         expect((context.folderRepo as any).delete).toHaveBeenCalledWith("target", { ignoreACL: true, purge: false });
     });
 
+    it("Returns MAPI_E_INVALID_OBJECT for a Contacts folder with contacts when DEL_MESSAGES isn't set, without deleting anything.", async () => {
+        const context = makeContext({
+            contactRepo: { find: vi.fn().mockResolvedValue([{ uid: "c1" }]), delete: vi.fn() } as any,
+        });
+        context.session.handles[5] = { type: "folder", entityUid: "folder:parent" };
+        context.session.folderIds = { "1": "folder:target" };
+        const handler = new RopDeleteFolderHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect((context.folderRepo as any).delete).not.toHaveBeenCalled();
+        expect((context.contactRepo as any).delete).not.toHaveBeenCalled();
+    });
+
+    it("Returns MAPI_E_INVALID_OBJECT for a Tasks folder with tasks when DEL_MESSAGES isn't set.", async () => {
+        const context = makeContext({
+            taskRepo: { find: vi.fn().mockResolvedValue([{ uid: "t1" }]), delete: vi.fn() } as any,
+        });
+        context.session.handles[5] = { type: "folder", entityUid: "folder:parent" };
+        context.session.folderIds = { "1": "folder:target" };
+        const handler = new RopDeleteFolderHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect((context.taskRepo as any).delete).not.toHaveBeenCalled();
+    });
+
+    it("Deletes contacts and tasks, then the folder, when DEL_MESSAGES is set.", async () => {
+        const context = makeContext({
+            contactRepo: { find: vi.fn().mockResolvedValue([{ uid: "c1" }]), delete: vi.fn().mockResolvedValue(undefined) } as any,
+            taskRepo: { find: vi.fn().mockResolvedValue([{ uid: "t1" }]), delete: vi.fn().mockResolvedValue(undefined) } as any,
+        });
+        context.session.handles[5] = { type: "folder", entityUid: "folder:parent" };
+        context.session.folderIds = { "1": "folder:target" };
+        const handler = new RopDeleteFolderHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ deleteFolderFlags: DEL_MESSAGES })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0);
+
+        expect((context.contactRepo as any).delete).toHaveBeenCalledWith("c1", { ignoreACL: true, purge: false });
+        expect((context.taskRepo as any).delete).toHaveBeenCalledWith("t1", { ignoreACL: true, purge: false });
+        expect((context.folderRepo as any).delete).toHaveBeenCalledWith("target", { ignoreACL: true, purge: false });
+    });
+
+    it("Treats a folder as empty for contacts/tasks purposes when contactRepo/taskRepo are absent from the context.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "folder", entityUid: "folder:parent" };
+        context.session.folderIds = { "1": "folder:target" };
+        const handler = new RopDeleteFolderHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0);
+        expect((context.folderRepo as any).delete).toHaveBeenCalledWith("target", { ignoreACL: true, purge: false });
+    });
+
+    it("Cascades contact/task deletion into recursively-deleted subfolders too.", async () => {
+        const folderFind = vi.fn().mockImplementation(({ parentFolderUid }: { parentFolderUid: string }) => {
+            if (parentFolderUid === "target") return Promise.resolve([{ uid: "child1" }]);
+            return Promise.resolve([]);
+        });
+        const contactFind = vi.fn().mockImplementation(({ folderUid }: { folderUid: string }) => {
+            if (folderUid === "child1") return Promise.resolve([{ uid: "child-contact" }]);
+            return Promise.resolve([]);
+        });
+        const taskFind = vi.fn().mockImplementation(({ folderUid }: { folderUid: string }) => {
+            if (folderUid === "child1") return Promise.resolve([{ uid: "child-task" }]);
+            return Promise.resolve([]);
+        });
+        const context = makeContext({
+            folderRepo: { find: folderFind, delete: vi.fn().mockResolvedValue(undefined) } as any,
+            contactRepo: { find: contactFind, delete: vi.fn().mockResolvedValue(undefined) } as any,
+            taskRepo: { find: taskFind, delete: vi.fn().mockResolvedValue(undefined) } as any,
+        });
+        context.session.handles[5] = { type: "folder", entityUid: "folder:parent" };
+        context.session.folderIds = { "1": "folder:target" };
+        const handler = new RopDeleteFolderHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ deleteFolderFlags: DEL_FOLDERS })), writer, context);
+
+        expect((context.contactRepo as any).delete).toHaveBeenCalledWith("child-contact", { ignoreACL: true, purge: false });
+        expect((context.taskRepo as any).delete).toHaveBeenCalledWith("child-task", { ignoreACL: true, purge: false });
+        expect((context.folderRepo as any).delete).toHaveBeenCalledWith("child1", { ignoreACL: true, purge: false });
+    });
+
     it("Returns MAPI_E_INVALID_OBJECT for a folder with subfolders when DEL_FOLDERS isn't set.", async () => {
         const context = makeContext({
             folderRepo: {

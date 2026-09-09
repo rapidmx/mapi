@@ -80,6 +80,25 @@ describe("RopReadStreamHandler Tests", () => {
         expect(context.session.handles[6]?.streamPosition).toBe(4);
     });
 
+    it("Clamps DataSize to 0xFFFF even when MaximumByteCount asks for more than a uint16 can carry, instead of throwing.", async () => {
+        const context = await makeContext();
+        // A body far larger than 0xFFFF bytes so the clamp is actually exercised, not just requested.
+        const bigBody = "x".repeat(40000);
+        await context.blobStore.put("bodies/m1", Buffer.from(`Subject: Hi\r\n\r\n${bigBody}`));
+        const handler = new RopReadStreamHandler();
+        const writer = new BufferWriter();
+
+        await handler.handle(new BufferReader(buildRequest({ byteCount: 0xbabe, maximumByteCount: 0x00100000 })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0); // ReturnValue - success, not a RangeError
+        const dataSize = response.readUInt16LE();
+        expect(dataSize).toBe(0xffff);
+        expect(context.session.handles[6]?.streamPosition).toBe(0xffff);
+    });
+
     it("Uses MaximumByteCount when ByteCount is the 0xBABE sentinel.", async () => {
         const context = await makeContext();
         const handler = new RopReadStreamHandler();

@@ -137,14 +137,14 @@ export class RopSaveChangesMessageHandler implements RopHandler {
                     {
                         uid: existing.uid,
                         version: existing.version,
-                        title: decoded.title,
-                        location: decoded.location,
+                        title: decoded.title ?? existing.title,
+                        location: decoded.location ?? existing.location,
                         startDate: decoded.startDate ?? existing.startDate,
                         endDate: decoded.endDate ?? existing.endDate,
                         busyStatus: decoded.busyStatus ?? existing.busyStatus,
-                        recurrenceRule: decoded.recurrenceRule,
+                        recurrenceRule: decoded.recurrenceRule ?? existing.recurrenceRule,
                         timezone: decoded.timezone ?? existing.timezone,
-                        reminderMinutesBeforeStart: decoded.reminderMinutesBeforeStart,
+                        reminderMinutesBeforeStart: decoded.reminderMinutesBeforeStart ?? existing.reminderMinutesBeforeStart,
                         attendees: attendees.length > 0 ? attendees : existing.attendees,
                     },
                     existing,
@@ -163,7 +163,7 @@ export class RopSaveChangesMessageHandler implements RopHandler {
             new context.calendarEventClass({
                 folderUid,
                 mailboxUid: context.mailboxUid,
-                title: decoded.title,
+                title: decoded.title ?? "",
                 location: decoded.location,
                 startDate: decoded.startDate ?? new Date(),
                 endDate: decoded.endDate ?? new Date(),
@@ -183,8 +183,13 @@ export class RopSaveChangesMessageHandler implements RopHandler {
     }
 }
 
+/** Every field but `attendeeAddresses` is deliberately optional and left `undefined` when this particular
+ * `RopSetProperties` call never touched it - `undefined` here specifically means "the client didn't set this
+ * property this time," distinct from a real, deliberately-empty value (e.g. clearing `PidTagSubject` to `""`).
+ * `saveAppointment`'s update branch relies on this distinction to fall back to the existing row's own value for
+ * an untouched field instead of blanking it - see that method's own doc comment. */
 interface DecodedCalendarFields {
-    title: string;
+    title?: string;
     location?: string;
     startDate?: Date;
     endDate?: Date;
@@ -200,10 +205,19 @@ interface DecodedCalendarFields {
  * `PropertyResolvers.calendarEventValueFor`'s read-side switch, sharing the same `CalendarNamedProperties.ts`
  * LID table. `PidTagDisplayTo`/`Cc` (not `Bcc` - a meeting has no concept of a blind attendee) become
  * `attendeeAddresses`, matching `RopSubmitMessageHandler`'s own mail-side addressing pragmatic subset (no
- * `RopModifyRecipients` support - see that file's own doc comment). */
+ * `RopModifyRecipients` support - see that file's own doc comment).
+ *
+ * `title` used to default to `""` whenever `PidTagSubject` wasn't present in `properties` at all, rather than
+ * staying `undefined` the way every other optional field here already did (the named-property loop below only
+ * ever assigns a field when its key is actually present) - `saveAppointment`'s update branch then wrote that
+ * `""` straight through with no existing-value fallback, silently blanking the title of any event edited via a
+ * `RopSetProperties` call that only touched some other property (e.g. just `PidLidBusyStatus`). Checking `in`
+ * explicitly (rather than `properties[key] ?? ""`) preserves the same "present but genuinely empty" vs.
+ * "absent" distinction `PidTagSubject` deserves alongside every other field here. */
 function decodeCalendarFieldsFromDraft(session: MapiSessionContext, properties: Record<string, string>): DecodedCalendarFields {
+    const subjectKey = String(PID_TAG_SUBJECT);
     const decoded: DecodedCalendarFields = {
-        title: properties[String(PID_TAG_SUBJECT)] ?? "",
+        title: subjectKey in properties ? properties[subjectKey] : undefined,
         attendeeAddresses: [
             ...parseAddressList(properties[String(PID_TAG_DISPLAY_TO)]),
             ...parseAddressList(properties[String(PID_TAG_DISPLAY_CC)]),

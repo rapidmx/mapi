@@ -16,13 +16,22 @@ const ERROR_INVALID_OBJECT = 0x80070005;
  * field instead" (`[MS-OXCPRPT]`'s own `RopReadStream` request-buffer page). */
 const BYTE_COUNT_USE_MAXIMUM = 0xbabe;
 
+/** The response's own `DataSize` field is a 16-bit count (`[MS-OXCPRPT]`'s own `RopReadStream` response-buffer
+ * page), so a single call can never actually return more than this many bytes - regardless of what `ByteCount`/
+ * `MaximumByteCount` (a full 32-bit value in the latter case) the client asked for. Returning fewer bytes than
+ * requested is spec-legal (the client just calls `RopReadStream` again for the rest, exactly how paging a large
+ * stream is meant to work) - `writeUInt16LE` throwing `RangeError` for an out-of-range value is not. */
+const MAX_DATA_SIZE = 0xffff;
+
 /**
  * `RopReadStream` (`[MS-OXCPRPT]`/`[MS-OXCROPS]`): reads up to `ByteCount` (or `MaximumByteCount`, if
  * `ByteCount` is the `0xBABE` sentinel) bytes from an already-opened stream (`RopOpenStream`), advancing the
- * stream's read position. Unlike most other ROPs in this pragmatic subset, `[MS-OXCROPS]` documents only one
- * combined response-buffer shape for this ROP (no separate Success/Failure pages) - `DataSize`/`Data` are
- * always present, `DataSize = 0` (empty `Data`) standing in for the failure case rather than the fields being
- * omitted entirely.
+ * stream's read position - clamped to `MAX_DATA_SIZE` (`0xFFFF`) regardless of what the client asked for, since
+ * the response's own `DataSize` field can't carry more than that; a client wanting more of a large body simply
+ * calls `RopReadStream` again from the advanced `streamPosition`, the same paging behavior real Exchange uses.
+ * Unlike most other ROPs in this pragmatic subset, `[MS-OXCROPS]` documents only one combined response-buffer
+ * shape for this ROP (no separate Success/Failure pages) - `DataSize`/`Data` are always present, `DataSize = 0`
+ * (empty `Data`) standing in for the failure case rather than the fields being omitted entirely.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -46,7 +55,7 @@ export class RopReadStreamHandler implements RopHandler {
 
         const bytes = await resolveMessageBodyBytes(handle.entityUid, context.messageRepo, context.blobStore);
         const position = handle.streamPosition ?? 0;
-        const slice = bytes.subarray(position, position + requestedCount);
+        const slice = bytes.subarray(position, position + Math.min(requestedCount, MAX_DATA_SIZE));
         handle.streamPosition = position + slice.length;
 
         writer.writeUInt8(ROP_ID_READ_STREAM);

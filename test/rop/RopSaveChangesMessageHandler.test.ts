@@ -259,6 +259,47 @@ describe("RopSaveChangesMessageHandler Tests", () => {
             expect(context.session.handles[5]?.entityUid).toBe("calendarEvent:evt1");
         });
 
+        it("Preserves title/location/recurrenceRule/reminder on an update that only touches an unrelated property (e.g. just PidLidBusyStatus), instead of blanking them.", async () => {
+            const context = makeContext();
+            const existing = {
+                uid: "evt1",
+                version: 3,
+                title: "Weekly Standup",
+                location: "Room 9",
+                startDate: new Date("2026-01-01T00:00:00.000Z"),
+                endDate: new Date("2026-01-01T01:00:00.000Z"),
+                busyStatus: BusyStatus.FREE,
+                timezone: "America/Los_Angeles",
+                recurrenceRule: { freq: "weekly", interval: 1, exceptions: [] },
+                reminderMinutesBeforeStart: 15,
+                attendees: [{ address: "existing@example.com", role: "required", responseStatus: "needsAction", isOrganizer: false }],
+            };
+            const calendarEventRepo = {
+                findOne: vi.fn().mockResolvedValue(existing),
+                update: vi.fn().mockResolvedValue(undefined),
+            };
+            context.calendarEventRepo = calendarEventRepo as any;
+            const busyStatusId = assignOrGetNamedPropertyId(context.session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_BUSY_STATUS });
+            context.session.handles[5] = {
+                type: "message",
+                entityUid: "calendarEvent:evt1",
+                // Only PidTagMessageClass + PidLidBusyStatus this call - Subject/Location/Recur/ReminderDelta
+                // are all deliberately absent, exactly the "routine free/busy toggle" scenario this fix covers.
+                draftProperties: { "26": "IPM.Appointment", [String(busyStatusId)]: "2" }, // 2 = BUSY
+            };
+            const handler = new RopSaveChangesMessageHandler();
+            const writer = new BufferWriter();
+
+            await handler.handle(new BufferReader(buildRequest({})), writer, context);
+
+            const [delta] = calendarEventRepo.update.mock.calls[0];
+            expect(delta.title).toBe(existing.title);
+            expect(delta.location).toBe(existing.location);
+            expect(delta.recurrenceRule).toEqual(existing.recurrenceRule);
+            expect(delta.reminderMinutesBeforeStart).toBe(existing.reminderMinutesBeforeStart);
+            expect(delta.busyStatus).toBe(BusyStatus.BUSY); // the one field this call actually changed
+        });
+
         it("Overwrites attendees on an update when DisplayTo/Cc were re-set this call.", async () => {
             const context = makeContext();
             const existing = {

@@ -123,6 +123,26 @@ describe("PropertyValue Tests", () => {
             expect(readPropertyValue(new BufferReader(Buffer.alloc(0)), PropertyType.PtypNull)).toBe(0);
         });
 
+        it("Throws instead of looping when a PtypMultipleString element count lies about how many elements the buffer actually holds.", () => {
+            const writer = new BufferWriter();
+            writer.writeUInt32LE(0xffffffff); // a client claiming ~4.29 billion elements
+            writer.writeNullTerminatedUtf16LE("only one real element");
+            expect(() => readPropertyValue(new BufferReader(writer.toBuffer()), PropertyType.PtypMultipleString)).toThrow(/element count/i);
+        });
+
+        it("Throws instead of looping when a PtypMultipleString8 element count lies about how many elements the buffer actually holds.", () => {
+            const writer = new BufferWriter();
+            writer.writeUInt32LE(0xffffffff);
+            writer.writeNullTerminatedString8("only one real element");
+            expect(() => readPropertyValue(new BufferReader(writer.toBuffer()), PropertyType.PtypMultipleString8)).toThrow(/element count/i);
+        });
+
+        it("Accepts a count that is large but still within what the buffer could actually hold.", () => {
+            // 3 single-character strings each take 4 bytes (2 UTF-16LE code units incl. terminator) - a count of
+            // 3 against a buffer with exactly that many bytes is legitimate, not an oversized lie.
+            expect(roundTrip(PropertyType.PtypMultipleString, ["a", "b", "c"])).toEqual(["a", "b", "c"]);
+        });
+
         it("Throws for an unsupported PropertyType.", () => {
             expect(() => readPropertyValue(new BufferReader(Buffer.alloc(0)), 0x00fd as PropertyType)).toThrow(
                 /unsupported PropertyType/i,

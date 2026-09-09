@@ -8,6 +8,7 @@
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
 import { decodeGuid } from "../../src/codec/MapiGuid.js";
 import { RopLogonHandler } from "../../src/rop/RopLogonHandler.js";
+import { assignOrGetFid } from "../../src/rop/FolderTarget.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { FolderType } from "@rapidmx/restapi";
@@ -112,6 +113,24 @@ describe("RopLogonHandler Tests", () => {
         // Root remains virtual regardless - this data model has no real backing row for it.
         const rootFid = Object.keys(context.session.folderIds)[0];
         expect(context.session.folderIds[rootFid]).toBe("virtual:root");
+    });
+
+    it("A second RopLogon on the same session preserves FIDs already assigned to child folders (does not wholesale-reset session.folderIds).", async () => {
+        const folderRepo = { find: vi.fn().mockResolvedValue([]) };
+        const context = makeContext(folderRepo);
+        const handler = new RopLogonHandler();
+
+        await handler.handle(new BufferReader(buildLogonRequest({ outputHandleIndex: 0 })), new BufferWriter(), context);
+        // Simulate a client having discovered a child folder via RopGetHierarchyTable/RopQueryRows after the
+        // first logon - this gets FID 14, the first one past the 13 specials.
+        const childFid = assignOrGetFid(context.session, "folder:child-uid");
+        expect(childFid).toBe(14);
+
+        await handler.handle(new BufferReader(buildLogonRequest({ outputHandleIndex: 1 })), new BufferWriter(), context);
+
+        expect(context.session.folderIds[String(childFid)]).toBe("folder:child-uid");
+        // The 13 specials also keep their original FIDs across the second logon, not a fresh 1-13 renumbering.
+        expect(Object.keys(context.session.folderIds).filter((fid) => Number(fid) <= 13)).toHaveLength(13);
     });
 
     it("Never trusts the request's Essdn field for mailbox identity - consumes it but ignores its value.", async () => {

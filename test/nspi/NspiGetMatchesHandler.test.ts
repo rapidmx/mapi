@@ -118,6 +118,25 @@ describe("handleNspiGetMatches Tests", () => {
         expect(readPropertyValue(reader, propertyType)).toBe(0);
     });
 
+    it("Does not throw when a contact's own emails field is missing entirely (not just empty), degrading EmailAddress to empty string.", async () => {
+        const contactRepo = { find: vi.fn().mockResolvedValue([{ uid: "c1", displayName: "No Emails Field" }]) };
+        const req = buildRequest((writer) => {
+            writer.writeUInt32LE(0);
+            writer.writeUInt8(0);
+            writer.writeUInt8(0);
+            writer.writeUInt32LE(0);
+            writer.writeUInt8(0); // HasFilter
+            writer.writeUInt8(0); // HasPropertyName
+            writer.writeUInt32LE(50);
+            writer.writeUInt8(0);
+            writer.writeUInt32LE(0);
+        });
+        const res = makeRes();
+
+        await expect(handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s)).resolves.not.toThrow();
+        expect(res.status).toHaveBeenCalledWith(200);
+    });
+
     it("Reports HasMinimalIds=0 and HasColumnsAndRows=0 (no MinimalIdCount/RowCount/RowData at all) when there are zero matches.", async () => {
         const contactRepo = { find: vi.fn().mockResolvedValue([]) };
         const req = buildRequest((writer) => {

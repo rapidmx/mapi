@@ -151,6 +151,27 @@ describe("RopFastTransferSourceGetBufferHandler Tests", () => {
         expect(response.readUInt16LE()).toBe(500);
     });
 
+    it("Clamps TransferBufferSize to 0xFFFF for the 0xBABE sentinel when the buffer exceeds a uint16, reporting Partial instead of throwing.", () => {
+        const context = makeContext();
+        const payload = Buffer.alloc(70000, 0x41); // far larger than 0xFFFF bytes
+        context.session.handles[5] = { type: "fastTransfer", entityUid: "folder:f1", transferBufferBase64: payload.toString("base64"), transferPosition: 0 };
+        const handler = new RopFastTransferSourceGetBufferHandler();
+        const writer = new BufferWriter();
+
+        handler.handle(new BufferReader(buildRequest({ bufferSize: BUFFER_SIZE_SERVER_DETERMINED, maximumBufferSize: 32768 })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0); // ReturnValue - success, not a RangeError
+        expect(response.readUInt16LE()).toBe(0x0001); // Partial - more remains past the 0xFFFF cap
+        response.readUInt16LE();
+        response.readUInt16LE();
+        response.readUInt8();
+        expect(response.readUInt16LE()).toBe(0xffff);
+        expect(context.session.handles[5]?.transferPosition).toBe(0xffff);
+    });
+
     it("Treats an absent transferBufferBase64 as an empty buffer, reporting Done with a zero-length chunk.", () => {
         const context = makeContext();
         context.session.handles[5] = { type: "fastTransfer", entityUid: "folder:f1" };

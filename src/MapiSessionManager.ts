@@ -79,11 +79,25 @@ export class MapiSessionContext extends SimpleEntity {
      * `RopLogon`, read back by a later `RopOpenFolder`. */
     public folderIds: Record<string, string> = {};
 
+    /** The reverse of `folderIds` (target -> FID) plus a monotonic counter, maintained alongside it by
+     * `FolderTarget.assignOrGetFid`/`RopLogonHandler` so "does this target already have a FID" is an O(1)
+     * lookup instead of a linear scan of `folderIds` repeated once per table row - see `assignOrGetFid`'s own
+     * doc comment for why the scan this replaces was a genuine (not just theoretical) quadratic cost across a
+     * session's lifetime. Small and purely additive to session state (one more string-keyed map of numbers,
+     * the same order of magnitude as `folderIds` itself), unlike caching whole resolved rows would be. */
+    public folderTargetIds: Record<string, number> = {};
+    public nextFolderId = 1;
+
     /** This session's MID assignments, keyed by MID (decimal string), valued `"message:<uid>"` - the message
      * analog of `folderIds` above. Unlike `folderIds` (pre-populated by `RopLogon`), a MID only ever comes into
      * existence lazily, the first time a `RopQueryRows` row exposes a message's `PidTagMid` column (see
      * `MessageTarget.assignOrGetMid`), read back by a later `RopOpenMessage`. */
     public messageIds: Record<string, string> = {};
+
+    /** The reverse of `messageIds` (target -> MID) plus a monotonic counter - the message analog of
+     * `folderTargetIds`/`nextFolderId` above, for the identical O(1)-lookup reason. */
+    public messageTargetIds: Record<string, number> = {};
+    public nextMessageId = 1;
 
     /** This session's `RopGetPropertyIdsFromNames` mapping table (`[MS-OXCPRPT]` §2.2.12), keyed by a JSON
      * string encoding of the `{guid, kind, lid|name}` `PropertyName` the numeric ID was assigned to - see
@@ -92,6 +106,13 @@ export class MapiSessionContext extends SimpleEntity {
      * one - `PidLidAppointmentStartWhole`, `PidLidBusyStatus`, `PidLidAppointmentRecur`, ...) through this table
      * once per session before ever setting/reading it via `RopSetProperties`/`RopGetPropertiesSpecific`. */
     public namedProperties: Record<string, number> = {};
+
+    /** The reverse of `namedProperties` (numeric ID -> `PropertyName` JSON key) plus a monotonic counter -
+     * `NamedPropertyRegistry.ts`'s own doc comment covers why both the O(n) forward scan this replaces and the
+     * `Math.max(...spread)` id-allocation it used are real problems, not just theoretical ones, at real
+     * mailbox/session scale. */
+    public namedPropertyIds: Record<number, string> = {};
+    public nextNamedPropertyId = 0x8000;
 
     /** `mailboxUid`/`userUid` are always known at construction time (the only call site is
      * `MapiSessionManager.create()`, which resolves both up front) - required here rather than optional with

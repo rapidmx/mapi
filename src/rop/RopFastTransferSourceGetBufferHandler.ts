@@ -13,9 +13,16 @@ const ROP_ID_GET_BUFFER = 0x4e;
 const ERROR_INVALID_OBJECT = 0x80070005;
 
 /** The `BufferSize` sentinel (`[MS-OXCROPS]`'s own documented value) meaning "let the server pick the chunk
- * size" - honored here as "return the whole remaining buffer in one call", the simplest spec-valid choice for
- * this pragmatic subset's already-fully-built-in-memory transfer buffers. */
+ * size". */
 const BUFFER_SIZE_SERVER_DETERMINED = 0xbabe;
+
+/** The response's own `TransferBufferSize` field is a 16-bit count (`[MS-OXCFXICS]`'s own `RopFastTransferSourceGetBuffer`
+ * response-buffer page), so a single call can never actually return more than this many bytes. For the
+ * `0xBABE` "server-determined" sentinel this caps what would otherwise be "the entire remaining buffer in one
+ * call" (only spec-valid when that buffer happens to fit in a `uint16`) down to the same paging behavior a
+ * client-specified `BufferSize` already gets - `writeUInt16LE` throwing `RangeError` for an out-of-range value
+ * is not spec-valid for any size of transfer. */
+const MAX_TRANSFER_BUFFER_SIZE = 0xffff;
 
 /** `TransferStatus` values (`[MS-OXCFXICS]` §2.2.3.1.1.5.2, confirmed this session) - only the two this
  * pragmatic subset (which never errors mid-transfer once a `"fastTransfer"` handle exists, and never returns
@@ -26,12 +33,12 @@ const TRANSFER_STATUS_DONE = 0x0003;
 /**
  * `RopFastTransferSourceGetBuffer` (`[MS-OXCFXICS]`/`[MS-OXCROPS]`, RopId `0x4E`): pages the FastTransfer
  * stream a prior `RopFastTransferSourceCopyTo`/`CopyProperties` built (`FastTransferStream.ts`) out of its
- * `"fastTransfer"` handle, `BufferSize` bytes at a time (or the entire remaining buffer at once for the
- * `0xBABE` "server-determined" sentinel - `MaximumBufferSize`, present only in that case, is decoded to advance
- * the reader correctly but not honored, since this pragmatic subset's transfer buffers are already small,
- * fully-in-memory test-mailbox-scale content, not something worth capping). Reports `Done` once the whole
- * buffer has been returned across one or more calls, `Partial` otherwise - `NoRoom` and `Error` are never
- * produced (a `"fastTransfer"` handle, once created, always has a complete, already-valid buffer to page from).
+ * `"fastTransfer"` handle, `BufferSize` bytes at a time (or the entire remaining buffer, capped to
+ * `MAX_TRANSFER_BUFFER_SIZE`, for the `0xBABE` "server-determined" sentinel - `MaximumBufferSize`, present only
+ * in that case, is decoded to advance the reader correctly but not honored, since honoring it would mean
+ * returning *more* than one chunk can carry, not less). Reports `Done` once the whole buffer has been returned
+ * across one or more calls, `Partial` otherwise - `NoRoom` and `Error` are never produced (a `"fastTransfer"`
+ * handle, once created, always has a complete, already-valid buffer to page from).
  *
  * `BackoffTime` is never emitted (this pragmatic subset never returns the one `ReturnValue` that field is
  * conditional on), and the failure path (`ERROR_INVALID_OBJECT`) omits every field after `ReturnValue` entirely
@@ -62,7 +69,8 @@ export class RopFastTransferSourceGetBufferHandler implements RopHandler {
         const fullBuffer = Buffer.from(handle.transferBufferBase64 ?? "", "base64");
         const position = handle.transferPosition ?? 0;
         const remaining = fullBuffer.length - position;
-        const chunkSize = bufferSize === BUFFER_SIZE_SERVER_DETERMINED ? remaining : Math.min(bufferSize, remaining);
+        const requestedSize = bufferSize === BUFFER_SIZE_SERVER_DETERMINED ? remaining : bufferSize;
+        const chunkSize = Math.min(requestedSize, remaining, MAX_TRANSFER_BUFFER_SIZE);
         const chunk = fullBuffer.subarray(position, position + chunkSize);
         handle.transferPosition = position + chunk.length;
         const done = handle.transferPosition >= fullBuffer.length;

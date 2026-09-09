@@ -32,15 +32,34 @@ function keyFor(propertyName: PropertyName): string {
         : JSON.stringify({ guid: propertyName.guid.toLowerCase(), kind: "name", name: propertyName.name });
 }
 
+/** The highest numeric property ID a `PropertyTag`'s 16-bit `PropertyId` field can carry at all - not a
+ * pragmatic-subset choice, an absolute wire-format ceiling (`writeUInt16LE` cannot encode anything past this). */
+const LAST_NAMED_PROPERTY_ID = 0xffff;
+
 /**
  * Returns `propertyName`'s existing numeric property ID if an earlier `RopGetPropertyIdsFromNames` call in
  * this session already assigned one, otherwise assigns and remembers the next free ID starting at
- * `FIRST_NAMED_PROPERTY_ID` - the exact `FolderTarget.assignOrGetFid`/`MessageTarget.assignOrGetMid` linear-
- * registry pattern already used twice in this codebase, adapted for named properties. This pragmatic subset
- * always behaves as if the request's own `Flags` field requested "assign a new ID if unmapped" (`0x02`) -
- * real Exchange's alternative (`0x00`, "only return already-mapped IDs") exists to let a client probe without
- * committing a mailbox-wide registration; since this registry is already only ever session-scoped (not a real
- * persisted per-mailbox mapping table), there is no meaningful difference between "probe" and "assign" here.
+ * `FIRST_NAMED_PROPERTY_ID`. This pragmatic subset always behaves as if the request's own `Flags` field
+ * requested "assign a new ID if unmapped" (`0x02`) - real Exchange's alternative (`0x00`, "only return
+ * already-mapped IDs") exists to let a client probe without committing a mailbox-wide registration; since this
+ * registry is already only ever session-scoped (not a real persisted per-mailbox mapping table), there is no
+ * meaningful difference between "probe" and "assign" here.
+ *
+ * Backed by `session.namedProperties`/`namedPropertyIds` (a forward and reverse map, kept in sync) and
+ * `session.nextNamedPropertyId`, an O(1) lookup/assignment pair rather than a linear scan plus a
+ * `Math.max(...spread)` over `Object.values(session.namedProperties)` - both real costs at scale: the spread
+ * form risks a `RangeError: Maximum call stack size exceeded` once a session has registered enough distinct
+ * names to exceed V8's function-argument-count limit, and the registry only ever grows for a session's
+ * lifetime, so a linear scan repeated once per property per row is quadratic over a session that resolves many
+ * named properties.
+ *
+ * Once `nextNamedPropertyId` would exceed `LAST_NAMED_PROPERTY_ID` (32,768 distinct names already registered
+ * this session - the entire `0x8000`-`0xFFFF` numeric ID space this pragmatic subset has to hand out), a *new*
+ * name can no longer be assigned a real ID; this returns `0x0000` for it instead of throwing, the exact value
+ * `[MS-OXCPRPT]`'s own `RopGetPropertyIdsFromNames` processing rules already use for "this `PropertyName`
+ * could not be resolved" (the same value this pragmatic subset already produces for a `Kind = 0xFF` entry) -
+ * not a new failure mode, just the same one applied to a different unmappable case. A name already registered
+ * before the registry filled up keeps returning its real, previously-assigned ID.
  */
 export function assignOrGetNamedPropertyId(session: MapiSessionContext, propertyName: PropertyName): number {
     const key = keyFor(propertyName);
@@ -48,20 +67,22 @@ export function assignOrGetNamedPropertyId(session: MapiSessionContext, property
     if (existing !== undefined) {
         return existing;
     }
-    const nextId = Math.max(FIRST_NAMED_PROPERTY_ID - 1, ...Object.values(session.namedProperties)) + 1;
-    session.namedProperties[key] = nextId;
-    return nextId;
+    if (session.nextNamedPropertyId > LAST_NAMED_PROPERTY_ID) {
+        return 0x0000;
+    }
+    const id = session.nextNamedPropertyId++;
+    session.namedProperties[key] = id;
+    session.namedPropertyIds[id] = key;
+    return id;
 }
 
 /** The reverse lookup `RopSetProperties`/`RopGetPropertiesSpecific`/`RopQueryRows` use to recognize an incoming
- * property ID `>= 0x8000` as one of this session's own mapped named properties. A linear scan, matching this
- * codebase's own established precedent (`FolderTarget.assignOrGetFid`'s doc comment) that a single session's
- * named-property count is never large enough for this to be a real cost. */
+ * property ID `>= 0x8000` as one of this session's own mapped named properties - an O(1) lookup against
+ * `session.namedPropertyIds` (kept in sync by `assignOrGetNamedPropertyId`) rather than a linear scan of
+ * `session.namedProperties` with a `JSON.parse` per candidate - see that function's own doc comment for why
+ * this matters at scale, particularly since this is called once per named-property column per row from
+ * `RopQueryRows`. */
 export function resolveNamedProperty(session: MapiSessionContext, propertyId: number): PropertyName | undefined {
-    for (const [key, id] of Object.entries(session.namedProperties)) {
-        if (id === propertyId) {
-            return JSON.parse(key) as PropertyName;
-        }
-    }
-    return undefined;
+    const key = session.namedPropertyIds[propertyId];
+    return key !== undefined ? (JSON.parse(key) as PropertyName) : undefined;
 }

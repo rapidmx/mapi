@@ -65,7 +65,7 @@ describe("submitMeetingResponse Tests", () => {
 
         await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
 
-        expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith({ icalUid: "evt-uid@example.com" }, { ignoreACL: true });
+        expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith({ icalUid: "evt-uid@example.com" }, { ignoreACL: true, limit: 1 });
     });
 
     it("Does nothing when no CalendarEvent matches the decoded icalUid.", async () => {
@@ -74,7 +74,7 @@ describe("submitMeetingResponse Tests", () => {
 
         await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
 
-        expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith({ icalUid: "unknown@example.com" }, { ignoreACL: true });
+        expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith({ icalUid: "unknown@example.com" }, { ignoreACL: true, limit: 1 });
     });
 
     it("Does nothing when the caller's mailbox can't be resolved.", async () => {

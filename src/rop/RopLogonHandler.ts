@@ -5,6 +5,7 @@
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { encodeGuid } from "../codec/MapiGuid.js";
 import { Folder, FolderType } from "@rapidmx/restapi";
+import { assignOrGetFid } from "./FolderTarget.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_LOGON = 0xfe;
@@ -89,31 +90,41 @@ export class RopLogonHandler implements RopHandler {
     }
 
     /**
-     * Assigns this session's FIDs for the 13 special folders (small sequential integers - a valid,
-     * spec-compliant choice, since MAPI only requires FIDs to be opaque 64-bit values the client echoes back,
-     * not any particular internal structure), remembering each one's real-`Folder`-or-virtual-placeholder
-     * target in `session.folderIds` so a later `RopOpenFolder` can resolve it back to something real.
+     * Assigns this session's FIDs for the 13 special folders, remembering each one's real-`Folder`-or-virtual-
+     * placeholder target in `session.folderIds` so a later `RopOpenFolder` can resolve it back to something
+     * real. Delegates to `FolderTarget.assignOrGetFid` - the same "reuse an existing FID for this target if one
+     * was already assigned, otherwise mint the next free one" logic `RopGetHierarchyTable`/`RopQueryRows` use
+     * for child folders - rather than wholesale-replacing `session.folderIds` with a freshly-numbered map
+     * starting back at FID 1. A second `RopLogon` on a live session (spec-legal - a real client can reconnect
+     * or re-logon within one session context) previously invalidated every FID a client had already learned
+     * for a child folder via `RopGetHierarchyTable`/`RopQueryRows` (all assigned starting at FID 14, since the
+     * old code always reset the counter to 1-13 for just these specials) and could even cause FIDs 14+ to be
+     * silently re-issued to a *different* folder than the one the client last associated with that number.
+     * Reusing `assignOrGetFid` means a re-`RopLogon` is now purely additive: these 13 targets get their
+     * existing FIDs back if this is a second logon, and any child-folder FIDs already assigned are left alone.
      */
     private async assignFolderIds(context: RopContext): Promise<Record<string, number>> {
-        const fids: Record<string, number> = {};
-        const mapping: Record<string, string> = {};
-        let nextFid = 1;
-        for (const folder of SPECIAL_FOLDERS) {
-            let target = `virtual:${folder.name}`;
-            if (folder.folderType) {
+        // The four real-folder-type lookups (Inbox/Outbox/Sent Items/Deleted Items) are independent of each
+        // other, so resolve them concurrently rather than one sequential round trip per special folder -
+        // FID *assignment* itself still happens afterward, in SPECIAL_FOLDERS' own fixed order, so which FID
+        // ends up bound to which target is unaffected by fetch order.
+        const targets = await Promise.all(
+            SPECIAL_FOLDERS.map(async (folder): Promise<string> => {
+                if (!folder.folderType) {
+                    return `virtual:${folder.name}`;
+                }
                 const existing: Folder[] = await context.folderRepo.find(
                     { mailboxUid: context.mailboxUid, type: folder.folderType },
                     { ignoreACL: true, limit: 1 },
                 );
-                if (existing[0]) {
-                    target = `folder:${existing[0].uid}`;
-                }
-            }
-            const fid = nextFid++;
-            fids[folder.name] = fid;
-            mapping[String(fid)] = target;
-        }
-        context.session.folderIds = mapping;
+                return existing[0] ? `folder:${existing[0].uid}` : `virtual:${folder.name}`;
+            }),
+        );
+
+        const fids: Record<string, number> = {};
+        SPECIAL_FOLDERS.forEach((folder, index) => {
+            fids[folder.name] = assignOrGetFid(context.session, targets[index]);
+        });
         return fids;
     }
 }

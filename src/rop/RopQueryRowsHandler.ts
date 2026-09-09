@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { writePropertyValue } from "../codec/PropertyValue.js";
-import { resolvePropertyValues } from "./PropertyResolvers.js";
+import { resolvePropertyValues, ResolutionCache } from "./PropertyResolvers.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_QUERY_ROWS = 0x15;
@@ -35,6 +35,15 @@ const ORIGIN_BOOKMARK_END = 0x02;
  * `MessageTarget`'s resolver and property-value mapping by row-target prefix, since a single table handle only
  * ever holds one kind of row.
  *
+ * **Known, deliberate performance limitation**: `resolvePropertyValues` still does one `repo.findOne()` per
+ * row (message/calendarEvent/contact/task) rather than a single batched fetch for the whole page - a genuine
+ * N+1 for a large `RowCount`. A real fix needs a batched "fetch all these uids" query, which this codebase's
+ * `RepoUtils<T>` abstraction doesn't expose a backend-agnostic way to express (Mongo's `$in` and TypeORM's
+ * `In()` aren't interchangeable at this call site, which has no idea which backend it's running against) - see
+ * `ResolutionCache` for the narrower, safe win this pass *did* make (the redundant *identical* whole-mailbox-
+ * folder-list and calendar-mailbox fetches that were happening once per row regardless of which distinct
+ * entity each row was, now happen at most once per call).
+ *
  * @author Jean-Philippe Steinmetz
  */
 export class RopQueryRowsHandler implements RopHandler {
@@ -60,9 +69,14 @@ export class RopQueryRowsHandler implements RopHandler {
         const slice: string[] = rows.slice(cursor, cursor + requestedCount);
         table.cursor = cursor + slice.length;
 
+        // Shared across every row this call resolves - see ResolutionCache's own doc comment for why: without
+        // it, a hierarchy table's `hasChildren` column (or a calendar table's organizer/attendee resolution)
+        // would re-fetch the same whole-mailbox folder list/mailbox record once per row instead of once per
+        // call.
+        const cache: ResolutionCache = {};
         const rowBuffers: Buffer[] = [];
         for (const target of slice) {
-            rowBuffers.push(await this.buildRow(context, target, table.columns ?? []));
+            rowBuffers.push(await this.buildRow(context, target, table.columns ?? [], cache));
         }
 
         writer.writeUInt8(ROP_ID_QUERY_ROWS);
@@ -79,10 +93,11 @@ export class RopQueryRowsHandler implements RopHandler {
         context: RopContext,
         target: string,
         columns: { propertyId: number; propertyType: number }[],
+        cache: ResolutionCache,
     ): Promise<Buffer> {
         const writer = new BufferWriter();
         writer.writeUInt8(0x00); // Flags - StandardPropertyRow, see class doc comment
-        const values = await resolvePropertyValues(target, columns, context);
+        const values = await resolvePropertyValues(target, columns, context, cache);
         columns.forEach((column, index) => writePropertyValue(writer, column.propertyType, values[index]));
         return writer.toBuffer();
     }

@@ -38,4 +38,12 @@ describe("RopBuffer Tests", () => {
         expect(decoded.ropsList.toString("hex")).toBe("aabbcc");
         expect(decoded.handleTable).toEqual([1, 2]);
     });
+
+    it("Throws on a malformed RopSize smaller than its own 2-byte field, instead of silently rewinding the cursor into the handle table.", () => {
+        // RopSize=0 would previously compute a ropsList length of -2, which Buffer.subarray silently clamped
+        // to empty while also rewinding the cursor's offset backwards - misparsing whatever followed as the
+        // handle table instead of failing loudly on this malformed input.
+        const bytes = Buffer.from("0000aabbcc0100000002000000", "hex");
+        expect(() => decodeRopBuffer(bytes)).toThrow(RangeError);
+    });
 });

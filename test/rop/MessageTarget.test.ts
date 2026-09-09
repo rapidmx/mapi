@@ -45,7 +45,7 @@ describe("MessageTarget Tests", () => {
     describe("assignOrGetMid", () => {
         it("Assigns sequential MIDs and reuses an existing assignment for the same target.", () => {
             const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-            session.messageIds = { "1": "message:m1" };
+            expect(assignOrGetMid(session, "message:m1")).toBe(1);
 
             const newMid = assignOrGetMid(session, "message:m2");
             expect(newMid).toBe(2);
