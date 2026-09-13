@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.1] - 2026-09-13
+
+### Added
+- Added read-only Categories support for messages (PidNameKeywords, PS_PUBLIC_STRINGS), resolving each Message.labelUids entry to its Label.name via a new labelRepo/labelClass RopContext field and PropertyResolvers.ts's existing per-call ResolutionCache
+- Added end-to-end HTTP+DB integration tests for Categories in both the mongo and sql MapiEmsmdbRoute test suites
+
+### Changed
+- Confirm via a targeted test that FolderType.ARCHIVE needs no new mapi code
+- Update README/CHANGELOG to document the new Categories support and the dependency bump
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+- Update release notes
+
+### Fixed
+- Fixed NSPI GAL search regression from service-core 2.0's glob-syntax like() operator, add read-only Outlook Categories (PidNameKeywords) support, and bump @rapidmx/restapi to ^0.8.0/@rapidrest/service-core to 2.x
+- Fixed NspiGetMatchesHandler/MapiNspiRouteMongo/MapiNspiRouteSQL's likePattern() wrapping search terms in raw *...* glob wildcards instead of regex-escaping them, since like()'s new glob grammar treats an unescaped term as an exact-match pattern with no wildcards
+
+### Removed
+- Removed @rapidrest/cli as a dep
+
 ### Added
 - Added read-only Outlook Categories (PidNameKeywords, PS_PUBLIC_STRINGS) support for messages, resolving each Message.labelUids entry to its Label.name and returning them as PtypMultipleString via RopQueryRows/RopGetPropertiesSpecific
 - Added labelRepo/labelClass as optional RopContext fields (mirroring contactRepo/taskRepo), populated by BaseMapiEmsmdbRoute
@@ -62,5 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.0...HEAD
+[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.1...HEAD
+[1.0.0-beta.1]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/mapi/releases/tag/v1.0.0-beta.0
