@@ -1,6 +1,6 @@
 {
     "name": "@rapidmx/mapi",
-    "version": "1.0.0-beta.1",
+    "version": "1.0.0-beta.2",
     "description": "MAPI over HTTP protocol support for RapidREST mail servers.",
     "repository": "https://github.com/RapidMX/mapi.git",
     "author": "RapidREST <rapidrests@gmail.com>",

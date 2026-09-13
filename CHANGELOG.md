@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.2] - 2026-09-13
+
+### Changed
+- Switch NSPI GAL search from like() glob-wrapping to the new regex() operator for a genuine literal-substring match
+- Change NspiGetMatchesHandler.findMatchingContacts to build a regex() query pattern via StringUtils.escapeRegExp(searchTerm) instead of wrapping the term in *...* glob wildcards for like(), closing the residual literal-*/?-acts-as-wildcard gap glob syntax can't escape
+- Update NspiGetMatchesHandler.test.ts/BaseMapiNspiRoute.test.ts for the simplified signature and the regex() query assertions
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Removed
+- Removed the now-unneeded per-backend likePattern() hook from BaseMapiNspiRoute/MapiNspiRouteMongo/MapiNspiRouteSQL, since regex() compiles identically on both backends
+
 ### Changed
 - Changed NSPI GAL search (GetMatches) from `like()` (glob syntax, requiring a `*...*`-wrapped pattern and still treating a literal `*`/`?` in the search term as a wildcard) to `regex()` (`@rapidrest/service-core` ^2.0's new operator), escaping the search term with `StringUtils.escapeRegExp` for a genuine literal-substring, case-insensitive match with no residual wildcard ambiguity - also removes the now-unneeded per-backend `likePattern()` hook from `BaseMapiNspiRoute`/`MapiNspiRouteMongo`/`MapiNspiRouteSQL`, since `regex()` compiles identically on both backends
 - Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
@@ -85,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.1...HEAD
+[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.2...HEAD
+[1.0.0-beta.2]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/mapi/releases/tag/v1.0.0-beta.0
