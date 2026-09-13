@@ -254,3 +254,52 @@ regardless of the backend nuance by making it correct-by-construction instead of
 - Full suite: 472/472 passing (up from 447, +25 net new tests targeting each fix specifically - not just
   "still passes" coverage). 100% statement/function/line, 99.14% branch. `yarn build`/`yarn tsc --noEmit`/
   `yarn lint` clean. Not committed - left staged/unstaged per the standing commit-discipline rule.
+
+### 2026-09-13 — restapi 0.3.1 → 0.8.0 sync: a real `like()`-operator regression fix plus Categories
+
+Prompted by "tons more changes have gone into restapi... do a full review of it, including the spec files...
+and implement any missing MAPI features that restapi now supports." Bumped the `@rapidmx/restapi` peer/dev
+dependency to `^0.8.0` and `@rapidrest/service-core` to `2.x`/`^2.0.0`, then read every file under
+`../restapi/specs/*.md` and diffed restapi's own changelog/commit history against what this package already
+covers, the same review discipline as the two prior sessions above.
+
+**Found and fixed a real regression**: `@rapidrest/service-core` 2.0's `ModelUtils` `like()` operator changed
+from raw substring matching to glob syntax (`*`/`?`, anchored `^...$` by default via `globToRegExpSource`/
+`globToLike`). `NspiGetMatchesHandler.ts`'s `escapeForLikeQuery()` was written for the *old* semantics -
+regex-escaping the user's search term so it behaved as a literal substring - which under the *new* semantics
+just produces an exact-match glob pattern with no wildcards, so `RopGetMatches`/GAL "search as you type" broke
+silently (0 results for the previously-passing `Filters by a ContentRestriction search term, matching only
+Jane` Mongo test; SQL coincidentally still worked at the time, which would have hidden this backend-specific if
+only one route's tests had been checked). Fixed by deleting `escapeForLikeQuery()` entirely and having both
+`MapiNspiRouteMongo.likePattern()`/`MapiNspiRouteSQL.likePattern()` wrap the *raw* term in `*...*` instead -
+the correct way to ask either backend's `like()` for a genuine substring match under the new grammar.
+
+**Implemented**: read-only Outlook Categories (`PidNameKeywords`, `PS_PUBLIC_STRINGS` GUID
+`00020329-0000-0000-c000-000000000046`, `Kind = "name"` not `"lid"` - the first named property in this
+codebase keyed by name instead of LID, since every previous one used `PSETID_*`/lid pairs) backed by restapi's
+pre-existing `Label`/`Message.labelUids` model (Gmail-style label-uid list, independent of folder placement).
+Wired the same optional-`RopContext`-field pattern as `contactRepo`/`taskRepo` (`labelRepo`/`labelClass`,
+`BaseMapiEmsmdbRoute` populates both) and extended `PropertyResolvers.ts`'s existing per-call `ResolutionCache`
+so a table of 100 categorized messages fetches a mailbox's `Label` set once, not once per row - the same
+n+1-avoidance pattern the 2026-09-09 session established for folder lists. Read-only by design: there's no
+general "edit an existing persisted message's properties" ROP path in this codebase at all (matches the
+existing Contacts/Tasks browse-only precedent) - assigning/removing labels goes through the REST API.
+
+**Deliberately excluded** (confirmed against restapi's own specs, not just left unmentioned): End-to-End
+Encryption (`specs/end-to-end_encryption.md` explicitly designs it so a real Outlook client needs *no* protocol
+changes at all - native S/MIME - and KeyVault/Escrow/Discovery are REST/web-client-layer only) and the search
+overhaul (`specs/search.md` states outright that parity with plaintext search "on Outlook... [is] Not
+achievable; documented instead" once E2E is on - "a documented limitation, not a defect"). Also excluded every
+compliance/admin-only feature (Branding, Bookings, TransportRule, Legal Hold, Matter, GDPR export/erasure) as
+categorically not MAPI-protocol surface, consistent with this conversation's standing scope rule.
+
+**Verified, not assumed**: confirmed via a targeted test change (`FolderType.ARCHIVE` in place of `USER` in an
+existing folder-browsing test) that restapi's Archive folder type needs zero new mapi code, since generic
+folder/message browsing already treats any non-special-cased `FolderType` identically.
+
+Full suite: 486/486 passing (up from 472, +14 net new tests). 100% statement/function/line, 99.16% branch.
+`yarn build` clean. Encountered and correctly identified as *not* a regression: repeated, non-reproducible
+full-suite-only failures (different files, different garbage values each run) matching this repo's own
+documented `mongodb-memory-server`/raw-socket-client flakiness pattern under load - every affected file passed
+100% in isolation immediately after, and the specific failure was never the same twice. Not committed - left
+staged/unstaged per the standing commit-discipline rule.

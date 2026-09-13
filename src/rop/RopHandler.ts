@@ -27,13 +27,15 @@ import type { MapiSessionContext } from "../MapiSessionManager.js";
  * `mailTransport` back the same `scanAndRelay()` compose/send pipeline `BaseMessageRoute.send()`/EAS's
  * `ComposeMailCommand` already share via `MailSendUtils.ts`.
  *
- * `contactRepo`/`taskRepo`/`contactClass`/`taskClass` are **optional**, unlike every other repo/class pair
- * here - `BaseMapiEmsmdbRoute` always populates them in real use (see its own `@Init`), but making them
- * required would force every one of this codebase's many existing `RopContext`-literal test fixtures (most
- * predating Contacts/Tasks folder support) to grow four new fields each for no behavioral reason. Every
- * consumer (`PropertyResolvers.ts`, `RopGetContentsTableHandler.ts`, `RopOpenMessageHandler.ts`) already
- * degrades a `"contact:"`/`"task:"` target to empty/no-rows when the corresponding repo is absent, the same
- * "missing data, not a crash" stance `resolveContactInfo`/`resolveTaskInfo` take for a vanished row.
+ * `contactRepo`/`taskRepo`/`contactClass`/`taskClass`/`labelRepo`/`labelClass` are **optional**, unlike every
+ * other repo/class pair here - `BaseMapiEmsmdbRoute` always populates them in real use (see its own `@Init`),
+ * but making them required would force every one of this codebase's many existing `RopContext`-literal test
+ * fixtures (most predating Contacts/Tasks folder support, and all predating Label support) to grow new fields
+ * each for no behavioral reason. Every consumer (`PropertyResolvers.ts`, `RopGetContentsTableHandler.ts`,
+ * `RopOpenMessageHandler.ts`) already degrades a `"contact:"`/`"task:"` target to empty/no-rows when the
+ * corresponding repo is absent, the same "missing data, not a crash" stance `resolveContactInfo`/
+ * `resolveTaskInfo` take for a vanished row; `labelRepo` absent degrades `PidNameKeywords` (Outlook Categories)
+ * to an empty list the same way.
  */
 export interface RopContext {
     mailboxUid: string;
@@ -45,11 +47,13 @@ export interface RopContext {
     calendarEventRepo: RepoUtils<any>;
     contactRepo?: RepoUtils<any>;
     taskRepo?: RepoUtils<any>;
+    labelRepo?: RepoUtils<any>;
     folderClass: any;
     messageClass: any;
     calendarEventClass: any;
     contactClass?: any;
     taskClass?: any;
+    labelClass?: any;
     blobStore: BlobStore;
     scanPipeline: ScanPipeline;
     mailTransport: any;

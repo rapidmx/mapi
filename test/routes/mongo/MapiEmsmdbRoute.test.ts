@@ -15,7 +15,7 @@ import config from "../../config.js";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
-import { ContactMongo, FolderMongo, MailboxMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
+import { ContactMongo, FolderMongo, LabelMongo, MailboxMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
 import { FolderType, MessageImportance, RecipientType } from "@rapidmx/restapi";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
@@ -42,6 +42,7 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
     let messageRepo: MongoRepository<MessageMongo>;
     let contactRepo: MongoRepository<ContactMongo>;
     let taskRepo: MongoRepository<TaskMongo>;
+    let labelRepo: MongoRepository<LabelMongo>;
     let aclRepo: MongoRepository<any>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -108,6 +109,10 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
         return await taskRepo.save(new TaskMongo({ mailboxUid, folderUid, title: "Test Task", ...data }));
     };
 
+    const createLabel = async function (mailboxUid: string, data?: Partial<LabelMongo>): Promise<LabelMongo> {
+        return await labelRepo.save(new LabelMongo({ mailboxUid, name: "Test Label", ...data }));
+    };
+
     const blobStore = function (): InMemoryBlobStore {
         return objectFactory.getInstance<InMemoryBlobStore>("BlobStore")!;
     };
@@ -164,6 +169,7 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             messageRepo = conn.getMongoRepository("MessageMongo");
             contactRepo = conn.getMongoRepository("ContactMongo");
             taskRepo = conn.getMongoRepository("TaskMongo");
+            labelRepo = conn.getMongoRepository("LabelMongo");
         } else {
             throw new Error("Could not find mongo connection");
         }
@@ -182,7 +188,7 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
     });
 
     beforeEach(async () => {
-        for (const repo of [mailboxRepo, folderRepo, messageRepo, contactRepo, taskRepo, aclRepo]) {
+        for (const repo of [mailboxRepo, folderRepo, messageRepo, contactRepo, taskRepo, labelRepo, aclRepo]) {
             try {
                 await repo.clear();
             } catch (err: any) {
@@ -426,7 +432,13 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
         it("Browses the top-level folder list end to end: Logon, OpenFolder(root), GetHierarchyTable, SetColumns, QueryRows.", async () => {
             const mailbox = await createMailbox(owner.uid);
             await createFolder(mailbox.uid, FolderType.INBOX, "Inbox");
-            await createFolder(mailbox.uid, FolderType.USER, "Archive");
+            // FolderType.ARCHIVE is a real folder type (restapi ^0.7) with no special-cased handling anywhere
+            // in this codebase - proving it appears in generic hierarchy browsing exactly like a plain
+            // FolderType.USER folder confirms no dedicated support is actually needed for it: only CALENDAR/
+            // CONTACTS/TASKS get routed to a different repo (see RopGetContentsTableHandler.ts's own doc
+            // comment), every other type - INBOX/SENT_ITEMS/DRAFTS/DELETED_ITEMS/OUTBOX/JUNK/ARCHIVE/NOTES/USER
+            // - already falls through to the same generic Message-backed path.
+            await createFolder(mailbox.uid, FolderType.ARCHIVE, "Archive");
             const connectResult = await connect();
             const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
 
@@ -1122,6 +1134,204 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             const dataSize = readStreamRopsReader.readUInt16LE();
             expect(dataSize).toBe(streamSize);
             expect(readPropertyValue(readStreamRopsReader, PropertyType.PtypString)).toBe("Actual body text.");
+        });
+    });
+
+    describe("Message categories (PidNameKeywords / Outlook Categories, backed by Message.labelUids)", () => {
+        const PSETID_PUBLIC_STRINGS = "00020329-0000-0000-c000-000000000046";
+
+        const buildLogonRops = function (outputHandleIndex: number): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0xfe);
+            writer.writeUInt8(0);
+            writer.writeUInt8(outputHandleIndex);
+            writer.writeUInt8(0x01);
+            writer.writeUInt32LE(0);
+            writer.writeUInt32LE(0);
+            writer.writeUInt16LE(0);
+            return writer.toBuffer();
+        };
+
+        const buildOpenFolderRops = function (inputHandleIndex: number, outputHandleIndex: number, folderId: bigint): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x02);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(outputHandleIndex);
+            writer.writeUInt8(0);
+            writer.writeBigUInt64LE(folderId);
+            return writer.toBuffer();
+        };
+
+        const buildGetContentsTableRops = function (inputHandleIndex: number, outputHandleIndex: number): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x05);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(outputHandleIndex);
+            writer.writeUInt8(0);
+            return writer.toBuffer();
+        };
+
+        const buildSetColumnsRops = function (inputHandleIndex: number, tags: { propertyId: number; propertyType: PropertyType }[]): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x12);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(0);
+            writer.writeUInt16LE(tags.length);
+            for (const tag of tags) {
+                writePropertyTag(writer, tag);
+            }
+            return writer.toBuffer();
+        };
+
+        const buildQueryRowsRops = function (inputHandleIndex: number, rowCount: number): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x15);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(0);
+            writer.writeUInt8(1);
+            writer.writeUInt16LE(rowCount);
+            return writer.toBuffer();
+        };
+
+        const buildOpenMessageRops = function (inputHandleIndex: number, outputHandleIndex: number, folderId: bigint, messageId: bigint): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x03);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(outputHandleIndex);
+            writer.writeUInt16LE(0);
+            writer.writeBigUInt64LE(folderId);
+            writer.writeUInt8(0);
+            writer.writeBigUInt64LE(messageId);
+            return writer.toBuffer();
+        };
+
+        /** `RopGetPropertyIdsFromNames`'s `Kind=Name` variant (`0x01`) - unlike the existing
+         * `RopGetPropertyIdsFromNames` describe block's own helper (`Kind=LID` only), `PidNameKeywords` is
+         * specifically a named-by-string property (see `PropertyResolvers.ts`'s own doc comment). `NameSize`
+         * is inclusive of the trailing UTF-16LE null terminator, per `RopGetPropertyIdsFromNamesHandler
+         * .readPropertyName`'s own documented convention. */
+        const buildGetPropertyIdsFromNamesForNameRops = function (inputHandleIndex: number, guid: string, name: string): Buffer {
+            const nameBytes = Buffer.concat([Buffer.from(name, "utf16le"), Buffer.from([0x00, 0x00])]);
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x56);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt8(0x02); // Flags - assign new IDs
+            writer.writeUInt16LE(1); // PropertyNameCount
+            writer.writeUInt8(0x01); // Kind - Name
+            writer.writeBytes(encodeGuid(guid));
+            writer.writeUInt8(nameBytes.length);
+            writer.writeBytes(nameBytes);
+            return writer.toBuffer();
+        };
+
+        const buildGetPropertiesSpecificRops = function (inputHandleIndex: number, tags: { propertyId: number; propertyType: PropertyType }[]): Buffer {
+            const writer = new BufferWriter();
+            writer.writeUInt8(0x07);
+            writer.writeUInt8(0);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt16LE(0);
+            writer.writeUInt16LE(0);
+            writer.writeUInt16LE(tags.length);
+            for (const tag of tags) {
+                writePropertyTag(writer, tag);
+            }
+            return writer.toBuffer();
+        };
+
+        it("Resolves a real message's labelUids to display names via PidNameKeywords, end to end.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX, "Inbox");
+            const important = await createLabel(mailbox.uid, { name: "Important" });
+            const work = await createLabel(mailbox.uid, { name: "Work" });
+            await createMessage(mailbox.uid, inbox.uid, { subject: "Categorized", labelUids: [important.uid, work.uid] });
+            const connectResult = await connect();
+            const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+
+            // Logon -> discover the Inbox FID.
+            const logonResult = await execute(cookie, encodeRopBuffer({ ropsList: buildLogonRops(0), handleTable: [0xffffffff] }));
+            const logonReader = new BufferReader(logonResult.body);
+            logonReader.readUInt32LE();
+            logonReader.readUInt32LE();
+            logonReader.readUInt32LE();
+            const { ropsList: logonRopsList } = decodeRopBuffer(logonReader.readBytes(logonReader.readUInt32LE()));
+            const logonRopsReader = new BufferReader(logonRopsList);
+            logonRopsReader.readUInt8();
+            logonRopsReader.readUInt8();
+            logonRopsReader.readUInt32LE();
+            logonRopsReader.readUInt8();
+            logonRopsReader.readBigUInt64LE();
+            logonRopsReader.readBigUInt64LE();
+            logonRopsReader.readBigUInt64LE();
+            logonRopsReader.readBigUInt64LE();
+            const inboxFid = logonRopsReader.readBigUInt64LE();
+
+            // OpenFolder(inbox) -> GetContentsTable -> SetColumns(Subject, Mid) -> QueryRows, to learn the MID.
+            await execute(cookie, encodeRopBuffer({ ropsList: buildOpenFolderRops(0, 1, inboxFid), handleTable: [0xffffffff, 0xffffffff] }));
+            await execute(cookie, encodeRopBuffer({ ropsList: buildGetContentsTableRops(1, 2), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+            const listColumns = [
+                { propertyId: 0x0037, propertyType: PropertyType.PtypString },
+                { propertyId: 0x674a, propertyType: PropertyType.PtypInteger64 },
+            ];
+            await execute(cookie, encodeRopBuffer({ ropsList: buildSetColumnsRops(2, listColumns), handleTable: [0xffffffff] }));
+            const queryRowsResult = await execute(cookie, encodeRopBuffer({ ropsList: buildQueryRowsRops(2, 10), handleTable: [0xffffffff] }));
+            const queryRowsReader = new BufferReader(queryRowsResult.body);
+            queryRowsReader.readUInt32LE();
+            queryRowsReader.readUInt32LE();
+            queryRowsReader.readUInt32LE();
+            const { ropsList: queryRowsList } = decodeRopBuffer(queryRowsReader.readBytes(queryRowsReader.readUInt32LE()));
+            const rowsReader = new BufferReader(queryRowsList);
+            rowsReader.readUInt8();
+            rowsReader.readUInt8();
+            rowsReader.readUInt32LE();
+            rowsReader.readUInt8();
+            rowsReader.readUInt16LE(); // RowCount
+            rowsReader.readUInt8(); // PropertyRow Flags
+            readPropertyValue(rowsReader, PropertyType.PtypString); // Subject
+            const mid = readPropertyValue(rowsReader, PropertyType.PtypInteger64) as bigint;
+
+            // OpenMessage, then RopGetPropertyIdsFromNames(Kind=Name "Keywords") to learn its session-scoped ID.
+            await execute(cookie, encodeRopBuffer({ ropsList: buildOpenMessageRops(1, 3, inboxFid, mid), handleTable: [0xffffffff, 0xffffffff] }));
+            const namesResult = await execute(
+                cookie,
+                encodeRopBuffer({ ropsList: buildGetPropertyIdsFromNamesForNameRops(0, PSETID_PUBLIC_STRINGS, "Keywords"), handleTable: [0xffffffff] }),
+            );
+            const namesReader = new BufferReader(namesResult.body);
+            namesReader.readUInt32LE();
+            namesReader.readUInt32LE();
+            namesReader.readUInt32LE();
+            const { ropsList: namesRopsList } = decodeRopBuffer(namesReader.readBytes(namesReader.readUInt32LE()));
+            const namesRopsReader = new BufferReader(namesRopsList);
+            namesRopsReader.readUInt8();
+            namesRopsReader.readUInt8();
+            expect(namesRopsReader.readUInt32LE()).toBe(0); // ReturnValue
+            expect(namesRopsReader.readUInt16LE()).toBe(1); // PropertyIdCount
+            const keywordsId = namesRopsReader.readUInt16LE();
+            expect(keywordsId).toBeGreaterThanOrEqual(0x8000);
+
+            // GetPropertiesSpecific(Keywords) on the opened message handle.
+            const getPropsInput = encodeRopBuffer({
+                ropsList: buildGetPropertiesSpecificRops(3, [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }]),
+                handleTable: [0xffffffff],
+            });
+            const getPropsResult = await execute(cookie, getPropsInput);
+            const getPropsReader = new BufferReader(getPropsResult.body);
+            getPropsReader.readUInt32LE();
+            getPropsReader.readUInt32LE();
+            getPropsReader.readUInt32LE();
+            const { ropsList: getPropsRopsList } = decodeRopBuffer(getPropsReader.readBytes(getPropsReader.readUInt32LE()));
+            const getPropsRopsReader = new BufferReader(getPropsRopsList);
+            getPropsRopsReader.readUInt8();
+            getPropsRopsReader.readUInt8();
+            expect(getPropsRopsReader.readUInt32LE()).toBe(0); // ReturnValue
+            getPropsRopsReader.readUInt8(); // PropertyRow Flags
+            const categories = readPropertyValue(getPropsRopsReader, PropertyType.PtypMultipleString) as string[];
+            expect(categories.sort()).toEqual(["Important", "Work"]);
         });
     });
 

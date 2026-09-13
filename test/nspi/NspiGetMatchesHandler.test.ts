@@ -225,7 +225,7 @@ describe("handleNspiGetMatches Tests", () => {
         expect(reader.readNullTerminatedUtf16LE()).toBe("Ann");
     });
 
-    it("Escapes regex metacharacters in the search term before querying.", async () => {
+    it("Passes the search term to likePattern as-is, not pre-escaped - the like() operator (service-core ^2.0+) does its own escaping.", async () => {
         const find = vi.fn().mockResolvedValue([]);
         const contactRepo = { find };
         const req = buildRequest((writer) => {
@@ -245,10 +245,10 @@ describe("handleNspiGetMatches Tests", () => {
             writer.writeUInt32LE(0);
         });
         const res = makeRes();
-        const likePattern = vi.fn((escaped: string) => escaped);
+        const likePattern = vi.fn((term: string) => term);
 
         await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, likePattern);
 
-        expect(likePattern).toHaveBeenCalledWith("a\\.b");
+        expect(likePattern).toHaveBeenCalledWith("a.b");
     });
 });

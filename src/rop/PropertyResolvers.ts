@@ -59,6 +59,15 @@ const PID_TAG_MID = 0x674a;
 /** `MSGFLAG_READ`, the one `PidTagMessageFlags` bit this pragmatic subset ever sets. */
 const MSGFLAG_READ = 0x01;
 
+/** `PidNameKeywords` ([MS-OXPROPS] "Keywords") - Outlook's Categories feature, a `Kind=name` named property
+ * (unlike every other named property this pragmatic subset resolves, all `Kind=lid` - see
+ * `NamedPropertyRegistry.ts`'s own `PropertyName` shape for why both kinds are supported). Maps directly onto
+ * this data model's Gmail-style `Message.labelUids`: Outlook only understands free-text category names, not a
+ * `Label.uid` reference, so `resolvePropertyValues` resolves each uid to its `Label.name` before this property
+ * is ever read. `PT_MV_UNICODE` (`PtypMultipleString` in this codebase's own enum naming). */
+const PSETID_PUBLIC_STRINGS = "00020329-0000-0000-c000-000000000046";
+const NAME_KEYWORDS = "Keywords";
+
 // Well-known Contact property IDs this pragmatic subset supports - all plain (non-named) PidTags, per
 // [MS-OXOCNTC], since a Contact needs no PSETID/LID lookup the way Calendar/Task properties do.
 const PID_TAG_GIVEN_NAME = 0x3a06;
@@ -130,13 +139,17 @@ export function folderValueFor(
     }
 }
 
-/** Resolves one requested property's value for a `"message:<uid>"` target. */
+/** Resolves one requested property's value for a `"message:<uid>"` target. `labelNames` is this message's own
+ * `labelUids` already resolved to display names (see `resolvePropertyValues`'s own doc comment) - a plain
+ * parameter rather than a repo lookup here, since this function (like every other `xxxValueFor`) is
+ * synchronous and can't do its own async DB access. */
 export function messageValueFor(
     session: MapiSessionContext,
     propertyId: number,
     propertyType: PropertyType,
     target: string,
     info: MessageTargetInfo,
+    labelNames: string[] = [],
 ): PropertyValueData {
     switch (propertyId) {
         case PID_TAG_SUBJECT:
@@ -149,8 +162,15 @@ export function messageValueFor(
             return info.receivedDate;
         case PID_TAG_MID:
             return BigInt(assignOrGetMid(session, target));
-        default:
+        default: {
+            if (propertyId >= 0x8000) {
+                const named = resolveNamedProperty(session, propertyId);
+                if (named && named.kind === "name" && named.name === NAME_KEYWORDS && named.guid.toLowerCase() === PSETID_PUBLIC_STRINGS) {
+                    return labelNames;
+                }
+            }
             return defaultValueForType(propertyType);
+        }
     }
 }
 
@@ -308,6 +328,10 @@ export function taskValueFor(
  * cache is still correct, just not deduplicated across calls it doesn't make anyway. */
 export interface ResolutionCache extends FolderResolutionCache {
     callerAddress?: string;
+    /** `Label.uid` -> `Label.name`, for the whole mailbox - built at most once per call the same way
+     * `allFolders`/`callerAddress` are, the first time a message row actually has a non-empty `labelUids` to
+     * resolve (most messages have none, so this stays unbuilt for a page with no labeled messages at all). */
+    labelNamesByUid?: Map<string, string>;
 }
 
 /** Resolves every column in `columns` for a single `target` (a `"folder:"`/`"virtual:"`/`"message:"`/
@@ -319,7 +343,15 @@ export async function resolvePropertyValues(
     columns: { propertyId: number; propertyType: PropertyType }[],
     context: Pick<
         RopContext,
-        "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo" | "contactRepo" | "taskRepo"
+        | "mailboxUid"
+        | "session"
+        | "folderRepo"
+        | "messageRepo"
+        | "calendarEventRepo"
+        | "mailboxRepo"
+        | "contactRepo"
+        | "taskRepo"
+        | "labelRepo"
     >,
     cache?: ResolutionCache,
 ): Promise<PropertyValueData[]> {
@@ -335,6 +367,22 @@ export async function resolvePropertyValues(
     const calendarEventInfo = isCalendarEvent ? await resolveCalendarEventInfo(target, context.calendarEventRepo) : undefined;
     const contactInfo = isContact && context.contactRepo ? await resolveContactInfo(target, context.contactRepo) : undefined;
     const taskInfo = isTask && context.taskRepo ? await resolveTaskInfo(target, context.taskRepo) : undefined;
+
+    let labelNames: string[] = [];
+    if (messageInfo && messageInfo.labelUids.length > 0 && context.labelRepo) {
+        let labelNamesByUid: Map<string, string>;
+        if (cache) {
+            if (!cache.labelNamesByUid) {
+                const labels = await context.labelRepo.find({ mailboxUid: context.mailboxUid }, { ignoreACL: true });
+                cache.labelNamesByUid = new Map(labels.map((l: { uid: string; name: string }) => [l.uid, l.name]));
+            }
+            labelNamesByUid = cache.labelNamesByUid;
+        } else {
+            const labels = await context.labelRepo.find({ mailboxUid: context.mailboxUid }, { ignoreACL: true });
+            labelNamesByUid = new Map(labels.map((l: { uid: string; name: string }) => [l.uid, l.name]));
+        }
+        labelNames = messageInfo.labelUids.map((uid) => labelNamesByUid.get(uid)).filter((name): name is string => name !== undefined);
+    }
 
     let callerAddress = "";
     if (isCalendarEvent) {
@@ -361,7 +409,7 @@ export async function resolvePropertyValues(
             return taskValueFor(context.session, column.propertyId, column.propertyType, target, taskInfo);
         }
         if (messageInfo) {
-            return messageValueFor(context.session, column.propertyId, column.propertyType, target, messageInfo);
+            return messageValueFor(context.session, column.propertyId, column.propertyType, target, messageInfo, labelNames);
         }
         if (isContact || isTask) {
             // contactRepo/taskRepo absent (see RopHandler.ts's own doc comment on why they're optional) - no

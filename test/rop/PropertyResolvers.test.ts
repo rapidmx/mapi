@@ -7,8 +7,9 @@ import { encodeTimeZoneStruct } from "../../src/codec/MapiTimeZone.js";
 import { PropertyType } from "../../src/codec/PropertyValue.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { assignOrGetNamedPropertyId } from "../../src/rop/NamedPropertyRegistry.js";
-import { calendarEventValueFor, contactValueFor, resolvePropertyValues, taskValueFor } from "../../src/rop/PropertyResolvers.js";
+import { calendarEventValueFor, contactValueFor, messageValueFor, resolvePropertyValues, taskValueFor } from "../../src/rop/PropertyResolvers.js";
 import type { CalendarEventTargetInfo } from "../../src/rop/CalendarEventTarget.js";
+import type { MessageTargetInfo } from "../../src/rop/MessageTarget.js";
 import type { ContactTargetInfo } from "../../src/rop/ContactTarget.js";
 import { LID_PERCENT_COMPLETE, LID_TASK_COMPLETE, LID_TASK_DUE_DATE, LID_TASK_STATUS, PSETID_TASK } from "../../src/rop/TaskNamedProperties.js";
 import type { TaskTargetInfo } from "../../src/rop/TaskTarget.js";
@@ -36,6 +37,7 @@ const LID_TIME_ZONE_STRUCT = 0x8233;
 
 const PID_TAG_SUBJECT = 0x0037;
 const PID_TAG_MID = 0x674a;
+const PSETID_PUBLIC_STRINGS = "00020329-0000-0000-c000-000000000046";
 
 function makeSession(): MapiSessionContext {
     return new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
@@ -540,6 +542,174 @@ describe("PropertyResolvers Tests", () => {
             );
 
             expect(values).toEqual([""]);
+        });
+    });
+
+    describe("messageValueFor", () => {
+        function baseMessageInfo(overrides: Partial<MessageTargetInfo> = {}): MessageTargetInfo {
+            return {
+                subject: "Hello",
+                read: true,
+                hasAttachments: false,
+                receivedDate: new Date("2026-01-01T00:00:00.000Z"),
+                labelUids: [],
+                ...overrides,
+            };
+        }
+
+        it("Resolves PidNameKeywords (a Kind=name named property) to the already-resolved labelNames array.", () => {
+            const session = makeSession();
+            const id = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const value = messageValueFor(session, id, PropertyType.PtypMultipleString, "message:m1", baseMessageInfo(), ["Important", "Work"]);
+            expect(value).toEqual(["Important", "Work"]);
+        });
+
+        it("Defaults labelNames to an empty array when the caller omits it.", () => {
+            const session = makeSession();
+            const id = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const value = messageValueFor(session, id, PropertyType.PtypMultipleString, "message:m1", baseMessageInfo());
+            expect(value).toEqual([]);
+        });
+
+        it("Falls back to a default for a Kind=lid named property under the same GUID (Keywords is specifically Kind=name).", () => {
+            const session = makeSession();
+            const id = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "lid", lid: 1 });
+            const value = messageValueFor(session, id, PropertyType.PtypMultipleString, "message:m1", baseMessageInfo(), ["Important"]);
+            expect(value).toEqual([]);
+        });
+
+        it("Falls back to a default for a Kind=name property under a different GUID with the same name.", () => {
+            const session = makeSession();
+            const id = assignOrGetNamedPropertyId(session, { guid: "11111111-0000-0000-c000-000000000046", kind: "name", name: "Keywords" });
+            const value = messageValueFor(session, id, PropertyType.PtypMultipleString, "message:m1", baseMessageInfo(), ["Important"]);
+            expect(value).toEqual([]);
+        });
+
+        it("Falls back to a default for an unassigned named property ID (>= 0x8000 but never resolved).", () => {
+            const session = makeSession();
+            const value = messageValueFor(session, 0x8000, PropertyType.PtypMultipleString, "message:m1", baseMessageInfo(), ["Important"]);
+            expect(value).toEqual([]);
+        });
+
+        it("Falls back to a default for an unrecognized plain (< 0x8000) property tag.", () => {
+            const session = makeSession();
+            const value = messageValueFor(session, 0x3007, PropertyType.PtypTime, "message:m1", baseMessageInfo());
+            expect(value).toEqual(new Date(0));
+        });
+    });
+
+    describe("resolvePropertyValues (message label/Keywords resolution)", () => {
+        function makeLabelRepo(labels: { uid: string; name: string }[]) {
+            return { find: vi.fn().mockResolvedValue(labels) };
+        }
+
+        it("Resolves a message's labelUids to display names via labelRepo, fetching the mailbox's labels only once across a shared cache.", async () => {
+            const session = makeSession();
+            const keywordsId = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const messageRepo = {
+                findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi", flags: { read: true }, labelUids: ["l1", "l2"] }),
+            };
+            const labelRepo = makeLabelRepo([
+                { uid: "l1", name: "Important" },
+                { uid: "l2", name: "Work" },
+                { uid: "l3", name: "Unrelated" },
+            ]);
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: messageRepo as any,
+                calendarEventRepo: {} as any,
+                mailboxRepo: {} as any,
+                labelRepo: labelRepo as any,
+            };
+            const cache = {};
+
+            const values1 = await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context, cache);
+            const values2 = await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context, cache);
+
+            expect(values1).toEqual([["Important", "Work"]]);
+            expect(values2).toEqual([["Important", "Work"]]);
+            expect(labelRepo.find).toHaveBeenCalledTimes(1);
+            expect(labelRepo.find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1" }, { ignoreACL: true });
+        });
+
+        it("Fetches labels fresh each call when no cache is provided.", async () => {
+            const session = makeSession();
+            const keywordsId = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi", labelUids: ["l1"] }) };
+            const labelRepo = makeLabelRepo([{ uid: "l1", name: "Important" }]);
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: messageRepo as any,
+                calendarEventRepo: {} as any,
+                mailboxRepo: {} as any,
+                labelRepo: labelRepo as any,
+            };
+
+            await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context);
+            await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context);
+
+            expect(labelRepo.find).toHaveBeenCalledTimes(2);
+        });
+
+        it("Skips fetching labels entirely when the message has no labelUids, even with labelRepo present.", async () => {
+            const session = makeSession();
+            const messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi", labelUids: [] }) };
+            const labelRepo = makeLabelRepo([]);
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: messageRepo as any,
+                calendarEventRepo: {} as any,
+                mailboxRepo: {} as any,
+                labelRepo: labelRepo as any,
+            };
+
+            await resolvePropertyValues("message:m1", [{ propertyId: PID_TAG_SUBJECT, propertyType: PropertyType.PtypString }], context);
+
+            expect(labelRepo.find).not.toHaveBeenCalled();
+        });
+
+        it("Degrades to an empty labelNames list when labelRepo is absent from the context, even for a message with labelUids.", async () => {
+            const session = makeSession();
+            const keywordsId = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi", labelUids: ["l1"] }) };
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: messageRepo as any,
+                calendarEventRepo: {} as any,
+                mailboxRepo: {} as any,
+            };
+
+            const values = await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context);
+
+            expect(values).toEqual([[]]);
+        });
+
+        it("Drops a labelUid that no longer resolves to a real Label (deleted since the message was tagged).", async () => {
+            const session = makeSession();
+            const keywordsId = assignOrGetNamedPropertyId(session, { guid: PSETID_PUBLIC_STRINGS, kind: "name", name: "Keywords" });
+            const messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi", labelUids: ["l1", "gone"] }) };
+            const labelRepo = makeLabelRepo([{ uid: "l1", name: "Important" }]);
+            const context = {
+                mailboxUid: "mailbox-1",
+                session,
+                folderRepo: {} as any,
+                messageRepo: messageRepo as any,
+                calendarEventRepo: {} as any,
+                mailboxRepo: {} as any,
+                labelRepo: labelRepo as any,
+            };
+
+            const values = await resolvePropertyValues("message:m1", [{ propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString }], context);
+
+            expect(values).toEqual([["Important"]]);
         });
     });
 });

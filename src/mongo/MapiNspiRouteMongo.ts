@@ -16,8 +16,9 @@ export class MapiNspiRouteMongo extends BaseMapiNspiRoute<MailboxMongo> {
     protected mailboxClass: any = MailboxMongo;
     protected contactClass: any = ContactMongo;
 
-    protected likePattern(escaped: string): string {
-        // Mongo's like() compiles to an unanchored $regex - already a substring match with no wrapping needed.
-        return escaped;
+    protected likePattern(term: string): string {
+        // like()'s glob syntax anchors with ^...$ by default (ModelUtils.globToRegExpSource) - wrap with the
+        // glob wildcard on both ends for a genuine substring match, the same way MapiNspiRouteSQL.ts does.
+        return `*${term}*`;
     }
 }

@@ -15,8 +15,9 @@ export class MapiNspiRouteSQL extends BaseMapiNspiRoute<MailboxSQL> {
     protected mailboxClass: any = MailboxSQL;
     protected contactClass: any = ContactSQL;
 
-    protected likePattern(escaped: string): string {
-        // SQL's like() compiles to TypeORM's ILike() - a plain LIKE, exact unless wrapped in % wildcards.
-        return `%${escaped}%`;
+    protected likePattern(term: string): string {
+        // like()'s glob syntax (ModelUtils.globToLike) translates * to a SQL % wildcard - wrap on both ends for
+        // a genuine substring match, the same way MapiNspiRouteMongo.ts does for its own $regex compilation.
+        return `*${term}*`;
     }
 }

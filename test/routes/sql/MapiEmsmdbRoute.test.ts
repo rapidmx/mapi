@@ -9,7 +9,7 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource, ACLAction, A
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
-import { ContactSQL, FolderSQL, MailboxSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
+import { ContactSQL, FolderSQL, LabelSQL, MailboxSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
 import { FolderType, MessageImportance, RecipientType } from "@rapidmx/restapi";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 import { cookieHeaderFrom, mapiRequest } from "../../mapiTestClient.js";
@@ -28,6 +28,7 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
     let messageRepo: Repository<MessageSQL>;
     let contactRepo: Repository<ContactSQL>;
     let taskRepo: Repository<TaskSQL>;
+    let labelRepo: Repository<LabelSQL>;
     let aclRepo: Repository<AccessControlListSQL>;
 
     const owner: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
@@ -94,6 +95,10 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         return await taskRepo.save(new TaskSQL({ mailboxUid, folderUid, title: "Test Task", ...data } as any));
     };
 
+    const createLabel = async function (mailboxUid: string, data?: Partial<LabelSQL>): Promise<LabelSQL> {
+        return await labelRepo.save(new LabelSQL({ mailboxUid, name: "Test Label", ...data } as any));
+    };
+
     const execute = async function (cookie: string, ropBuffer: Buffer) {
         const body = new BufferWriter();
         body.writeUInt32LE(0);
@@ -147,6 +152,7 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
             messageRepo = conn.getRepository(MessageSQL);
             contactRepo = conn.getRepository(ContactSQL);
             taskRepo = conn.getRepository(TaskSQL);
+            labelRepo = conn.getRepository(LabelSQL);
         } else {
             throw new Error("Could not find sql connection");
         }
@@ -169,6 +175,7 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         await messageRepo.clear();
         await contactRepo.clear();
         await taskRepo.clear();
+        await labelRepo.clear();
         await aclRepo.clear();
     });
 
@@ -841,6 +848,152 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         const dataSize = readStreamRopsReader.readUInt16LE();
         expect(dataSize).toBe(streamSize);
         expect(readPropertyValue(readStreamRopsReader, PropertyType.PtypString)).toBe("Actual body text.");
+    });
+
+    it("Resolves a real message's labelUids to display names via PidNameKeywords, end to end.", async () => {
+        const PSETID_PUBLIC_STRINGS = "00020329-0000-0000-c000-000000000046";
+        const mailbox = await createMailbox(owner.uid);
+        const inbox = await createFolder(mailbox.uid, FolderType.INBOX, "Inbox");
+        const important = await createLabel(mailbox.uid, { name: "Important" });
+        const work = await createLabel(mailbox.uid, { name: "Work" });
+        await createMessage(mailbox.uid, inbox.uid, { subject: "Categorized", labelUids: [important.uid, work.uid] });
+        const connectResult = await connect();
+        const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+
+        const logonRops = new BufferWriter();
+        logonRops.writeUInt8(0xfe);
+        logonRops.writeUInt8(0);
+        logonRops.writeUInt8(0);
+        logonRops.writeUInt8(0x01);
+        logonRops.writeUInt32LE(0);
+        logonRops.writeUInt32LE(0);
+        logonRops.writeUInt16LE(0);
+        const logonResult = await execute(cookie, encodeRopBuffer({ ropsList: logonRops.toBuffer(), handleTable: [0xffffffff] }));
+        const logonReader = new BufferReader(logonResult.body);
+        logonReader.readUInt32LE();
+        logonReader.readUInt32LE();
+        logonReader.readUInt32LE();
+        const { ropsList: logonRopsList } = decodeRopBuffer(logonReader.readBytes(logonReader.readUInt32LE()));
+        const logonRopsReader = new BufferReader(logonRopsList);
+        logonRopsReader.readUInt8();
+        logonRopsReader.readUInt8();
+        logonRopsReader.readUInt32LE();
+        logonRopsReader.readUInt8();
+        logonRopsReader.readBigUInt64LE();
+        logonRopsReader.readBigUInt64LE();
+        logonRopsReader.readBigUInt64LE();
+        logonRopsReader.readBigUInt64LE();
+        const inboxFid = logonRopsReader.readBigUInt64LE();
+
+        const openFolderRops = new BufferWriter();
+        openFolderRops.writeUInt8(0x02);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeUInt8(1);
+        openFolderRops.writeUInt8(0);
+        openFolderRops.writeBigUInt64LE(inboxFid);
+        await execute(cookie, encodeRopBuffer({ ropsList: openFolderRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff] }));
+
+        const tableRops = new BufferWriter();
+        tableRops.writeUInt8(0x05);
+        tableRops.writeUInt8(0);
+        tableRops.writeUInt8(1);
+        tableRops.writeUInt8(2);
+        tableRops.writeUInt8(0);
+        await execute(cookie, encodeRopBuffer({ ropsList: tableRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+
+        const setColumnsRops = new BufferWriter();
+        setColumnsRops.writeUInt8(0x12);
+        setColumnsRops.writeUInt8(0);
+        setColumnsRops.writeUInt8(2);
+        setColumnsRops.writeUInt8(0);
+        setColumnsRops.writeUInt16LE(2);
+        writePropertyTag(setColumnsRops, { propertyId: 0x0037, propertyType: PropertyType.PtypString });
+        writePropertyTag(setColumnsRops, { propertyId: 0x674a, propertyType: PropertyType.PtypInteger64 });
+        await execute(cookie, encodeRopBuffer({ ropsList: setColumnsRops.toBuffer(), handleTable: [0xffffffff] }));
+
+        const queryRowsRops = new BufferWriter();
+        queryRowsRops.writeUInt8(0x15);
+        queryRowsRops.writeUInt8(0);
+        queryRowsRops.writeUInt8(2);
+        queryRowsRops.writeUInt8(0);
+        queryRowsRops.writeUInt8(1);
+        queryRowsRops.writeUInt16LE(10);
+        const queryRowsResult = await execute(cookie, encodeRopBuffer({ ropsList: queryRowsRops.toBuffer(), handleTable: [0xffffffff] }));
+        const queryRowsReader = new BufferReader(queryRowsResult.body);
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        queryRowsReader.readUInt32LE();
+        const { ropsList: queryRowsList } = decodeRopBuffer(queryRowsReader.readBytes(queryRowsReader.readUInt32LE()));
+        const rowsReader = new BufferReader(queryRowsList);
+        rowsReader.readUInt8();
+        rowsReader.readUInt8();
+        rowsReader.readUInt32LE();
+        rowsReader.readUInt8();
+        rowsReader.readUInt16LE();
+        rowsReader.readUInt8();
+        readPropertyValue(rowsReader, PropertyType.PtypString);
+        const mid = readPropertyValue(rowsReader, PropertyType.PtypInteger64) as bigint;
+
+        const openMessageRops = new BufferWriter();
+        openMessageRops.writeUInt8(0x03);
+        openMessageRops.writeUInt8(0);
+        openMessageRops.writeUInt8(1);
+        openMessageRops.writeUInt8(3);
+        openMessageRops.writeUInt16LE(0);
+        openMessageRops.writeBigUInt64LE(inboxFid);
+        openMessageRops.writeUInt8(0);
+        openMessageRops.writeBigUInt64LE(mid);
+        await execute(cookie, encodeRopBuffer({ ropsList: openMessageRops.toBuffer(), handleTable: [0xffffffff, 0xffffffff] }));
+
+        // RopGetPropertyIdsFromNames, Kind=Name ("Keywords") - NameSize is inclusive of the trailing UTF-16LE
+        // null terminator, per RopGetPropertyIdsFromNamesHandler.readPropertyName's own documented convention.
+        const nameBytes = Buffer.concat([Buffer.from("Keywords", "utf16le"), Buffer.from([0x00, 0x00])]);
+        const namesRops = new BufferWriter();
+        namesRops.writeUInt8(0x56);
+        namesRops.writeUInt8(0);
+        namesRops.writeUInt8(0);
+        namesRops.writeUInt8(0x02);
+        namesRops.writeUInt16LE(1);
+        namesRops.writeUInt8(0x01); // Kind - Name
+        namesRops.writeBytes(encodeGuid(PSETID_PUBLIC_STRINGS));
+        namesRops.writeUInt8(nameBytes.length);
+        namesRops.writeBytes(nameBytes);
+        const namesResult = await execute(cookie, encodeRopBuffer({ ropsList: namesRops.toBuffer(), handleTable: [0xffffffff] }));
+        const namesReader = new BufferReader(namesResult.body);
+        namesReader.readUInt32LE();
+        namesReader.readUInt32LE();
+        namesReader.readUInt32LE();
+        const { ropsList: namesRopsList } = decodeRopBuffer(namesReader.readBytes(namesReader.readUInt32LE()));
+        const namesRopsReader = new BufferReader(namesRopsList);
+        namesRopsReader.readUInt8();
+        namesRopsReader.readUInt8();
+        expect(namesRopsReader.readUInt32LE()).toBe(0);
+        expect(namesRopsReader.readUInt16LE()).toBe(1);
+        const keywordsId = namesRopsReader.readUInt16LE();
+        expect(keywordsId).toBeGreaterThanOrEqual(0x8000);
+
+        const getPropsRops = new BufferWriter();
+        getPropsRops.writeUInt8(0x07);
+        getPropsRops.writeUInt8(0);
+        getPropsRops.writeUInt8(3);
+        getPropsRops.writeUInt16LE(0);
+        getPropsRops.writeUInt16LE(0);
+        getPropsRops.writeUInt16LE(1);
+        writePropertyTag(getPropsRops, { propertyId: keywordsId, propertyType: PropertyType.PtypMultipleString });
+        const getPropsResult = await execute(cookie, encodeRopBuffer({ ropsList: getPropsRops.toBuffer(), handleTable: [0xffffffff] }));
+        const getPropsReader = new BufferReader(getPropsResult.body);
+        getPropsReader.readUInt32LE();
+        getPropsReader.readUInt32LE();
+        getPropsReader.readUInt32LE();
+        const { ropsList: getPropsRopsList } = decodeRopBuffer(getPropsReader.readBytes(getPropsReader.readUInt32LE()));
+        const getPropsRopsReader = new BufferReader(getPropsRopsList);
+        getPropsRopsReader.readUInt8();
+        getPropsRopsReader.readUInt8();
+        expect(getPropsRopsReader.readUInt32LE()).toBe(0);
+        getPropsRopsReader.readUInt8();
+        const categories = readPropertyValue(getPropsRopsReader, PropertyType.PtypMultipleString) as string[];
+        expect(categories.sort()).toEqual(["Important", "Work"]);
     });
 
     it("Composes and sends a real message end to end, saving a Sent Items copy.", async () => {

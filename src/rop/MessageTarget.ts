@@ -16,6 +16,10 @@ export interface MessageTargetInfo {
     read: boolean;
     hasAttachments: boolean;
     receivedDate: Date;
+    /** `Label.uid`s applied to this message (Gmail-style, independent of folder placement) - resolved to
+     * display names for `PidNameKeywords` (Outlook Categories) by `PropertyResolvers.ts`, which is where the
+     * `labelRepo` needed to translate a uid into a name lives. */
+    labelUids: string[];
 }
 
 /** Degrades to empty-looking values for a `"message:<uid>"` target whose real `Message` has since vanished
@@ -29,6 +33,7 @@ export async function resolveMessageInfo(target: string, messageRepo: RepoUtils<
         read: message?.flags?.read ?? false,
         hasAttachments: message?.hasAttachments ?? false,
         receivedDate: message?.receivedDate ?? new Date(0),
+        labelUids: message?.labelUids ?? [],
     };
 }
 

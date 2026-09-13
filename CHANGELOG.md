@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added read-only Outlook Categories (PidNameKeywords, PS_PUBLIC_STRINGS) support for messages, resolving each Message.labelUids entry to its Label.name and returning them as PtypMultipleString via RopQueryRows/RopGetPropertiesSpecific
+- Added labelRepo/labelClass as optional RopContext fields (mirroring contactRepo/taskRepo), populated by BaseMapiEmsmdbRoute
+- Added end-to-end HTTP+DB integration tests for Categories in both the mongo and sql MapiEmsmdbRoute test suites
+- Confirmed (via a targeted test against FolderType.ARCHIVE) that restapi's Archive folder type needs no new mapi code - generic folder/message browsing already handles any non-special-cased folder type identically
+
+### Changed
+- Bumped @rapidmx/restapi peer/dev dependency range to ^0.8.0 and @rapidrest/service-core to 2.x/^2.0.0
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
+### Fixed
+- Fixed NSPI GAL search (GetMatches) returning zero matches against restapi ^0.8.0/@rapidrest/service-core 2.x, whose like() operator changed from raw substring matching to glob syntax (* / ?) that treats an unescaped search term as an exact-match pattern - likePattern() implementations now wrap the raw term in `*...*` instead of regex-escaping it
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
 ## [1.0.0-beta.0] - 2026-09-09
 
 ### Added

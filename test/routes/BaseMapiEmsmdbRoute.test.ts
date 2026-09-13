@@ -4,11 +4,11 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Isolated unit tests for BaseMapiEmsmdbRoute, reserved for the defensive guard branches a real wired server
 // can never exercise (`!this.mailboxRepo || !this.folderRepo || !this.messageRepo || !this.calendarEventRepo ||
-// !this.contactRepo || !this.taskRepo || !this.sessionManager || !this.blobStore || !this.scanPipeline ||
-// !this.mailTransport` - DI always populates all ten before a request can reach a route - and `!user`, a second
-// defensive check behind `@Auth(["jwt"])` itself) - the same rationale test/routes/BaseEasRoute.test.ts already
-// uses for its own identical guards. Every other behavior is exercised via real HTTP+DB requests in
-// test/routes/mongo/MapiEmsmdbRoute.test.ts (and its sql/ counterpart).
+// !this.contactRepo || !this.taskRepo || !this.labelRepo || !this.sessionManager || !this.blobStore ||
+// !this.scanPipeline || !this.mailTransport` - DI always populates all eleven before a request can reach a
+// route - and `!user`, a second defensive check behind `@Auth(["jwt"])` itself) - the same rationale
+// test/routes/BaseEasRoute.test.ts already uses for its own identical guards. Every other behavior is
+// exercised via real HTTP+DB requests in test/routes/mongo/MapiEmsmdbRoute.test.ts (and its sql/ counterpart).
 import config from "../config.js";
 import { ObjectFactory } from "@rapidrest/service-core";
 import { Logger } from "@rapidrest/core";
@@ -21,6 +21,7 @@ class TestMapiEmsmdbRoute extends BaseMapiEmsmdbRoute<any> {
     protected calendarEventClass: any = { name: "TestCalendarEvent" };
     protected contactClass: any = { name: "TestContact" };
     protected taskClass: any = { name: "TestTask" };
+    protected labelClass: any = { name: "TestLabel" };
 }
 
 function makeReq(): any {
@@ -43,8 +44,8 @@ describe("BaseMapiEmsmdbRoute Tests (guard clauses only)", () => {
         vi.restoreAllMocks();
     });
 
-    it("dispatch() throws INTERNAL_ERROR when mailboxRepo/folderRepo/messageRepo/calendarEventRepo/contactRepo/taskRepo/sessionManager/blobStore/scanPipeline/mailTransport are not set.", async () => {
-        // `initialize: false` skips `@Init`, leaving all ten genuinely `undefined` - exactly what this
+    it("dispatch() throws INTERNAL_ERROR when mailboxRepo/folderRepo/messageRepo/calendarEventRepo/contactRepo/taskRepo/labelRepo/sessionManager/blobStore/scanPipeline/mailTransport are not set.", async () => {
+        // `initialize: false` skips `@Init`, leaving all eleven genuinely `undefined` - exactly what this
         // guard clause exists to catch.
         const route = objectFactory.newInstance<TestMapiEmsmdbRoute>(TestMapiEmsmdbRoute, { initialize: false });
 
@@ -63,6 +64,7 @@ describe("BaseMapiEmsmdbRoute Tests (guard clauses only)", () => {
         (route as any).calendarEventRepo = {};
         (route as any).contactRepo = {};
         (route as any).taskRepo = {};
+        (route as any).labelRepo = {};
         (route as any).sessionManager = {};
         (route as any).blobStore = {};
         (route as any).scanPipeline = {};

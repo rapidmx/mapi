@@ -16,8 +16,8 @@ class TestMapiNspiRoute extends BaseMapiNspiRoute<any> {
     protected mailboxClass: any = { name: "TestMailbox" };
     protected contactClass: any = { name: "TestContact" };
 
-    protected likePattern(escaped: string): string {
-        return escaped;
+    protected likePattern(term: string): string {
+        return term;
     }
 }
 

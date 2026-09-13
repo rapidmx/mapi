@@ -7,7 +7,7 @@ import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 
 describe("MessageTarget Tests", () => {
     describe("resolveMessageInfo", () => {
-        it("Resolves a real message's subject/read/hasAttachments/receivedDate.", async () => {
+        it("Resolves a real message's subject/read/hasAttachments/receivedDate/labelUids.", async () => {
             const receivedDate = new Date("2026-01-01T00:00:00.000Z");
             const messageRepo = {
                 findOne: vi.fn().mockResolvedValue({
@@ -16,10 +16,11 @@ describe("MessageTarget Tests", () => {
                     flags: { read: true },
                     hasAttachments: true,
                     receivedDate,
+                    labelUids: ["label1"],
                 }),
             };
             const info = await resolveMessageInfo("message:m1", messageRepo as any);
-            expect(info).toEqual({ subject: "Hello", read: true, hasAttachments: true, receivedDate });
+            expect(info).toEqual({ subject: "Hello", read: true, hasAttachments: true, receivedDate, labelUids: ["label1"] });
             expect(messageRepo.findOne).toHaveBeenCalledWith("m1", { ignoreACL: true });
         });
 
@@ -30,6 +31,13 @@ describe("MessageTarget Tests", () => {
             expect(info.read).toBe(false);
             expect(info.hasAttachments).toBe(false);
             expect(info.receivedDate).toEqual(new Date(0));
+            expect(info.labelUids).toEqual([]);
+        });
+
+        it("Defaults labelUids to an empty array when the message has none set.", async () => {
+            const messageRepo = { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject: "Hi" }) };
+            const info = await resolveMessageInfo("message:m1", messageRepo as any);
+            expect(info.labelUids).toEqual([]);
         });
     });
 

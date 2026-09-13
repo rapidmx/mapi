@@ -45,10 +45,10 @@ export abstract class BaseMapiNspiRoute<M extends Mailbox> {
     protected abstract mailboxClass: any;
     protected abstract contactClass: any;
 
-    /** Wraps an already-regex-escaped substring for this backend's `like()` operator - see
-     * `NspiGetMatchesHandler.ts`'s own `findMatchingContacts` and `SearchCommand.ts`'s identical hook for the
-     * full Mongo-vs-SQL reasoning. */
-    protected abstract likePattern(escaped: string): string;
+    /** Wraps a raw (not pre-escaped) search term in this backend's own `like()` glob-wildcard syntax (`*`) -
+     * see `NspiGetMatchesHandler.ts`'s own `findMatchingContacts` doc comment for why no escaping happens here
+     * (the `like()` operator, `@rapidrest/service-core` ^2.0+, already escapes everything but `*`/`?` itself). */
+    protected abstract likePattern(term: string): string;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -96,7 +96,7 @@ export abstract class BaseMapiNspiRoute<M extends Mailbox> {
                 if (!mailboxUid) {
                     throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
                 }
-                await handleNspiGetMatches(req, res, mailboxUid, this.contactRepo, (escaped) => this.likePattern(escaped));
+                await handleNspiGetMatches(req, res, mailboxUid, this.contactRepo, (term) => this.likePattern(term));
                 return;
             }
             default:

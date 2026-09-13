@@ -9,8 +9,8 @@ server — covers the pragmatic subset a real Outlook desktop client (and the "N
 on-prem/hybrid mailboxes) needs: mailbox logon, folder/message browsing, read-only Contacts/Tasks folder
 browsing, compose/send (including deferred/"do not deliver before" send and read-receipt requests), full
 Calendar CRUD including meeting invites/responses, deletion, a pragmatic (full-dump, not byte-perfect ICS)
-incremental sync, and a minimal NSPI address-book endpoint (`Bind`/`Unbind`/`GetMatches`) for GAL "search as
-you type."
+incremental sync, read-only Outlook Categories (`PidNameKeywords`, backed by restapi's Label/`labelUids`
+model), and a minimal NSPI address-book endpoint (`Bind`/`Unbind`/`GetMatches`) for GAL "search as you type."
 
 Like ActiveSync, it authenticates with the same JWT the rest of a RapidREST app's routes already use — no
 MAPI-specific auth code — which means a real native Outlook client needs an OAuth 2.0 Authorization Server
@@ -23,8 +23,13 @@ auto-accept; no DST-aware timezones (fixed-offset approximation only); no recurr
 `RopModifyRecipients`; no public-folder support; no delegate/shared-mailbox access; no
 rules/permissions/search-folder ROPs; no client-certificate enrollment; NSPI limited to
 `Bind`/`Unbind`/`GetMatches` only; Contacts/Tasks are browse-only (no create/edit via MAPI - use the REST API
-for that); no Focused Inbox (`PidTagInferenceClassification`) exposure, since its real wire encoding isn't
-publicly documented closely enough to implement with confidence.
+for that); Categories are likewise read-only (assign/remove labels via the REST API - there's no general
+"edit an existing message's properties" ROP path to hang a write-back on); no Focused Inbox
+(`PidTagInferenceClassification`) exposure, since its real wire encoding isn't publicly documented closely
+enough to implement with confidence; restapi's End-to-End Encryption and search features are deliberately
+out of scope here - E2E is designed so a real Outlook client needs no protocol changes (native S/MIME), and
+restapi's own specs document encrypted-mail search as unachievable from Outlook, not a gap this package could
+close.
 
 A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets real Outlook clients find
 this package's endpoints from just an email address.
