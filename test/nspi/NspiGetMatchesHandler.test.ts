@@ -49,7 +49,7 @@ describe("handleNspiGetMatches Tests", () => {
         });
         const res = makeRes();
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
         expect(contactRepo.find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1" }, { ignoreACL: true });
         expect(res.status).toHaveBeenCalledWith(200);
@@ -72,7 +72,7 @@ describe("handleNspiGetMatches Tests", () => {
         });
         const res = makeRes();
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
         expect(res.status).toHaveBeenCalledWith(200);
     });
@@ -94,7 +94,7 @@ describe("handleNspiGetMatches Tests", () => {
         });
         const res = makeRes();
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
         const body = res.send.mock.calls[0][0] as Buffer;
         const reader = new BufferReader(body);
@@ -133,7 +133,7 @@ describe("handleNspiGetMatches Tests", () => {
         });
         const res = makeRes();
 
-        await expect(handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s)).resolves.not.toThrow();
+        await expect(handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any)).resolves.not.toThrow();
         expect(res.status).toHaveBeenCalledWith(200);
     });
 
@@ -152,7 +152,7 @@ describe("handleNspiGetMatches Tests", () => {
         });
         const res = makeRes();
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, (s) => s);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
         const body = res.send.mock.calls[0][0] as Buffer;
         const reader = new BufferReader(body);
@@ -169,7 +169,7 @@ describe("handleNspiGetMatches Tests", () => {
     it("Throws (via BufferReader) when req.rawBody is undefined, falling back to an empty buffer.", async () => {
         const contactRepo = { find: vi.fn() };
         const req = { headers: {}, rawBody: undefined } as any;
-        await expect(handleNspiGetMatches(req, makeRes() as any, "mailbox-1", contactRepo as any, (s) => s)).rejects.toThrow();
+        await expect(handleNspiGetMatches(req, makeRes() as any, "mailbox-1", contactRepo as any)).rejects.toThrow();
     });
 
     it("Filters via a ContentRestriction search term, querying displayName/givenName/surname/company, merging by uid, and sorting by displayName.", async () => {
@@ -196,11 +196,10 @@ describe("handleNspiGetMatches Tests", () => {
             writer.writeUInt32LE(0);
         });
         const res = makeRes();
-        const likePattern = vi.fn((escaped: string) => escaped);
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, likePattern);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
-        expect(likePattern).toHaveBeenCalledWith("jane");
+        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(jane)" }, { ignoreACL: true });
         expect(find).toHaveBeenCalledTimes(4); // displayName/givenName/surname/company
         const body = res.send.mock.calls[0][0] as Buffer;
         const reader = new BufferReader(body);
@@ -225,7 +224,7 @@ describe("handleNspiGetMatches Tests", () => {
         expect(reader.readNullTerminatedUtf16LE()).toBe("Ann");
     });
 
-    it("Passes the search term to likePattern as-is, not pre-escaped - the like() operator (service-core ^2.0+) does its own escaping.", async () => {
+    it("Escapes regex metacharacters in the search term before building the regex() query pattern, so a literal '.' matches only itself.", async () => {
         const find = vi.fn().mockResolvedValue([]);
         const contactRepo = { find };
         const req = buildRequest((writer) => {
@@ -245,10 +244,9 @@ describe("handleNspiGetMatches Tests", () => {
             writer.writeUInt32LE(0);
         });
         const res = makeRes();
-        const likePattern = vi.fn((term: string) => term);
 
-        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any, likePattern);
+        await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
-        expect(likePattern).toHaveBeenCalledWith("a.b");
+        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(a\\.b)" }, { ignoreACL: true });
     });
 });

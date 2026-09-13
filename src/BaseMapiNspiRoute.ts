@@ -35,20 +35,15 @@ function firstHeader(req: HttpRequest, name: string): string | undefined {
  * `BaseMapiEmsmdbRoute`'s own doc comment already gives for why Bearer-token auth on an address-book endpoint
  * is real, current Exchange behavior, not a deviation this library invents.
  *
- * `mailboxClass`/`contactClass` are supplied by the Mongo/SQL concrete subclasses, and `likePattern` picks the
- * two-backend `like()`-wrapping convention `SearchCommand.ts` (EAS) already established for its own identical
- * GAL-search query gap.
+ * `mailboxClass`/`contactClass` are supplied by the Mongo/SQL concrete subclasses. GAL search itself (see
+ * `NspiGetMatchesHandler.ts`) uses `RepoUtils`'s `regex(...)` operator, which compiles identically on both
+ * backends - no per-backend hook needed here.
  *
  * @author Jean-Philippe Steinmetz
  */
 export abstract class BaseMapiNspiRoute<M extends Mailbox> {
     protected abstract mailboxClass: any;
     protected abstract contactClass: any;
-
-    /** Wraps a raw (not pre-escaped) search term in this backend's own `like()` glob-wildcard syntax (`*`) -
-     * see `NspiGetMatchesHandler.ts`'s own `findMatchingContacts` doc comment for why no escaping happens here
-     * (the `like()` operator, `@rapidrest/service-core` ^2.0+, already escapes everything but `*`/`?` itself). */
-    protected abstract likePattern(term: string): string;
 
     // Automatically injected by ObjectFactory on instantiation
     private _objectFactory?: ObjectFactory;
@@ -96,7 +91,7 @@ export abstract class BaseMapiNspiRoute<M extends Mailbox> {
                 if (!mailboxUid) {
                     throw new ApiError(ApiErrors.NOT_FOUND, 404, ApiErrorMessages.NOT_FOUND);
                 }
-                await handleNspiGetMatches(req, res, mailboxUid, this.contactRepo, (term) => this.likePattern(term));
+                await handleNspiGetMatches(req, res, mailboxUid, this.contactRepo);
                 return;
             }
             default:

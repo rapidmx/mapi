@@ -270,9 +270,22 @@ regex-escaping the user's search term so it behaved as a literal substring - whi
 just produces an exact-match glob pattern with no wildcards, so `RopGetMatches`/GAL "search as you type" broke
 silently (0 results for the previously-passing `Filters by a ContentRestriction search term, matching only
 Jane` Mongo test; SQL coincidentally still worked at the time, which would have hidden this backend-specific if
-only one route's tests had been checked). Fixed by deleting `escapeForLikeQuery()` entirely and having both
-`MapiNspiRouteMongo.likePattern()`/`MapiNspiRouteSQL.likePattern()` wrap the *raw* term in `*...*` instead -
-the correct way to ask either backend's `like()` for a genuine substring match under the new grammar.
+only one route's tests had been checked). First fix attempt: deleted `escapeForLikeQuery()` and had both
+`MapiNspiRouteMongo.likePattern()`/`MapiNspiRouteSQL.likePattern()` wrap the *raw* term in `*...*` glob
+wildcards instead. **Superseded within the same session**: JP pointed out `@rapidrest/service-core` 2.0 also
+added a genuine `regex()` operator (validated server-side against ReDoS shapes via `isUnsafeRegexPattern`,
+compiled case-insensitively and identically on both backends - Mongo `$regex`/`$options:"i"`, SQL `~*`/`REGEXP`
+with a `better-sqlite3` `REGEXP` function auto-registered per-connection) - a strictly better fit for "literal
+substring, case-insensitive" than glob-wrapping `like()`, since a `regex()` pattern built from `StringUtils
+.escapeRegExp(term)` has no residual wildcard ambiguity for a literal `*`/`?` in the search term (glob syntax
+has no escape for those two characters; `like()` would always have that gap). Switched to `regex()` and, since
+it compiles identically on both backends (unlike the old glob-wrapping, which coincidentally also ended up
+identical but didn't have to be), deleted the per-backend `likePattern()` hook entirely -
+`BaseMapiNspiRoute`/`MapiNspiRouteMongo`/`MapiNspiRouteSQL` no longer need one. Guidance for future sessions:
+prefer `regex()` over hand-rolled `like()` glob-wrapping specifically for "does this field contain this literal
+substring" queries, but don't reach for `regex()` where a simpler operator (`eq`/`in`/plain `like()` for a
+genuine prefix/suffix-style client-supplied glob) already does the job - it's the right tool for this one
+narrow shape, not a blanket replacement for `like()`.
 
 **Implemented**: read-only Outlook Categories (`PidNameKeywords`, `PS_PUBLIC_STRINGS` GUID
 `00020329-0000-0000-c000-000000000046`, `Kind = "name"` not `"lid"` - the first named property in this

@@ -15,10 +15,4 @@ import { BaseMapiNspiRoute } from "../BaseMapiNspiRoute.js";
 export class MapiNspiRouteMongo extends BaseMapiNspiRoute<MailboxMongo> {
     protected mailboxClass: any = MailboxMongo;
     protected contactClass: any = ContactMongo;
-
-    protected likePattern(term: string): string {
-        // like()'s glob syntax anchors with ^...$ by default (ModelUtils.globToRegExpSource) - wrap with the
-        // glob wildcard on both ends for a genuine substring match, the same way MapiNspiRouteSQL.ts does.
-        return `*${term}*`;
-    }
 }

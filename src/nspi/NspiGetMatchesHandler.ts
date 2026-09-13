@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { StringUtils } from "@rapidrest/core";
 import type { HttpRequest, HttpResponse, RepoUtils } from "@rapidrest/service-core";
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyType, type PropertyTag, type PropertyValueData } from "../codec/PropertyValue.js";
@@ -66,29 +67,29 @@ function valueForColumn(contact: ContactRow, column: PropertyTag): PropertyValue
  * (no filter was supplied, or (`extractContentRestrictionSearchTerm`'s own contract) the filter was already
  * known-good by the time this is called).
  *
- * `searchTerm` is passed to `likePattern` as-is, not pre-escaped: `RepoUtils`'s `like(...)` operator (`@rapidrest
- * /service-core` ^2.0) takes a **glob** pattern (`*`/`?` as wildcards) and already fully escapes every other
- * character itself before compiling it to a `$regex` (Mongo) or a `LIKE` pattern (SQL) - see
- * `ModelUtils.globToRegExpSource`/`globToLike`. Escaping regex metacharacters here first, as this pragmatic
- * subset used to, would double-escape them (e.g. a literal `.` in a search term would become a literal `\.` in
- * the stored data query, matching nothing) - this codebase's own `like()`-operator doc comment confirms the
- * escaping now happens exactly once, inside the framework. A search term containing a literal `*`/`?` still
- * acts as a wildcard, since the glob syntax has no escape mechanism of its own for those two characters - a
- * narrow, accepted limitation of the operator itself, not something this pragmatic subset works around. */
+ * Uses `RepoUtils`'s `regex(...)` operator (`@rapidrest/service-core` ^2.0), not `like(...)`: `like()` compiles
+ * a **glob** pattern (`*`/`?` as wildcards), which would require wrapping the term in `*...*` to get a substring
+ * match and would still treat a literal `*`/`?` in the search term itself as a wildcard (glob syntax has no
+ * escape for those two characters). `regex()` takes a real, already-anchoring-free regular expression compiled
+ * case-insensitively on both backends (`$regex`/`~*`/`REGEXP`), so escaping the term with `StringUtils
+ * .escapeRegExp` here gives a genuine literal-substring match with no residual wildcard ambiguity. `regex()`
+ * patterns are also independently validated by the framework itself (`ModelUtils.isUnsafeRegexPattern`) against
+ * catastrophic-backtracking shapes, but that guard is for patterns a caller assembles from parts; escaping the
+ * entire term with `escapeRegExp` before it ever reaches here already prevents any of those shapes from forming
+ * in the first place, since no unescaped metacharacter survives. */
 async function findMatchingContacts(
     mailboxUid: string,
     contactRepo: RepoUtils<any>,
     searchTerm: string | undefined,
-    likePattern: (term: string) => string,
 ): Promise<ContactRow[]> {
     if (!searchTerm) {
         return contactRepo.find({ mailboxUid }, { ignoreACL: true });
     }
 
-    const pattern = likePattern(searchTerm);
+    const pattern = StringUtils.escapeRegExp(searchTerm);
     const perField = await Promise.all(
         ["displayName", "givenName", "surname", "company"].map((field) =>
-            contactRepo.find({ mailboxUid, [field]: `like(${pattern})` } as any, { ignoreACL: true }),
+            contactRepo.find({ mailboxUid, [field]: `regex(${pattern})` } as any, { ignoreACL: true }),
         ),
     );
     const byUid = new Map<string, ContactRow>();
@@ -120,7 +121,7 @@ async function findMatchingContacts(
  *
  * @author Jean-Philippe Steinmetz
  */
-export async function handleNspiGetMatches(req: HttpRequest, res: HttpResponse, mailboxUid: string, contactRepo: RepoUtils<any>, likePattern: (term: string) => string): Promise<void> {
+export async function handleNspiGetMatches(req: HttpRequest, res: HttpResponse, mailboxUid: string, contactRepo: RepoUtils<any>): Promise<void> {
     const reader = new BufferReader(req.rawBody ?? Buffer.alloc(0));
     reader.readUInt32LE(); // Reserved
     if (reader.readUInt8()) {
@@ -143,7 +144,7 @@ export async function handleNspiGetMatches(req: HttpRequest, res: HttpResponse, 
     const columns = reader.readUInt8() ? readLargePropertyTagArray(reader) : DEFAULT_COLUMNS;
     // AuxiliaryBufferSize/AuxiliaryBuffer intentionally left unread - no auxiliary-payload support.
 
-    const matches = await findMatchingContacts(mailboxUid, contactRepo, searchTerm, likePattern);
+    const matches = await findMatchingContacts(mailboxUid, contactRepo, searchTerm);
     const page = matches.slice(0, rowCount);
 
     const body = new BufferWriter();

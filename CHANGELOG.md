@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Changed NSPI GAL search (GetMatches) from `like()` (glob syntax, requiring a `*...*`-wrapped pattern and still treating a literal `*`/`?` in the search term as a wildcard) to `regex()` (`@rapidrest/service-core` ^2.0's new operator), escaping the search term with `StringUtils.escapeRegExp` for a genuine literal-substring, case-insensitive match with no residual wildcard ambiguity - also removes the now-unneeded per-backend `likePattern()` hook from `BaseMapiNspiRoute`/`MapiNspiRouteMongo`/`MapiNspiRouteSQL`, since `regex()` compiles identically on both backends
+- Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
+
 ## [1.0.0-beta.1] - 2026-09-13
 
 ### Added
