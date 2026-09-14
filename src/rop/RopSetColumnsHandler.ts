@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
-import { readPropertyTag } from "../codec/PropertyValue.js";
+import { readPropertyTagArray } from "../codec/PropertyValue.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_SET_COLUMNS = 0x12;
@@ -16,6 +16,9 @@ const TABLE_STATUS_COMPLETE = 0x00;
  * doesn't exist)" - the same constant `RopQueryRowsHandler`/`RopGetHierarchyTableHandler` use for their own
  * analogous checks. */
 const ERROR_INVALID_OBJECT = 0x80070005;
+
+/** `MAPI_E_TOO_BIG`, for more than `MAX_PROPERTY_TAG_COUNT` columns. */
+const ERROR_TOO_BIG = 0x80040305;
 
 /**
  * `RopSetColumns` (`[MS-OXCTABL]`/`[MS-OXCROPS]`): configures which properties a table's subsequent
@@ -39,17 +42,13 @@ export class RopSetColumnsHandler implements RopHandler {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session
         const inputHandleIndex: number = reader.readUInt8();
         reader.readUInt8(); // SetColumnsFlags - this pragmatic subset has no async/deferred column-set variant
-        const propertyTagCount: number = reader.readUInt16LE();
-        const columns: { propertyId: number; propertyType: number }[] = [];
-        for (let i = 0; i < propertyTagCount; i++) {
-            columns.push(readPropertyTag(reader));
-        }
+        const columns = readPropertyTagArray(reader, reader.readUInt16LE());
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || handle.type !== "table") {
+        if (!handle || handle.type !== "table" || !columns) {
             writer.writeUInt8(ROP_ID_SET_COLUMNS);
             writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+            writer.writeUInt32LE(columns ? ERROR_INVALID_OBJECT : ERROR_TOO_BIG);
             return;
         }
         handle.columns = columns;

@@ -13,19 +13,47 @@ import {
     RouteDecorators,
 } from "@rapidrest/service-core";
 import { BufferReader, BufferWriter } from "./codec/BufferCursor.js";
-import { decodeRopBuffer, encodeRopBuffer } from "./codec/RopBuffer.js";
+import { decodeRopBuffer, encodeRopBuffer, type RopBuffer } from "./codec/RopBuffer.js";
 import { MapiSessionContext, MapiSessionManager } from "./MapiSessionManager.js";
 import { dispatchRops } from "./RopDispatcher.js";
 import type { RopContext, RopHandler } from "./rop/RopHandler.js";
 import { ScanPipeline } from "@rapidmx/restapi/scan";
-import { Folder, Mailbox, RecoverableRepoUtils, resolveCallerMailboxUid, type BlobStore } from "@rapidmx/restapi";
-const { Init, Inject, Logger } = ObjectDecorators;
+import { Folder, Mailbox, RecoverableRepoUtils, recordAuditLog, resolveCallerMailboxUid, type BlobStore } from "@rapidmx/restapi";
+const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Auth, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
 /** The well-known MAPI HRESULT `MAPI_E_LOGON_FAILED`, reused here to signal "no such session - reconnect"
  * via `X-ResponseCode`/`ErrorCode`. Not a claim of exact `[MS-OXCRPC]` return-value-table parity for this
  * specific condition - a real client only needs a non-zero code to know to re-`Connect`, not a precise one. */
 const ERROR_SESSION_NOT_FOUND = 0x80040111;
+
+/** `[MS-OXCMAPIHTTP]` `X-ResponseCode` 15, "Invalid Sequence": the request overlapped another one on the same
+ * session context. Sent when the session changed underneath this request (see `MapiSessionManager.save()`). */
+const RESPONSE_CODE_INVALID_SEQUENCE = 15;
+
+/** The largest `RopBufferSize` accepted - the `[MS-OXCRPC]` ROP input buffer limit. */
+export const MAX_ROP_BUFFER_SIZE = 32767;
+
+/**
+ * Decodes an `Execute` request body's `Flags`/`RopBufferSize`/`RopBuffer` and the ROP buffer framing inside it.
+ * Throws a 400 `ApiError` for a malformed body - a `RopBufferSize` over `MAX_ROP_BUFFER_SIZE` or past the end of the
+ * body, or a ROP buffer `decodeRopBuffer` rejects - instead of letting a bare `RangeError` surface as a 500.
+ * `MaxRopOut`/`AuxiliaryBufferSize`/`AuxiliaryBuffer` are left unread - no output-size capping or auxiliary-payload
+ * support in this pragmatic subset.
+ */
+export function decodeExecuteRequest(rawBody: Buffer): RopBuffer {
+    try {
+        const reader = new BufferReader(rawBody);
+        reader.readUInt32LE(); // Flags - unused by this pragmatic subset (no client ROP-response hints honored)
+        const ropBufferSize: number = reader.readUInt32LE();
+        if (ropBufferSize > MAX_ROP_BUFFER_SIZE || ropBufferSize > reader.remaining) {
+            throw new RangeError(`Execute: invalid RopBufferSize ${ropBufferSize}.`);
+        }
+        return decodeRopBuffer(reader.readBytes(ropBufferSize));
+    } catch {
+        throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
+    }
+}
 
 function firstHeader(req: HttpRequest, name: string): string | undefined {
     const value: string | string[] | undefined = req.headers[name];
@@ -74,6 +102,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
     protected abstract contactClass: any;
     protected abstract taskClass: any;
     protected abstract labelClass: any;
+    /** The backend's `AuditLogEntry` class. When set, messages deleted through MAPI are audited like REST deletes. */
+    protected auditLogClass?: any;
 
     /** ROP handler classes to instantiate (one each) in `@Init`, keyed by their own `ropId`. Empty until a
      * concrete `RopHandler` lands - every ROP is then simply left unprocessed (see `RopDispatcher`'s own doc
@@ -104,6 +134,9 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
 
     @Logger
     private logger: any;
+
+    @Config()
+    private config?: any;
 
     @Init
     public async init(): Promise<void> {
@@ -244,26 +277,13 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
      */
     private async handleExecute(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
         const session: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
-        if (!session) {
-            res.setHeader("X-ResponseCode", String(ERROR_SESSION_NOT_FOUND));
-            const body = new BufferWriter();
-            body.writeUInt32LE(0); // StatusCode
-            body.writeUInt32LE(ERROR_SESSION_NOT_FOUND); // ErrorCode
-            body.writeUInt32LE(0); // Flags
-            body.writeUInt32LE(0); // RopBufferSize
-            body.writeUInt32LE(0); // AuxiliaryBufferSize
-            res.status(200).send(body.toBuffer());
+        // The caller must still own the session's mailbox: a mailbox reassigned since Connect ends the session.
+        if (!session || (await resolveCallerMailboxUid(this.mailboxRepo!, user)) !== session.mailboxUid) {
+            this.sendExecuteFailure(res, ERROR_SESSION_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
             return;
         }
 
-        const requestReader = new BufferReader(req.rawBody ?? Buffer.alloc(0));
-        requestReader.readUInt32LE(); // Flags - unused by this pragmatic subset (no client ROP-response hints honored)
-        const ropBufferSize: number = requestReader.readUInt32LE();
-        const ropBufferBytes: Buffer = requestReader.readBytes(ropBufferSize);
-        // MaxRopOut/AuxiliaryBufferSize/AuxiliaryBuffer intentionally left unread - no output-size capping or
-        // auxiliary-payload support in this pragmatic subset.
-
-        const { ropsList, handleTable } = decodeRopBuffer(ropBufferBytes);
+        const { ropsList, handleTable } = decodeExecuteRequest(req.rawBody ?? Buffer.alloc(0));
         const context: RopContext = {
             mailboxUid: session.mailboxUid,
             userUid: session.userUid,
@@ -284,11 +304,25 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             blobStore: this.blobStore!,
             scanPipeline: this.scanPipeline!,
             mailTransport: this.mailTransport!,
+            audit: this.auditLogClass
+                ? (params) =>
+                      recordAuditLog(this._objectFactory!, this.auditLogClass, { config: this.config, req, user, logger: this.logger }, params)
+                : undefined,
         };
         const responseRopsList: Buffer = await dispatchRops(ropsList, this.ropHandlers, context);
         const responseRopBuffer: Buffer = encodeRopBuffer({ ropsList: responseRopsList, handleTable });
 
-        await this.sessionManager!.save(session);
+        const saved = await this.sessionManager!.save(session);
+        if (saved === "conflict") {
+            // Another request on this session saved first. This request's handle changes can't be kept, so fail it
+            // the way real Exchange reports overlapping requests on one session context; the client retries.
+            this.sendExecuteFailure(res, RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE);
+            return;
+        }
+        if (saved === "missing") {
+            this.sendExecuteFailure(res, ERROR_SESSION_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
+            return;
+        }
 
         const body = new BufferWriter();
         body.writeUInt32LE(0); // StatusCode
@@ -296,6 +330,18 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         body.writeUInt32LE(0); // Flags
         body.writeUInt32LE(responseRopBuffer.length);
         body.writeBytes(responseRopBuffer);
+        body.writeUInt32LE(0); // AuxiliaryBufferSize
+        res.status(200).send(body.toBuffer());
+    }
+
+    /** Writes an `Execute` failure body (no ROP buffer) with the given `X-ResponseCode` and `ErrorCode`. */
+    private sendExecuteFailure(res: HttpResponse, responseCode: number, errorCode: number): void {
+        res.setHeader("X-ResponseCode", String(responseCode));
+        const body = new BufferWriter();
+        body.writeUInt32LE(0); // StatusCode
+        body.writeUInt32LE(errorCode); // ErrorCode
+        body.writeUInt32LE(0); // Flags
+        body.writeUInt32LE(0); // RopBufferSize
         body.writeUInt32LE(0); // AuxiliaryBufferSize
         res.status(200).send(body.toBuffer());
     }

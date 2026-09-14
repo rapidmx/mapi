@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { assignHandle } from "../MapiSessionManager.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_CREATE_MESSAGE = 0x06;
@@ -48,12 +49,12 @@ export class RopCreateMessageHandler implements RopHandler {
             return;
         }
 
-        context.session.handles[outputHandleIndex] = {
+        assignHandle(context.session, outputHandleIndex, {
             type: "message",
             entityUid: "",
             draftFolderUid: target,
             draftProperties: {},
-        };
+        });
 
         writer.writeUInt8(ROP_ID_CREATE_MESSAGE);
         writer.writeUInt8(outputHandleIndex);

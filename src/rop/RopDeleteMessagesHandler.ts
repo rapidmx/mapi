@@ -3,9 +3,21 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { AuditAction } from "@rapidmx/restapi";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_DELETE_MESSAGES = 0x1e;
+
+/** Audits a message deleted through MAPI with the same `MESSAGE_DELETE` entry the REST message route records. */
+export async function auditMessageDelete(context: RopContext, message: { uid: string; mailboxUid: string; subject?: string; folderUid: string }): Promise<void> {
+    await context.audit?.({
+        action: AuditAction.MESSAGE_DELETE,
+        targetType: "Message",
+        targetUid: message.uid,
+        mailboxUid: message.mailboxUid,
+        details: { subject: message.subject, folderUid: message.folderUid },
+    });
+}
 
 /** The well-known MAPI HRESULT `MAPI_E_INVALID_OBJECT`, reused for "the referenced handle isn't a folder (or
  * doesn't exist)" - the same constant `RopGetContentsTableHandler` uses for its own analogous check. */
@@ -62,7 +74,12 @@ export class RopDeleteMessagesHandler implements RopHandler {
         for (const messageId of messageIds) {
             const target: string | undefined = context.session.messageIds[messageId.toString()];
             if (target?.startsWith("message:")) {
-                await context.messageRepo.delete(target.slice("message:".length), { ignoreACL: true });
+                const uid = target.slice("message:".length);
+                const message = context.audit ? await context.messageRepo.findOne(uid, { ignoreACL: true }) : undefined;
+                await context.messageRepo.delete(uid, { ignoreACL: true });
+                if (message) {
+                    await auditMessageDelete(context, message);
+                }
             } else if (target?.startsWith("calendarEvent:")) {
                 await context.calendarEventRepo.delete(target.slice("calendarEvent:".length), { ignoreACL: true });
             } else {

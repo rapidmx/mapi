@@ -5,6 +5,7 @@
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { encodeGuid } from "../codec/MapiGuid.js";
 import { Folder, FolderType } from "@rapidmx/restapi";
+import { assignHandle } from "../MapiSessionManager.js";
 import { assignOrGetFid } from "./FolderTarget.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -71,7 +72,7 @@ export class RopLogonHandler implements RopHandler {
         }
 
         const fids: Record<string, number> = await this.assignFolderIds(context);
-        context.session.handles[outputHandleIndex] = { type: "logon", entityUid: context.mailboxUid };
+        assignHandle(context.session, outputHandleIndex, { type: "logon", entityUid: context.mailboxUid });
 
         writer.writeUInt8(ROP_ID_LOGON);
         writer.writeUInt8(outputHandleIndex);

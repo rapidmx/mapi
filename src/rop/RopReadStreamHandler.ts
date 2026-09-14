@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
-import { resolveMessageBodyBytes } from "./MessageBodyStream.js";
+import { loadStreamBody } from "./MessageBodyStream.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_READ_STREAM = 0x2c;
@@ -53,7 +53,7 @@ export class RopReadStreamHandler implements RopHandler {
             return;
         }
 
-        const bytes = await resolveMessageBodyBytes(handle.entityUid, context.messageRepo, context.blobStore);
+        const bytes = await loadStreamBody(context, inputHandleIndex, handle);
         const position = handle.streamPosition ?? 0;
         const slice = bytes.subarray(position, position + Math.min(requestedCount, MAX_DATA_SIZE));
         handle.streamPosition = position + slice.length;

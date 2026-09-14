@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { writeTypedString } from "../codec/TypedString.js";
+import { assignHandle } from "../MapiSessionManager.js";
 import { resolveCalendarEventInfo } from "./CalendarEventTarget.js";
 import { resolveContactInfo } from "./ContactTarget.js";
 import { resolveMessageInfo } from "./MessageTarget.js";
@@ -73,7 +74,7 @@ export class RopOpenMessageHandler implements RopHandler {
         } else {
             subject = (await resolveMessageInfo(target, context.messageRepo)).subject;
         }
-        context.session.handles[outputHandleIndex] = { type: "message", entityUid: target };
+        assignHandle(context.session, outputHandleIndex, { type: "message", entityUid: target });
 
         writer.writeUInt8(ROP_ID_OPEN_MESSAGE);
         writer.writeUInt8(outputHandleIndex);

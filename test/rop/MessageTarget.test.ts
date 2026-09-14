@@ -46,7 +46,19 @@ describe("MessageTarget Tests", () => {
             const messageRepo = { find: vi.fn().mockResolvedValue([{ uid: "m1" }, { uid: "m2" }]) };
             const targets = await resolveFolderMessages("folder-1", messageRepo as any);
             expect(targets).toEqual(["message:m1", "message:m2"]);
-            expect(messageRepo.find).toHaveBeenCalledWith({ folderUid: "folder-1" }, { ignoreACL: true });
+            expect(messageRepo.find).toHaveBeenCalledWith(
+                { folderUid: "folder-1", sort: { receivedDate: "DESC", uid: "ASC" }, limit: 1000, page: 0 },
+                { ignoreACL: true, limit: 1000, page: 0 },
+            );
+        });
+
+        it("Pages past the repo's page size instead of stopping at its default row limit.", async () => {
+            const fullPage = Array.from({ length: 1000 }, (_, i) => ({ uid: `m${i}` }));
+            const messageRepo = { find: vi.fn().mockResolvedValueOnce(fullPage).mockResolvedValueOnce([{ uid: "last" }]) };
+            const targets = await resolveFolderMessages("folder-1", messageRepo as any);
+            expect(targets.length).toBe(1001);
+            expect(targets[1000]).toBe("message:last");
+            expect(messageRepo.find).toHaveBeenLastCalledWith(expect.objectContaining({ page: 1 }), expect.objectContaining({ page: 1 }));
         });
     });
 

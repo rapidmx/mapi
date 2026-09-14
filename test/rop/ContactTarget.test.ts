@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { resolveContactInfo, resolveFolderContacts } from "../../src/rop/ContactTarget.js";
+import { resolveContactInfo } from "../../src/rop/ContactTarget.js";
 import { ContactAddressKind } from "@rapidmx/restapi";
 
 describe("ContactTarget Tests", () => {
@@ -56,17 +56,6 @@ describe("ContactTarget Tests", () => {
 
             expect(info.email).toBeUndefined();
             expect(info.businessPhone).toBeUndefined();
-        });
-    });
-
-    describe("resolveFolderContacts", () => {
-        it("Returns each contact as a contact:<uid> target string.", async () => {
-            const contactRepo = { find: vi.fn().mockResolvedValue([{ uid: "c1" }, { uid: "c2" }]) };
-
-            const targets = await resolveFolderContacts("folder-1", contactRepo as any);
-
-            expect(targets).toEqual(["contact:c1", "contact:c2"]);
-            expect(contactRepo.find).toHaveBeenCalledWith({ folderUid: "folder-1" }, { ignoreACL: true });
         });
     });
 });

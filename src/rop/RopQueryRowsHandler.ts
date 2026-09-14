@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { writePropertyValue } from "../codec/PropertyValue.js";
+import { resolveContentsWindow } from "./ContentsTable.js";
 import { resolvePropertyValues, ResolutionCache } from "./PropertyResolvers.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -16,6 +17,10 @@ const ERROR_INVALID_OBJECT = 0x80070005;
 /** `BOOKMARK_END` (`[MS-OXCTABL]`'s `Origin` field) - this pragmatic subset has no separate seek/bookmark ROP
  * support, so every response reports the cursor as having landed at the table's current end. */
 const ORIGIN_BOOKMARK_END = 0x02;
+
+/** The most rows one `RopQueryRows` returns. Fewer rows than requested is normal table paging: the client asks
+ * again from the new cursor position. */
+export const MAX_ROWS_PER_QUERY = 500;
 
 /**
  * `RopQueryRows` (`[MS-OXCTABL]`/`[MS-OXCROPS]`): fetches up to `RowCount` rows from an already-configured
@@ -64,9 +69,12 @@ export class RopQueryRowsHandler implements RopHandler {
             return;
         }
 
-        const rows: string[] = table.rows ?? [];
         const cursor: number = table.cursor ?? 0;
-        const slice: string[] = rows.slice(cursor, cursor + requestedCount);
+        const count: number = Math.min(requestedCount, MAX_ROWS_PER_QUERY);
+        // A hierarchy table carries its rows; a contents table reads just this window from the database.
+        const slice: string[] = table.contentsKind
+            ? await resolveContentsWindow(context, table, cursor, count)
+            : (table.rows ?? []).slice(cursor, cursor + count);
         table.cursor = cursor + slice.length;
 
         // Shared across every row this call resolves - see ResolutionCache's own doc comment for why: without

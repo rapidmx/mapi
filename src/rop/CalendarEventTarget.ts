@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Attendee, BusyStatus, CalendarEvent, RecurrenceRule } from "@rapidmx/restapi";
+import { findAllCapped, type RepoSort } from "./RepoPaging.js";
 
 /**
  * The `RopGetContentsTable`/`RopOpenMessage` analog of `MessageTarget.ts`, for a `Folder` of type `CALENDAR`:
@@ -46,9 +47,12 @@ export async function resolveCalendarEventInfo(target: string, calendarEventRepo
     };
 }
 
-/** Resolves the calendar events directly in `folderUid`, as `"calendarEvent:<uid>"` target strings, for
- * `RopGetContentsTable` against a `CALENDAR`-type folder. */
+/** The order a calendar folder's events are listed in: latest start first, ties broken by `uid`. */
+export const CALENDAR_EVENT_SORT: RepoSort = { startDate: "DESC", uid: "ASC" };
+
+/** Resolves the calendar events directly in `folderUid`, latest first and capped at `MAX_COLLECTION_ROWS`, as
+ * `"calendarEvent:<uid>"` target strings. */
 export async function resolveFolderCalendarEvents(folderUid: string, calendarEventRepo: RepoUtils<any>): Promise<string[]> {
-    const events: CalendarEvent[] = await calendarEventRepo.find({ folderUid }, { ignoreACL: true });
+    const { items: events } = await findAllCapped<CalendarEvent>(calendarEventRepo, { folderUid }, CALENDAR_EVENT_SORT);
     return events.map((e) => `calendarEvent:${e.uid}`);
 }

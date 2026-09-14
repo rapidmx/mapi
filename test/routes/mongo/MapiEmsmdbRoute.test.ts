@@ -24,6 +24,7 @@ import { BufferReader, BufferWriter } from "../../../src/codec/BufferCursor.js";
 import { decodeGuid, encodeGuid } from "../../../src/codec/MapiGuid.js";
 import { PropertyType, readPropertyValue, writePropertyTag, writeTaggedPropertyValue, type TaggedPropertyValue } from "../../../src/codec/PropertyValue.js";
 import { decodeRopBuffer, encodeRopBuffer } from "../../../src/codec/RopBuffer.js";
+import { MapiSessionManager } from "../../../src/MapiSessionManager.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -285,6 +286,53 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             expect(responseRopBuffer.readUInt32LE(2)).toBe(7);
             expect(responseRopBuffer.readUInt32LE(6)).toBe(9);
             expect(reader.readUInt32LE()).toBe(0); // AuxiliaryBufferSize
+        });
+
+        it("Returns 400 for a RopBufferSize larger than the ROP buffer limit or the body itself.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const oversized = new BufferWriter().writeUInt32LE(0).writeUInt32LE(0x7fffffff).writeBytes(Buffer.alloc(16)).toBuffer();
+
+            const result = await mapiRequest(
+                server.getApplication(),
+                baseUrl,
+                { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie },
+                oversized,
+            );
+
+            expect(result.status).toBe(400);
+        });
+
+        it("Ends the session when the caller no longer owns the session's mailbox.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            await mailboxRepo.updateOne({ uid: mailbox.uid } as any, { $set: { ownerUserUid: uuid.v4() } });
+
+            const result = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+
+            expect(result.status).toBe(200);
+            expect(result.headers["x-responsecode"]).toBe(String(0x80040111));
+        });
+
+        it("Fails a request whose session was saved by an overlapping request first, with X-ResponseCode 15, and a vanished session as not-found.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const save = vi.spyOn(MapiSessionManager.prototype, "save").mockResolvedValueOnce("conflict").mockResolvedValueOnce("missing");
+            try {
+                const conflict = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+                expect(conflict.headers["x-responsecode"]).toBe("15");
+                const conflictBody = new BufferReader(conflict.body);
+                conflictBody.readUInt32LE();
+                expect(conflictBody.readUInt32LE()).toBe(15);
+
+                const missing = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+                expect(missing.headers["x-responsecode"]).toBe(String(0x80040111));
+            } finally {
+                save.mockRestore();
+            }
+
+            const ok = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+            expect(ok.headers["x-responsecode"]).toBe("0");
         });
     });
 
@@ -1134,6 +1182,51 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             const dataSize = readStreamRopsReader.readUInt16LE();
             expect(dataSize).toBe(streamSize);
             expect(readPropertyValue(readStreamRopsReader, PropertyType.PtypString)).toBe("Actual body text.");
+        });
+
+        it("Deletes a message by MID with RopDeleteMessages as a soft delete, recording a MESSAGE_DELETE audit entry.", async () => {
+            const mailbox = await createMailbox(owner.uid);
+            const inbox = await createFolder(mailbox.uid, FolderType.INBOX, "Inbox");
+            const message = await createMessage(mailbox.uid, inbox.uid, { subject: "Delete Me" });
+            const connectResult = await connect();
+            const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+
+            const logonResult = await execute(cookie, encodeRopBuffer({ ropsList: buildLogonRops(0), handleTable: [0xffffffff] }));
+            const logonReader = new BufferReader(logonResult.body);
+            logonReader.readBytes(12);
+            const logonRops = new BufferReader(decodeRopBuffer(logonReader.readBytes(logonReader.readUInt32LE())).ropsList);
+            logonRops.readBytes(7);
+            logonRops.readBytes(8 * 4); // Root, Deferred Action, Spooler Queue, IPM Subtree
+            const inboxFid = logonRops.readBigUInt64LE();
+
+            await execute(cookie, encodeRopBuffer({ ropsList: buildOpenFolderRops(0, 1, inboxFid), handleTable: [0xffffffff, 0xffffffff] }));
+            await execute(cookie, encodeRopBuffer({ ropsList: buildGetContentsTableRops(1, 2), handleTable: [0xffffffff, 0xffffffff, 0xffffffff] }));
+            await execute(cookie, encodeRopBuffer({ ropsList: buildSetColumnsRops(2, [{ propertyId: 0x674a, propertyType: PropertyType.PtypInteger64 }]), handleTable: [0xffffffff] }));
+            const rowsResult = await execute(cookie, encodeRopBuffer({ ropsList: buildQueryRowsRops(2, 10), handleTable: [0xffffffff] }));
+            const rowsReader = new BufferReader(rowsResult.body);
+            rowsReader.readBytes(12);
+            const rows = new BufferReader(decodeRopBuffer(rowsReader.readBytes(rowsReader.readUInt32LE())).ropsList);
+            rows.readBytes(7);
+            expect(rows.readUInt16LE()).toBe(1);
+            rows.readUInt8();
+            const mid = readPropertyValue(rows, PropertyType.PtypInteger64) as bigint;
+
+            const deleteRops = new BufferWriter().writeUInt8(0x1e).writeUInt8(0).writeUInt8(1).writeUInt8(0).writeUInt8(0).writeUInt16LE(1).writeBigUInt64LE(mid).toBuffer();
+            const deleteResult = await execute(cookie, encodeRopBuffer({ ropsList: deleteRops, handleTable: [0xffffffff] }));
+            const deleteReader = new BufferReader(deleteResult.body);
+            deleteReader.readBytes(12);
+            const deleteResponse = new BufferReader(decodeRopBuffer(deleteReader.readBytes(deleteReader.readUInt32LE())).ropsList);
+            deleteResponse.readBytes(2);
+            expect(deleteResponse.readUInt32LE()).toBe(0);
+            expect(deleteResponse.readUInt8()).toBe(0); // PartialCompletion
+
+            const stored: any = await messageRepo.findOne({ uid: message.uid } as any);
+            expect(stored?.deleted).toBe(true); // soft-deleted, still recoverable
+            const connMgr: ConnectionManager | undefined = objectFactory.getInstance(ConnectionManager);
+            const auditRepo = (connMgr?.connections.get("mongo") as MongoConnection).getMongoRepository("AuditLogEntryMongo");
+            const entries: any[] = await auditRepo.find({ targetUid: message.uid }).toArray();
+            expect(entries).toHaveLength(1);
+            expect(entries[0]).toMatchObject({ action: "message.delete", targetType: "Message", mailboxUid: mailbox.uid, actorUserUid: owner.uid });
         });
     });
 

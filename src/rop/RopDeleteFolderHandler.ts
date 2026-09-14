@@ -2,7 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import type { RepoUtils } from "@rapidrest/service-core";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { auditMessageDelete } from "./RopDeleteMessagesHandler.js";
+import { findAllCapped, findPage, MAX_COLLECTION_ROWS, type RepoSort } from "./RepoPaging.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_DELETE_FOLDER = 0x1d;
@@ -17,30 +20,46 @@ const ERROR_NOT_FOUND = 0x8004010f;
  * `[MS-OXCFOLD]` return-value-table parity (the real spec's own `ecFolderNotEmpty` isn't separately modeled). */
 const ERROR_INVALID_OBJECT = 0x80070005;
 
-/** `DeleteFolderFlags` bits (`[MS-OXCFOLD]` §2.2.1.3.1, confirmed this session). */
+/** `MAPI_E_TOO_COMPLEX`, for a subfolder tree deeper than `MAX_FOLDER_DEPTH` or larger than `MAX_FOLDERS_PER_DELETE`. */
+const ERROR_TOO_COMPLEX = 0x80040117;
+
+/** `DeleteFolderFlags` bits (`[MS-OXCFOLD]` §2.2.1.3.1). `DELETE_HARD_DELETE` (`0x10`) is deliberately not
+ * honored - see the class doc comment. */
 const DEL_MESSAGES = 0x01;
 const DEL_FOLDERS = 0x04;
-const DELETE_HARD_DELETE = 0x10;
+
+/** The deepest subfolder nesting a recursive delete walks. */
+export const MAX_FOLDER_DEPTH = 32;
+
+/** The most folders one recursive delete removes. */
+export const MAX_FOLDERS_PER_DELETE = 1000;
+
+/** The most items (messages, events, contacts, tasks) one `RopDeleteFolder` deletes. Past this the ROP stops,
+ * reports `PartialCompletion`, and leaves the folders that still hold items in place; the client can retry. */
+export const MAX_ITEMS_PER_DELETE = MAX_COLLECTION_ROWS;
+
+const UID_SORT: RepoSort = { uid: "ASC" };
 
 /**
- * `RopDeleteFolder` (`[MS-OXCFOLD]`/`[MS-OXCROPS]`, RopId `0x1D`): deletes a folder by `FolderId`. Reuses
- * `RecoverableRepoUtils.delete()` exactly as-built in Phase 2 for `Folder`/`Message`/`CalendarEvent` - see
- * `RopDeleteMessagesHandler.ts`'s own doc comment for why that matters (EAS's watermark-based incremental
- * delete detection depends on it).
+ * `RopDeleteFolder` (`[MS-OXCFOLD]`/`[MS-OXCROPS]`, RopId `0x1D`): deletes a folder by `FolderId`, via
+ * `RecoverableRepoUtils.delete()` - see `RopDeleteMessagesHandler.ts`'s own doc comment for why that matters (EAS's
+ * watermark-based incremental delete detection depends on it).
  *
- * **Real spec semantics honored, not simplified away**: per `[MS-OXCFOLD]`, `RopDeleteFolder` only operates on
- * an empty folder by default - `DEL_MESSAGES` must be set to also delete the folder's own messages/calendar
- * events/contacts/tasks, and `DEL_FOLDERS` to also delete (recursively) its subfolders; a non-empty folder
- * deleted without the matching flag fails rather than silently cascading. `DELETE_HARD_DELETE` maps directly
- * onto `RepoDeleteOptions.purge` - real, exact semantic overlap with this library's own soft-delete model, not
- * a coincidence this codec papers over.
+ * **Real spec semantics honored**: `RopDeleteFolder` only operates on an empty folder by default - `DEL_MESSAGES`
+ * must be set to also delete the folder's own messages/calendar events/contacts/tasks, and `DEL_FOLDERS` to also
+ * delete (recursively) its subfolders; a non-empty folder deleted without the matching flag fails rather than
+ * silently cascading.
  *
- * **Contacts/Tasks folders**: emptiness is checked against `contactRepo`/`taskRepo` alongside `messageRepo`/
- * `calendarEventRepo`, and both are included in the delete cascade - a `CONTACTS`/`TASKS` folder's real content
- * lives in those repos (see `ContactTarget.ts`/`TaskTarget.ts`), not `messageRepo`, so checking only the latter
- * would let a non-empty Contacts/Tasks folder be deleted without `DEL_MESSAGES` and orphan its rows. Guarded
- * with `context.contactRepo`/`taskRepo` presence checks the same way `RopGetContentsTableHandler` does, since
- * `RopContext`'s doc comment documents both as optional.
+ * **Always a soft delete.** `DELETE_HARD_DELETE` is ignored. A permanent delete has to go through restapi's legal
+ * hold check first (the REST routes call `LegalHoldUtils.assertNotOnLegalHold()` for `purge=true`), and that helper
+ * isn't part of `@rapidmx/restapi`'s public exports. A soft-deleted item stays recoverable and discoverable, which is
+ * exactly what a hold requires, so MAPI never purges. Each deleted message is audited as `MESSAGE_DELETE`, like the
+ * REST message route.
+ *
+ * **Bounded.** The subfolder tree is walked iteratively with a visited set (a corrupt `parentFolderUid` cycle
+ * can't loop), at most `MAX_FOLDER_DEPTH` deep and `MAX_FOLDERS_PER_DELETE` wide, and only through folders in the
+ * caller's own mailbox. Items are fetched in explicit, paged queries (a bare `find()` stops at 100 rows, which used
+ * to leave items behind in a folder that was then deleted), up to `MAX_ITEMS_PER_DELETE`.
  *
  * The request's own `InputHandleIndex` (nominally the *parent* folder of the one being deleted) is validated to
  * be a real, open folder handle but not cross-checked against the target folder's actual `parentFolderUid` -
@@ -60,93 +79,125 @@ export class RopDeleteFolderHandler implements RopHandler {
 
         const handle = context.session.handles[inputHandleIndex];
         if (!handle || handle.type !== "folder") {
-            writer.writeUInt8(ROP_ID_DELETE_FOLDER);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+            this.writeFailure(writer, inputHandleIndex, ERROR_INVALID_OBJECT);
             return;
         }
 
         const target: string | undefined = context.session.folderIds[folderId.toString()];
         if (!target?.startsWith("folder:")) {
-            writer.writeUInt8(ROP_ID_DELETE_FOLDER);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_NOT_FOUND);
+            this.writeFailure(writer, inputHandleIndex, ERROR_NOT_FOUND);
             return;
         }
         const uid = target.slice("folder:".length);
-        const purge = (deleteFolderFlags & DELETE_HARD_DELETE) !== 0;
 
-        const messages = await context.messageRepo.find({ folderUid: uid }, { ignoreACL: true });
-        const events = await context.calendarEventRepo.find({ folderUid: uid }, { ignoreACL: true });
-        const contacts = context.contactRepo ? await context.contactRepo.find({ folderUid: uid }, { ignoreACL: true }) : [];
-        const tasks = context.taskRepo ? await context.taskRepo.find({ folderUid: uid }, { ignoreACL: true }) : [];
-        const childFolders = await context.folderRepo.find({ parentFolderUid: uid }, { ignoreACL: true });
-
-        if (
-            (messages.length > 0 || events.length > 0 || contacts.length > 0 || tasks.length > 0) &&
-            (deleteFolderFlags & DEL_MESSAGES) === 0
-        ) {
-            writer.writeUInt8(ROP_ID_DELETE_FOLDER);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+        if ((deleteFolderFlags & DEL_MESSAGES) === 0 && (await this.hasItems(uid, context))) {
+            this.writeFailure(writer, inputHandleIndex, ERROR_INVALID_OBJECT);
             return;
         }
-        if (childFolders.length > 0 && (deleteFolderFlags & DEL_FOLDERS) === 0) {
-            writer.writeUInt8(ROP_ID_DELETE_FOLDER);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+        const childQuery = { parentFolderUid: uid, mailboxUid: context.mailboxUid };
+        if ((deleteFolderFlags & DEL_FOLDERS) === 0 && (await findPage(context.folderRepo, childQuery, UID_SORT, 0, 1)).length > 0) {
+            this.writeFailure(writer, inputHandleIndex, ERROR_INVALID_OBJECT);
             return;
         }
 
-        for (const message of messages) {
-            await context.messageRepo.delete(message.uid, { ignoreACL: true, purge });
+        const folders: string[] | undefined = await this.collectSubtree(uid, context);
+        if (!folders) {
+            this.writeFailure(writer, inputHandleIndex, ERROR_TOO_COMPLEX);
+            return;
         }
-        for (const event of events) {
-            await context.calendarEventRepo.delete(event.uid, { ignoreACL: true, purge });
+
+        const budget = { remaining: MAX_ITEMS_PER_DELETE };
+        let partialCompletion = false;
+        for (const folderUid of folders) {
+            if (!(await this.deleteItems(folderUid, context, budget))) {
+                partialCompletion = true;
+                break;
+            }
+            await context.folderRepo.delete(folderUid, { ignoreACL: true });
         }
-        for (const contact of contacts) {
-            await context.contactRepo!.delete(contact.uid, { ignoreACL: true, purge });
-        }
-        for (const task of tasks) {
-            await context.taskRepo!.delete(task.uid, { ignoreACL: true, purge });
-        }
-        for (const childFolder of childFolders) {
-            await this.deleteFolderRecursive(childFolder.uid, context, purge);
-        }
-        await context.folderRepo.delete(uid, { ignoreACL: true, purge });
 
         writer.writeUInt8(ROP_ID_DELETE_FOLDER);
         writer.writeUInt8(inputHandleIndex);
         writer.writeUInt32LE(0); // ReturnValue - success
-        writer.writeUInt8(0); // PartialCompletion - always false; a partial failure above already returned early
+        writer.writeUInt8(partialCompletion ? 1 : 0); // PartialCompletion
     }
 
-    /** Cascades a `DEL_FOLDERS` delete into `folderUid`'s own messages/calendar events/subfolders before
-     * deleting it - this data model's folder hierarchy is a plain parent-pointer tree (never a graph), so
-     * unbounded recursion here needs no cycle protection, the same assumption `FolderTarget.resolveFolderChildren`
-     * already makes. */
-    private async deleteFolderRecursive(folderUid: string, context: RopContext, purge: boolean): Promise<void> {
-        const messages = await context.messageRepo.find({ folderUid }, { ignoreACL: true });
-        const events = await context.calendarEventRepo.find({ folderUid }, { ignoreACL: true });
-        const contacts = context.contactRepo ? await context.contactRepo.find({ folderUid }, { ignoreACL: true }) : [];
-        const tasks = context.taskRepo ? await context.taskRepo.find({ folderUid }, { ignoreACL: true }) : [];
-        const childFolders = await context.folderRepo.find({ parentFolderUid: folderUid }, { ignoreACL: true });
+    private writeFailure(writer: BufferWriter, inputHandleIndex: number, returnValue: number): void {
+        writer.writeUInt8(ROP_ID_DELETE_FOLDER);
+        writer.writeUInt8(inputHandleIndex);
+        writer.writeUInt32LE(returnValue);
+    }
 
-        for (const message of messages) {
-            await context.messageRepo.delete(message.uid, { ignoreACL: true, purge });
+    /** The repos a folder's items can live in, skipping the optional ones the context doesn't have. */
+    private itemRepos(context: RopContext): RepoUtils<any>[] {
+        return [context.messageRepo, context.calendarEventRepo, context.contactRepo, context.taskRepo].filter(
+            (repo): repo is RepoUtils<any> => repo !== undefined,
+        );
+    }
+
+    private async hasItems(folderUid: string, context: RopContext): Promise<boolean> {
+        for (const repo of this.itemRepos(context)) {
+            if ((await findPage(repo, { folderUid, mailboxUid: context.mailboxUid }, UID_SORT, 0, 1)).length > 0) {
+                return true;
+            }
         }
-        for (const event of events) {
-            await context.calendarEventRepo.delete(event.uid, { ignoreACL: true, purge });
+        return false;
+    }
+
+    /**
+     * `rootUid` and every folder below it in the caller's mailbox, children before their parents, or `undefined` when
+     * the tree is deeper than `MAX_FOLDER_DEPTH` or has more than `MAX_FOLDERS_PER_DELETE` folders.
+     */
+    private async collectSubtree(rootUid: string, context: RopContext): Promise<string[] | undefined> {
+        const visited = new Set<string>([rootUid]);
+        const preOrder: string[] = [];
+        const stack: { uid: string; depth: number }[] = [{ uid: rootUid, depth: 0 }];
+        while (stack.length > 0) {
+            const { uid, depth } = stack.pop()!;
+            preOrder.push(uid);
+            const { items: children, truncated } = await findAllCapped<{ uid: string }>(
+                context.folderRepo,
+                { parentFolderUid: uid, mailboxUid: context.mailboxUid },
+                UID_SORT,
+                MAX_FOLDERS_PER_DELETE,
+            );
+            if (truncated) {
+                return undefined;
+            }
+            for (const child of children) {
+                if (visited.has(child.uid)) {
+                    continue;
+                }
+                if (depth + 1 > MAX_FOLDER_DEPTH || visited.size >= MAX_FOLDERS_PER_DELETE) {
+                    return undefined;
+                }
+                visited.add(child.uid);
+                stack.push({ uid: child.uid, depth: depth + 1 });
+            }
         }
-        for (const contact of contacts) {
-            await context.contactRepo!.delete(contact.uid, { ignoreACL: true, purge });
+        return preOrder.reverse();
+    }
+
+    /** Soft-deletes `folderUid`'s items within `budget`. Returns `false` if items remain once the budget is spent. */
+    private async deleteItems(folderUid: string, context: RopContext, budget: { remaining: number }): Promise<boolean> {
+        for (const repo of this.itemRepos(context)) {
+            const { items, truncated } = await findAllCapped<any>(
+                repo,
+                { folderUid, mailboxUid: context.mailboxUid },
+                UID_SORT,
+                budget.remaining,
+            );
+            for (const item of items) {
+                await repo.delete(item.uid, { ignoreACL: true });
+                if (repo === context.messageRepo) {
+                    await auditMessageDelete(context, item);
+                }
+            }
+            budget.remaining -= items.length;
+            if (truncated) {
+                return false;
+            }
         }
-        for (const task of tasks) {
-            await context.taskRepo!.delete(task.uid, { ignoreACL: true, purge });
-        }
-        for (const childFolder of childFolders) {
-            await this.deleteFolderRecursive(childFolder.uid, context, purge);
-        }
-        await context.folderRepo.delete(folderUid, { ignoreACL: true, purge });
+        return true;
     }
 }

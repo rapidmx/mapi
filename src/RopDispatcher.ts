@@ -5,6 +5,10 @@
 import { BufferReader, BufferWriter } from "./codec/BufferCursor.js";
 import type { RopContext, RopHandler } from "./rop/RopHandler.js";
 
+/** The most ROPs processed from one `Execute` request. A real client batches far fewer; anything past this is
+ * left unprocessed. */
+export const MAX_ROPS_PER_EXECUTE = 1024;
+
 /**
  * Walks a decoded `RopBuffer`'s `ropsList` blob, dispatching each contained ROP - identified by its own
  * leading `RopId` byte - to the matching registered handler in turn, collecting every response into one
@@ -24,10 +28,13 @@ export async function dispatchRops(
     ropsList: Buffer,
     handlers: Map<number, RopHandler>,
     context: RopContext,
+    maxRops: number = MAX_ROPS_PER_EXECUTE,
 ): Promise<Buffer> {
     const reader = new BufferReader(ropsList);
     const writer = new BufferWriter();
-    while (reader.hasMore()) {
+    let processed = 0;
+    // Stops after `maxRops` the same way it stops at an unknown RopId, so one Execute can't queue unbounded work.
+    while (reader.hasMore() && processed++ < maxRops) {
         const ropId = reader.readUInt8();
         const handler = handlers.get(ropId);
         if (!handler) {

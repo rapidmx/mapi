@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { assignHandle } from "../MapiSessionManager.js";
 import { resolveFolderChildren } from "./FolderTarget.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -41,7 +42,7 @@ export class RopGetHierarchyTableHandler implements RopHandler {
         }
 
         const rows: string[] = await resolveFolderChildren(context.mailboxUid, folderHandle.entityUid, context.folderRepo);
-        context.session.handles[outputHandleIndex] = { type: "table", entityUid: folderHandle.entityUid, rows, cursor: 0 };
+        assignHandle(context.session, outputHandleIndex, { type: "table", entityUid: folderHandle.entityUid, rows, cursor: 0 });
 
         writer.writeUInt8(ROP_ID_GET_HIERARCHY_TABLE);
         writer.writeUInt8(outputHandleIndex);

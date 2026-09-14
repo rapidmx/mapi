@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Contact } from "@rapidmx/restapi";
+import type { RepoSort } from "./RepoPaging.js";
 
 /**
  * The `RopGetContentsTable`/`RopOpenMessage` analog of `MessageTarget.ts`, for a `Folder` of type `CONTACTS`:
@@ -44,9 +45,5 @@ export async function resolveContactInfo(target: string, contactRepo: RepoUtils<
     };
 }
 
-/** Resolves the contacts directly in `folderUid`, as `"contact:<uid>"` target strings, for
- * `RopGetContentsTable` against a `CONTACTS`-type folder. */
-export async function resolveFolderContacts(folderUid: string, contactRepo: RepoUtils<any>): Promise<string[]> {
-    const contacts: Contact[] = await contactRepo.find({ folderUid }, { ignoreACL: true });
-    return contacts.map((c) => `contact:${c.uid}`);
-}
+/** The order a `CONTACTS` folder's contents table lists contacts in (see `ContentsTable.ts`). */
+export const CONTACT_SORT: RepoSort = { displayName: "ASC", uid: "ASC" };

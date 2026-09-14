@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
-import { readPropertyTag, type PropertyTag } from "../codec/PropertyValue.js";
-import { buildFastTransferStream } from "./FastTransferStream.js";
+import { readPropertyTagArray, type PropertyTag } from "../codec/PropertyValue.js";
+import { openFastTransferHandle } from "./FastTransferStream.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_COPY_PROPERTIES = 0x69;
@@ -13,6 +13,9 @@ const ROP_ID_COPY_PROPERTIES = 0x69;
  * message (or doesn't exist)" - the same constant `RopGetPropertiesSpecificHandler` uses for its own analogous
  * check. */
 const ERROR_INVALID_OBJECT = 0x80070005;
+
+/** `MAPI_E_TOO_BIG`: more than `MAX_PROPERTY_TAG_COUNT` tags, or a stream past `MAX_FAST_TRANSFER_BYTES`. */
+const ERROR_TOO_BIG = 0x80040305;
 
 /**
  * `RopFastTransferSourceCopyProperties` (`[MS-OXCFXICS]`/`[MS-OXCROPS]`, RopId `0x69`): the explicit-column
@@ -42,11 +45,7 @@ export class RopFastTransferSourceCopyPropertiesHandler implements RopHandler {
         reader.readUInt8(); // Level - subfolder recursion not honored, see class doc comment
         reader.readUInt8(); // CopyFlags (1 byte here, unlike CopyTo's 4) - not honored, see class doc comment
         reader.readUInt8(); // SendOptions - not honored, see class doc comment
-        const propertyTagCount: number = reader.readUInt16LE();
-        const columns: PropertyTag[] = [];
-        for (let i = 0; i < propertyTagCount; i++) {
-            columns.push(readPropertyTag(reader));
-        }
+        const columns: PropertyTag[] | undefined = readPropertyTagArray(reader, reader.readUInt16LE());
 
         const handle = context.session.handles[inputHandleIndex];
         if (!handle || (handle.type !== "folder" && handle.type !== "message")) {
@@ -55,14 +54,12 @@ export class RopFastTransferSourceCopyPropertiesHandler implements RopHandler {
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
             return;
         }
-
-        const transferBuffer = await buildFastTransferStream(handle, context, { columns });
-        context.session.handles[outputHandleIndex] = {
-            type: "fastTransfer",
-            entityUid: handle.entityUid,
-            transferBufferBase64: transferBuffer.toString("base64"),
-            transferPosition: 0,
-        };
+        if (!columns || !(await openFastTransferHandle(context, outputHandleIndex, handle, { columns }))) {
+            writer.writeUInt8(ROP_ID_COPY_PROPERTIES);
+            writer.writeUInt8(outputHandleIndex);
+            writer.writeUInt32LE(ERROR_TOO_BIG);
+            return;
+        }
 
         writer.writeUInt8(ROP_ID_COPY_PROPERTIES);
         writer.writeUInt8(outputHandleIndex);

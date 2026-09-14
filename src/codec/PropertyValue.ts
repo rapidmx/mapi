@@ -66,6 +66,28 @@ export function readPropertyTag(reader: BufferReader): PropertyTag {
     return { propertyId, propertyType };
 }
 
+/** The most `PropertyTag`s accepted in one request's tag array (`RopSetColumns`, `RopGetPropertiesSpecific`,
+ * the FastTransfer source ROPs, NSPI `Columns`). Every tag multiplies the per-row resolution work and, for
+ * `RopSetColumns`, the stored session state; a real client asks for far fewer. */
+export const MAX_PROPERTY_TAG_COUNT = 256;
+
+/**
+ * Reads `count` consecutive `PropertyTag`s. When `count` exceeds `MAX_PROPERTY_TAG_COUNT`, the tags' bytes are
+ * skipped (still bounds-checked, so a count larger than the buffer throws) and `undefined` is returned, leaving
+ * the reader positioned after the array so the caller can send an error response and keep parsing later ROPs.
+ */
+export function readPropertyTagArray(reader: BufferReader, count: number): PropertyTag[] | undefined {
+    if (count > MAX_PROPERTY_TAG_COUNT) {
+        reader.readBytes(count * 4);
+        return undefined;
+    }
+    const tags: PropertyTag[] = [];
+    for (let i = 0; i < count; i++) {
+        tags.push(readPropertyTag(reader));
+    }
+    return tags;
+}
+
 export function writePropertyTag(writer: BufferWriter, tag: PropertyTag): void {
     writer.writeUInt16LE(tag.propertyType);
     writer.writeUInt16LE(tag.propertyId);

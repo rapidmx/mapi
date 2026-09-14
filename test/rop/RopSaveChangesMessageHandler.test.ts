@@ -329,6 +329,85 @@ describe("RopSaveChangesMessageHandler Tests", () => {
             ]);
         });
 
+        describe("sequence (RFC 5546 SEQUENCE)", () => {
+            const baseExisting = () => ({
+                uid: "evt1",
+                version: 1,
+                sequence: 4,
+                title: "Sync",
+                location: "Room 1",
+                startDate: new Date("2026-02-01T10:00:00.000Z"),
+                endDate: new Date("2026-02-01T11:00:00.000Z"),
+                busyStatus: BusyStatus.BUSY,
+                timezone: "UTC",
+                attendees: [{ address: "a@example.com", role: "required", responseStatus: "accepted", isOrganizer: false }],
+            });
+
+            async function saveWith(existing: any, properties: (session: MapiSessionContext) => Record<string, string>): Promise<any> {
+                const context = makeContext();
+                const calendarEventRepo = { findOne: vi.fn().mockResolvedValue(existing), update: vi.fn().mockResolvedValue(undefined) };
+                context.calendarEventRepo = calendarEventRepo as any;
+                context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment", ...properties(context.session) } };
+                await new RopSaveChangesMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+                return calendarEventRepo.update.mock.calls[0][0];
+            }
+
+            it("Keeps the sequence for an edit attendees don't need to hear about (title, busy status).", async () => {
+                const delta = await saveWith(baseExisting(), (session) => ({
+                    "55": "Renamed",
+                    [String(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_BUSY_STATUS }))]: "0",
+                }));
+                expect(delta.sequence).toBe(4);
+            });
+
+            it("Bumps the sequence when the start time moves.", async () => {
+                const delta = await saveWith(baseExisting(), (session) => ({
+                    [String(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_APPOINTMENT_START_WHOLE }))]:
+                        "2026-02-01T12:00:00.000Z",
+                }));
+                expect(delta.sequence).toBe(5);
+            });
+
+            it("Bumps the sequence when the location changes.", async () => {
+                const delta = await saveWith(baseExisting(), (session) => ({
+                    [String(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_LOCATION }))]: "Room 2",
+                }));
+                expect(delta.sequence).toBe(5);
+            });
+
+            it("Bumps the sequence when the invite list changes, but keeps a still-invited attendee's recorded response.", async () => {
+                const delta = await saveWith(baseExisting(), () => ({ "3588": "A@example.com; b@example.com" }));
+                expect(delta.sequence).toBe(5);
+                expect(delta.attendees[0].responseStatus).toBe("accepted");
+                expect(delta.attendees[1]).toEqual({ address: "b@example.com", role: "required", responseStatus: "needsAction", isOrganizer: false });
+            });
+
+            it("Keeps the sequence when the same attendees are re-sent, and treats a missing stored sequence as 0.", async () => {
+                const { sequence: _sequence, ...withoutSequence } = baseExisting();
+                const delta = await saveWith(withoutSequence, () => ({ "3588": "a@example.com" }));
+                expect(delta.sequence).toBe(0);
+            });
+
+            it("Bumps the sequence when the end time or recurrence changes.", async () => {
+                const endDelta = await saveWith(baseExisting(), (session) => ({
+                    [String(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_APPOINTMENT_END_WHOLE }))]:
+                        "2026-02-01T11:30:00.000Z",
+                }));
+                expect(endDelta.sequence).toBe(5);
+
+                const recurrence = encodeAppointmentRecurrence(
+                    { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] },
+                    new Date("2026-02-01T10:00:00.000Z"),
+                    new Date("2026-02-01T11:00:00.000Z"),
+                );
+                const recurDelta = await saveWith(baseExisting(), (session) => ({
+                    [String(assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: LID_APPOINTMENT_RECUR }))]:
+                        recurrence.toString("base64"),
+                }));
+                expect(recurDelta.sequence).toBe(5);
+            });
+        });
+
         it("Persists a bare folder uid (not 'folder:'-prefixed) as-is on create when draftFolderUid was never set.", async () => {
             const context = makeContext();
             const calendarEventRepo = { create: vi.fn().mockResolvedValue({ uid: "evt3" }) };

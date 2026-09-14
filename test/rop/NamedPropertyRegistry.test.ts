@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { assignOrGetNamedPropertyId, resolveNamedProperty } from "../../src/rop/NamedPropertyRegistry.js";
+import { assignOrGetNamedPropertyId, MAX_NAMED_PROPERTIES_PER_SESSION, resolveNamedProperty } from "../../src/rop/NamedPropertyRegistry.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 
 const PSETID_APPOINTMENT = "00062002-0000-0000-c000-000000000046";
@@ -46,11 +46,14 @@ describe("NamedPropertyRegistry Tests", () => {
             expect(upper).toBe(lower);
         });
 
-        it("Returns 0x0000 for a new name once the session's entire 0x8000-0xFFFF ID space is exhausted, without throwing.", () => {
+        it("Returns 0x0000 for a new name once the session holds MAX_NAMED_PROPERTIES_PER_SESSION names, without throwing.", () => {
             const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-            session.nextNamedPropertyId = 0xffff;
+            for (let lid = 0; lid < MAX_NAMED_PROPERTIES_PER_SESSION - 1; lid++) {
+                assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 1000 + lid });
+            }
             const last = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 1 });
-            expect(last).toBe(0xffff);
+            expect(last).toBe(0x8000 + MAX_NAMED_PROPERTIES_PER_SESSION - 1);
+            expect(Object.keys(session.namedProperties).length).toBe(MAX_NAMED_PROPERTIES_PER_SESSION);
 
             const overflowed = assignOrGetNamedPropertyId(session, { guid: PSETID_APPOINTMENT, kind: "lid", lid: 2 });
             expect(overflowed).toBe(0x0000);

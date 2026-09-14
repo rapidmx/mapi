@@ -25,10 +25,12 @@ import { BufferReader, BufferWriter } from "./BufferCursor.js";
  * actually observes DST - a real client will show the correct offset only for occurrences near the reference
  * instant used at encode time, not a spec violation but a real, documented fidelity gap.
  * - Decoding a struct back into an IANA identifier is fundamentally lossy (a bias alone doesn't identify a
- * unique zone name) - this codec resolves it to a synthetic-but-valid `Etc/GMT±N` IANA identifier (note the
- * IANA `Etc/GMT` area's own sign convention is POSIX-inverted from common usage: `Etc/GMT+8` means UTC-8, not
- * UTC+8) rounded to the nearest whole hour, since `Etc/GMT` zones only support integer-hour offsets - a further
- * documented approximation for zones with a half-hour/quarter-hour offset (e.g. India, Nepal).
+ * unique zone name) - this codec resolves a whole-hour offset to a synthetic-but-valid `Etc/GMT±N` IANA identifier
+ * (note the IANA `Etc/GMT` area's own sign convention is POSIX-inverted from common usage: `Etc/GMT+8` means UTC-8,
+ * not UTC+8). A half-hour/quarter-hour offset keeps its minutes: it maps to a real DST-less zone with that offset
+ * (e.g. `Asia/Kolkata`, `Asia/Kathmandu`) or otherwise to a fixed-offset identifier like `"-03:30"`. An offset
+ * outside UTC-12..UTC+14 decodes as `"UTC"`.
+ * - Encoding a zone `Intl` doesn't recognize falls back to UTC instead of throwing.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -72,7 +74,14 @@ function utcOffsetMinutes(timezone: string, at: Date): number {
  * reference instant for resolving a non-UTC zone's current fixed offset. */
 export function encodeTimeZoneStruct(timezone: string, at: Date): Buffer {
     const writer = new BufferWriter();
-    const bias = timezone === "UTC" ? 0 : -utcOffsetMinutes(timezone, at);
+    let bias = 0;
+    try {
+        bias = timezone === "UTC" ? 0 : -utcOffsetMinutes(timezone, at);
+    } catch {
+        // An identifier Intl doesn't recognize (e.g. stored by another client) is sent as UTC rather than failing
+        // the whole property read.
+        bias = 0;
+    }
 
     writer.writeInt32LE(bias); // lBias
     writer.writeInt32LE(0); // lStandardBias - no DST modeled
@@ -92,12 +101,36 @@ export function decodeTimeZoneStruct(reader: BufferReader): string {
     skipTransitionBlock(reader); // wStandardYear + stStandardDate
     skipTransitionBlock(reader); // wDaylightYear + stDaylightDate
 
-    if (bias === 0) {
+    const offsetMinutes = -bias;
+    // No real zone is further than UTC-12/UTC+14; anything else is garbage and treated as UTC.
+    if (offsetMinutes === 0 || offsetMinutes < -12 * 60 || offsetMinutes > 14 * 60) {
         return "UTC";
     }
+    if (offsetMinutes % 60 === 0) {
+        const hours = offsetMinutes / 60;
+        return `Etc/GMT${hours < 0 ? "+" : "-"}${Math.abs(hours)}`;
+    }
+    return FRACTIONAL_OFFSET_ZONES[offsetMinutes] ?? formatFixedOffset(offsetMinutes);
+}
 
-    const offsetMinutes = -bias;
-    const wholeHours = Math.round(offsetMinutes / 60);
-    const etcSign = wholeHours <= 0 ? "+" : "-";
-    return `Etc/GMT${etcSign}${Math.abs(wholeHours)}`;
+/** Real zones with a non-whole-hour offset and no daylight saving, so the zone matches a DST-less
+ * `TimeZoneStruct` all year. */
+const FRACTIONAL_OFFSET_ZONES: Record<number, string> = {
+    [-570]: "Pacific/Marquesas",
+    210: "Asia/Tehran",
+    270: "Asia/Kabul",
+    330: "Asia/Kolkata",
+    345: "Asia/Kathmandu",
+    390: "Asia/Yangon",
+    525: "Australia/Eucla",
+    570: "Australia/Darwin",
+};
+
+/** A fixed-offset identifier such as `"-03:30"`, which `Intl.DateTimeFormat` accepts as a `timeZone`. Used for a
+ * minute-precision offset with no matching DST-less zone, instead of rounding it to a whole hour. */
+function formatFixedOffset(offsetMinutes: number): string {
+    const magnitude = Math.abs(offsetMinutes);
+    const hours = String(Math.floor(magnitude / 60)).padStart(2, "0");
+    const minutes = String(magnitude % 60).padStart(2, "0");
+    return `${offsetMinutes < 0 ? "-" : "+"}${hours}:${minutes}`;
 }

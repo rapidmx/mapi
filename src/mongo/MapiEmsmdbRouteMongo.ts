@@ -2,7 +2,16 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { CalendarEventMongo, ContactMongo, FolderMongo, LabelMongo, MailboxMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
+import {
+    AuditLogEntryMongo,
+    CalendarEventMongo,
+    ContactMongo,
+    FolderMongo,
+    LabelMongo,
+    MailboxMongo,
+    MessageMongo,
+    TaskMongo,
+} from "@rapidmx/restapi/mongo";
 import { BaseMapiEmsmdbRoute } from "../BaseMapiEmsmdbRoute.js";
 import { RopLogonHandler } from "../rop/RopLogonHandler.js";
 import { RopReleaseHandler } from "../rop/RopReleaseHandler.js";
@@ -45,6 +54,7 @@ export class MapiEmsmdbRouteMongo extends BaseMapiEmsmdbRoute<MailboxMongo> {
     protected contactClass: any = ContactMongo;
     protected taskClass: any = TaskMongo;
     protected labelClass: any = LabelMongo;
+    protected auditLogClass: any = AuditLogEntryMongo;
     protected ropHandlerClasses: any[] = [
         RopLogonHandler,
         RopReleaseHandler,

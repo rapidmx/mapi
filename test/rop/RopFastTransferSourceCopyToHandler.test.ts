@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
-import { PropertyType, writePropertyTag } from "../../src/codec/PropertyValue.js";
+import { MAX_PROPERTY_TAG_COUNT, PropertyType, writePropertyTag } from "../../src/codec/PropertyValue.js";
+import { handleDataCache, handleDataKey } from "../../src/rop/HandleDataCache.js";
 import { RopFastTransferSourceCopyToHandler } from "../../src/rop/RopFastTransferSourceCopyToHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
@@ -88,7 +89,36 @@ describe("RopFastTransferSourceCopyToHandler Tests", () => {
         expect(outputHandle?.type).toBe("fastTransfer");
         expect(outputHandle?.entityUid).toBe("folder:f1");
         expect(outputHandle?.transferPosition).toBe(0);
-        expect(Buffer.from(outputHandle?.transferBufferBase64 ?? "", "base64").length).toBeGreaterThan(0);
+        expect(cachedTransfer(context).length).toBeGreaterThan(0);
+    });
+
+    it("Returns MAPI_E_TOO_BIG, creating no handle, for more than MAX_PROPERTY_TAG_COUNT excluded tags.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "folder", entityUid: "folder:f1" };
+        const tags = Array.from({ length: MAX_PROPERTY_TAG_COUNT + 1 }, () => ({ propertyId: 0x3001, propertyType: PropertyType.PtypString }));
+        const writer = new BufferWriter();
+
+        await new RopFastTransferSourceCopyToHandler().handle(new BufferReader(buildRequest({ excludedTags: tags })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80040305);
+        expect(context.session.handles[6]).toBeUndefined();
+    });
+
+    it("Replacing the output handle drops the previous transfer's cached stream.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "folder", entityUid: "folder:f1" };
+        const handler = new RopFastTransferSourceCopyToHandler();
+        await handler.handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+        const firstKey = handleDataKey(context.session.uid, 6, context.session.handles[6].generation);
+        expect(handleDataCache.get(firstKey)).toBeDefined();
+
+        await handler.handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+
+        expect(handleDataCache.get(firstKey)).toBeUndefined();
+        expect(cachedTransfer(context).length).toBeGreaterThan(0);
     });
 
     it("Creates a fastTransfer output handle for a message handle.", async () => {
@@ -114,14 +144,18 @@ describe("RopFastTransferSourceCopyToHandler Tests", () => {
             context,
         );
 
-        const outputHandle = context.session.handles[6];
-        const buffer = Buffer.from(outputHandle?.transferBufferBase64 ?? "", "base64");
+        const buffer = cachedTransfer(context);
+        expect(context.session.handles[6]?.transferExcludeIds).toEqual([0x3001]);
         // DisplayName (0x3001) excluded - the stream should be shorter than the default (all 3 folder columns).
         const contextWithoutExclusion = makeContext();
         contextWithoutExclusion.session.handles[5] = { type: "folder", entityUid: "folder:f1" };
         const writer2 = new BufferWriter();
         await handler.handle(new BufferReader(buildRequest({})), writer2, contextWithoutExclusion);
-        const fullBuffer = Buffer.from(contextWithoutExclusion.session.handles[6]?.transferBufferBase64 ?? "", "base64");
+        const fullBuffer = cachedTransfer(contextWithoutExclusion);
         expect(buffer.length).toBeLessThan(fullBuffer.length);
     });
 });
+
+function cachedTransfer(context: RopContext): Buffer {
+    return handleDataCache.get(handleDataKey(context.session.uid, 6, context.session.handles[6].generation))!;
+}

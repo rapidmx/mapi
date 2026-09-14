@@ -5,6 +5,13 @@
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Folder } from "@rapidmx/restapi";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
+import { findAllCapped } from "./RepoPaging.js";
+
+/** Every folder in `mailboxUid` (up to `MAX_COLLECTION_ROWS`), by name. Paged explicitly: a bare `find()` stops at
+ * the repo's 100-row default, which silently dropped folders from hierarchy tables in larger mailboxes. */
+async function findMailboxFolders(mailboxUid: string, folderRepo: RepoUtils<any>): Promise<Folder[]> {
+    return (await findAllCapped<Folder>(folderRepo, { mailboxUid }, { name: "ASC", uid: "ASC" })).items;
+}
 
 /**
  * Shared helpers for resolving the `"virtual:<name>"`/`"folder:<uid>"` target strings `RopLogonHandler`
@@ -110,10 +117,10 @@ export async function resolveFolderChildren(
 
     let allFolders: Folder[];
     if (cache) {
-        cache.allFolders ??= await folderRepo.find({ mailboxUid }, { ignoreACL: true });
+        cache.allFolders ??= await findMailboxFolders(mailboxUid, folderRepo);
         allFolders = cache.allFolders;
     } else {
-        allFolders = await folderRepo.find({ mailboxUid }, { ignoreACL: true });
+        allFolders = await findMailboxFolders(mailboxUid, folderRepo);
     }
     return allFolders
         .filter((f) => (isTopLevel ? f.parentFolderUid == null : f.parentFolderUid === parentFolderUid))

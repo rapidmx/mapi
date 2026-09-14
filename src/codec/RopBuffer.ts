@@ -28,21 +28,34 @@ export interface RopBuffer {
     handleTable: number[];
 }
 
+/** The largest `ServerObjectHandleTable` accepted. Every ROP addresses a handle by a one-byte index, so a table
+ * with more than 255 entries can't be referenced anyway; a larger one is only a way to make the server allocate
+ * and echo back an oversized array. */
+export const MAX_HANDLE_TABLE_ENTRIES = 255;
+
 export function encodeRopBuffer(buf: RopBuffer): Buffer {
     const writer = new BufferWriter();
     // RopSize covers itself (2 bytes) plus ropsList - the handle table isn't part of RopSize's count.
     writer.writeUInt16LE(2 + buf.ropsList.length);
     writer.writeBytes(buf.ropsList);
-    for (const handle of buf.handleTable) {
-        writer.writeUInt32LE(handle);
-    }
+    // One allocation for the whole table instead of one small buffer per entry.
+    const table = Buffer.alloc(buf.handleTable.length * 4);
+    buf.handleTable.forEach((handle, index) => table.writeUInt32LE(handle >>> 0, index * 4));
+    writer.writeBytes(table);
     return writer.toBuffer();
 }
 
+/** Throws a `RangeError` for a malformed buffer: a `RopSize` smaller than its own field or larger than the
+ * buffer, a handle table that isn't a whole number of 4-byte entries, or one with more than
+ * `MAX_HANDLE_TABLE_ENTRIES` entries. */
 export function decodeRopBuffer(buffer: Buffer): RopBuffer {
     const reader = new BufferReader(buffer);
     const ropSize = reader.readUInt16LE();
     const ropsList = reader.readBytes(ropSize - 2);
+    const tableBytes = reader.remaining;
+    if (tableBytes % 4 !== 0 || tableBytes / 4 > MAX_HANDLE_TABLE_ENTRIES) {
+        throw new RangeError(`RopBuffer: invalid ServerObjectHandleTable of ${tableBytes} bytes.`);
+    }
     const handleTable: number[] = [];
     while (reader.hasMore()) {
         handleTable.push(reader.readUInt32LE());

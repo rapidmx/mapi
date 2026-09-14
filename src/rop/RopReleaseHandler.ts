@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { releaseHandle } from "../MapiSessionManager.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_RELEASE = 0x01;
@@ -21,6 +22,7 @@ export class RopReleaseHandler implements RopHandler {
     public handle(reader: BufferReader, _writer: BufferWriter, context: RopContext): void {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track per-logon-id state separately
         const inputHandleIndex: number = reader.readUInt8();
-        delete context.session.handles[inputHandleIndex];
+        // Also releases write streams opened against this handle and drops its cached data - see releaseHandle.
+        releaseHandle(context.session, inputHandleIndex);
     }
 }

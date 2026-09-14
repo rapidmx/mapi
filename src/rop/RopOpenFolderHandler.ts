@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { assignHandle } from "../MapiSessionManager.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_OPEN_FOLDER = 0x02;
@@ -45,7 +46,7 @@ export class RopOpenFolderHandler implements RopHandler {
             return;
         }
 
-        context.session.handles[outputHandleIndex] = { type: "folder", entityUid: target };
+        assignHandle(context.session, outputHandleIndex, { type: "folder", entityUid: target });
 
         writer.writeUInt8(ROP_ID_OPEN_FOLDER);
         writer.writeUInt8(outputHandleIndex);

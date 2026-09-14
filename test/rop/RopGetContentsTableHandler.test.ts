@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
+import { resolveContentsWindow } from "../../src/rop/ContentsTable.js";
 import { RopGetContentsTableHandler } from "../../src/rop/RopGetContentsTableHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
@@ -16,40 +17,51 @@ function buildRequest({ logonId = 0, inputHandleIndex = 5, outputHandleIndex = 6
     return writer.toBuffer();
 }
 
+function makeContext(folderEntityUid: string, overrides: Partial<RopContext> = {}): RopContext {
+    const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
+    session.handles[5] = { type: "folder", entityUid: folderEntityUid };
+    return {
+        mailboxUid: "mailbox-1",
+        userUid: "user-1",
+        session,
+        folderRepo: {} as any,
+        messageRepo: {} as any,
+        calendarEventRepo: {} as any,
+        mailboxRepo: {} as any,
+        folderClass: {} as any,
+        messageClass: {} as any,
+        calendarEventClass: {} as any,
+        scanPipeline: {} as any,
+        mailTransport: {} as any,
+        blobStore: {} as any,
+        ...overrides,
+    };
+}
+
+/** A repo whose `find` returns `total` rows `<prefix>0..`, honoring `page`/`limit` like the real backends do. */
+function pagedRepo(prefix: string, total: number) {
+    return {
+        find: vi.fn().mockImplementation((_query: any, options: { page: number; limit: number }) => {
+            const start = options.page * options.limit;
+            return Promise.resolve(
+                Array.from({ length: Math.max(0, Math.min(options.limit, total - start)) }, (_, i) => ({ uid: `${prefix}${start + i}` })),
+            );
+        }),
+    };
+}
+
 describe("RopGetContentsTableHandler Tests", () => {
     it("Has RopId 0x05.", () => {
         expect(new RopGetContentsTableHandler().ropId).toBe(0x05);
     });
 
-    it("Creates a table handle listing the folder's messages, resolved via the message repo.", async () => {
-        const messageRepo = {
-            find: vi.fn().mockResolvedValue([
-                { uid: "msg1", folderUid: "top1" },
-                { uid: "msg2", folderUid: "top1" },
-            ]),
-        };
+    it("Creates a row-less message table handle for an ordinary folder, without listing its messages up front.", async () => {
+        const messageRepo = { find: vi.fn() };
         const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "top1", type: "inbox" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:top1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: messageRepo as any,
-            calendarEventRepo: {} as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
+        const context = makeContext("folder:top1", { folderRepo: folderRepo as any, messageRepo: messageRepo as any });
 
-        const handler = new RopGetContentsTableHandler();
         const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+        await new RopGetContentsTableHandler().handle(new BufferReader(buildRequest({})), writer, context);
 
         const response = new BufferReader(writer.toBuffer());
         expect(response.readUInt8()).toBe(0x05);
@@ -57,234 +69,97 @@ describe("RopGetContentsTableHandler Tests", () => {
         expect(response.readUInt32LE()).toBe(0);
         expect(response.hasMore()).toBe(false);
 
-        expect(session.handles[6]).toEqual({
-            type: "table",
-            entityUid: "folder:top1",
-            rows: ["message:msg1", "message:msg2"],
-            cursor: 0,
-        });
+        expect(context.session.handles[6]).toEqual({ type: "table", entityUid: "folder:top1", contentsKind: "message", cursor: 0, generation: 1 });
         expect(folderRepo.findOne).toHaveBeenCalledWith("top1", { ignoreACL: true });
-        expect(messageRepo.find).toHaveBeenCalledWith({ folderUid: "top1" }, { ignoreACL: true });
-    });
-
-    it("Creates a table handle listing a CALENDAR folder's events, resolved via the calendar event repo instead of the message repo.", async () => {
-        const messageRepo = { find: vi.fn() };
-        const calendarEventRepo = {
-            find: vi.fn().mockResolvedValue([
-                { uid: "evt1", folderUid: "cal1" },
-                { uid: "evt2", folderUid: "cal1" },
-            ]),
-        };
-        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "cal1", type: "calendar" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:cal1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: messageRepo as any,
-            calendarEventRepo: calendarEventRepo as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-        expect(session.handles[6]?.rows).toEqual(["calendarEvent:evt1", "calendarEvent:evt2"]);
-        expect(calendarEventRepo.find).toHaveBeenCalledWith({ folderUid: "cal1" }, { ignoreACL: true });
         expect(messageRepo.find).not.toHaveBeenCalled();
     });
 
-    it("Creates a table handle listing a CONTACTS folder's contacts, resolved via the contact repo instead of the message repo.", async () => {
+    it.each([
+        ["calendar", "calendarEvent"],
+        ["contacts", "contact"],
+        ["tasks", "task"],
+    ])("Records a %s folder's contents as %s rows.", async (folderType, contentsKind) => {
+        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "f1", type: folderType }) };
+        const context = makeContext("folder:f1", { folderRepo: folderRepo as any });
+
+        await new RopGetContentsTableHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+
+        expect(context.session.handles[6]?.contentsKind).toBe(contentsKind);
+        expect(context.session.handles[6]?.rows).toBeUndefined();
+    });
+
+    it("Returns an empty table for a virtual folder, without querying any repo.", async () => {
         const messageRepo = { find: vi.fn() };
-        const contactRepo = {
-            find: vi.fn().mockResolvedValue([
-                { uid: "c1", folderUid: "contacts1" },
-                { uid: "c2", folderUid: "contacts1" },
-            ]),
-        };
-        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "contacts1", type: "contacts" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:contacts1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: messageRepo as any,
-            calendarEventRepo: {} as any,
-            contactRepo: contactRepo as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
+        const context = makeContext("virtual:root", { messageRepo: messageRepo as any });
 
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
+        await new RopGetContentsTableHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
 
-        expect(session.handles[6]?.rows).toEqual(["contact:c1", "contact:c2"]);
-        expect(contactRepo.find).toHaveBeenCalledWith({ folderUid: "contacts1" }, { ignoreACL: true });
-        expect(messageRepo.find).not.toHaveBeenCalled();
-    });
-
-    it("Returns an empty table for a CONTACTS folder when contactRepo is absent from the context.", async () => {
-        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "contacts1", type: "contacts" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:contacts1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: {} as any,
-            calendarEventRepo: {} as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-        expect(session.handles[6]?.rows).toEqual([]);
-    });
-
-    it("Creates a table handle listing a TASKS folder's tasks, resolved via the task repo instead of the message repo.", async () => {
-        const messageRepo = { find: vi.fn() };
-        const taskRepo = {
-            find: vi.fn().mockResolvedValue([
-                { uid: "t1", folderUid: "tasks1" },
-                { uid: "t2", folderUid: "tasks1" },
-            ]),
-        };
-        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "tasks1", type: "tasks" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:tasks1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: messageRepo as any,
-            calendarEventRepo: {} as any,
-            taskRepo: taskRepo as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-        expect(session.handles[6]?.rows).toEqual(["task:t1", "task:t2"]);
-        expect(taskRepo.find).toHaveBeenCalledWith({ folderUid: "tasks1" }, { ignoreACL: true });
-        expect(messageRepo.find).not.toHaveBeenCalled();
-    });
-
-    it("Returns an empty table for a TASKS folder when taskRepo is absent from the context.", async () => {
-        const folderRepo = { findOne: vi.fn().mockResolvedValue({ uid: "tasks1", type: "tasks" }) };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "folder:tasks1" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: folderRepo as any,
-            messageRepo: {} as any,
-            calendarEventRepo: {} as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-        expect(session.handles[6]?.rows).toEqual([]);
-    });
-
-    it("Returns an empty table for a virtual folder, without querying the message repo.", async () => {
-        const messageRepo = { find: vi.fn() };
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        session.handles[5] = { type: "folder", entityUid: "virtual:root" };
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: {} as any,
-            messageRepo: messageRepo as any,
-            calendarEventRepo: {} as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-
-        const handler = new RopGetContentsTableHandler();
-        const writer = new BufferWriter();
-        await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-        expect(session.handles[6]?.rows).toEqual([]);
+        expect(context.session.handles[6]?.rows).toEqual([]);
+        expect(context.session.handles[6]?.contentsKind).toBeUndefined();
         expect(messageRepo.find).not.toHaveBeenCalled();
     });
 
     it("Returns MAPI_E_INVALID_OBJECT when InputHandleIndex isn't a folder handle.", async () => {
-        const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
-        const context: RopContext = {
-            mailboxUid: "mailbox-1",
-            userUid: "user-1",
-            session,
-            folderRepo: {} as any,
-            messageRepo: {} as any,
-            calendarEventRepo: {} as any,
-            mailboxRepo: {} as any,
-            folderClass: {} as any,
-            messageClass: {} as any,
-            calendarEventClass: {} as any,
-            scanPipeline: {} as any,
-            mailTransport: {} as any,
-            blobStore: {} as any,
-        };
-        const handler = new RopGetContentsTableHandler();
+        const context = makeContext("folder:f1");
         const writer = new BufferWriter();
 
-        await handler.handle(new BufferReader(buildRequest({ inputHandleIndex: 99 })), writer, context);
+        await new RopGetContentsTableHandler().handle(new BufferReader(buildRequest({ inputHandleIndex: 99 })), writer, context);
 
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
         expect(response.readUInt32LE()).toBe(0x80070005);
-        expect(session.handles[6]).toBeUndefined();
+        expect(context.session.handles[6]).toBeUndefined();
+    });
+});
+
+describe("ContentsTable.resolveContentsWindow Tests", () => {
+    it("Reads a window from the message repo scoped to the folder and mailbox, in a stable newest-first order.", async () => {
+        const messageRepo = pagedRepo("msg", 3);
+        const context = makeContext("folder:top1", { messageRepo: messageRepo as any });
+
+        const rows = await resolveContentsWindow(context, { type: "table", entityUid: "folder:top1", contentsKind: "message" }, 1, 5);
+
+        expect(rows).toEqual(["message:msg1", "message:msg2"]);
+        expect(messageRepo.find).toHaveBeenCalledWith(
+            { folderUid: "top1", mailboxUid: "mailbox-1", sort: { receivedDate: "DESC", uid: "ASC" }, limit: 1000, page: 0 },
+            { ignoreACL: true, limit: 1000, page: 0 },
+        );
+    });
+
+    it("Pages past the repo's 100-row default and across its 1000-row page boundary.", async () => {
+        const messageRepo = pagedRepo("msg", 2500);
+        const context = makeContext("folder:top1", { messageRepo: messageRepo as any });
+        const table = { type: "table" as const, entityUid: "folder:top1", contentsKind: "message" as const };
+
+        const rows = await resolveContentsWindow(context, table, 990, 20);
+
+        expect(rows.length).toBe(20);
+        expect(rows[0]).toBe("message:msg990");
+        expect(rows[19]).toBe("message:msg1009");
+        expect(messageRepo.find).toHaveBeenCalledTimes(2);
+        expect(await resolveContentsWindow(context, table, 2490, 50)).toHaveLength(10);
+    });
+
+    it.each([
+        ["calendarEvent", "calendarEventRepo", { startDate: "DESC", uid: "ASC" }],
+        ["contact", "contactRepo", { displayName: "ASC", uid: "ASC" }],
+        ["task", "taskRepo", { title: "ASC", uid: "ASC" }],
+    ])("Reads %s rows from %s with its own sort.", async (kind, repoName, sort) => {
+        const repo = pagedRepo("x", 2);
+        const overrides: Partial<RopContext> = { [repoName]: repo };
+        const context = makeContext("folder:f1", overrides);
+        const contentsKind = kind as "calendarEvent" | "contact" | "task";
+
+        const rows = await resolveContentsWindow(context, { type: "table", entityUid: "folder:f1", contentsKind }, 0, 10);
+
+        expect(rows).toEqual([`${kind}:x0`, `${kind}:x1`]);
+        expect(repo.find).toHaveBeenCalledWith(expect.objectContaining({ sort }), expect.anything());
+    });
+
+    it("Yields no rows for a contacts or tasks table when the context has no such repo.", async () => {
+        const context = makeContext("folder:f1");
+        expect(await resolveContentsWindow(context, { type: "table", entityUid: "folder:f1", contentsKind: "contact" }, 0, 10)).toEqual([]);
+        expect(await resolveContentsWindow(context, { type: "table", entityUid: "folder:f1", contentsKind: "task" }, 0, 10)).toEqual([]);
     });
 });

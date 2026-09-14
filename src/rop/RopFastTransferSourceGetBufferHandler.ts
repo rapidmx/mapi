@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
+import { loadFastTransferBuffer } from "./FastTransferStream.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_GET_BUFFER = 0x4e;
@@ -50,7 +51,7 @@ const TRANSFER_STATUS_DONE = 0x0003;
 export class RopFastTransferSourceGetBufferHandler implements RopHandler {
     public readonly ropId = ROP_ID_GET_BUFFER;
 
-    public handle(reader: BufferReader, writer: BufferWriter, context: RopContext): void {
+    public async handle(reader: BufferReader, writer: BufferWriter, context: RopContext): Promise<void> {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session
         const inputHandleIndex: number = reader.readUInt8();
         const bufferSize: number = reader.readUInt16LE();
@@ -66,7 +67,7 @@ export class RopFastTransferSourceGetBufferHandler implements RopHandler {
             return;
         }
 
-        const fullBuffer = Buffer.from(handle.transferBufferBase64 ?? "", "base64");
+        const fullBuffer = await loadFastTransferBuffer(context, inputHandleIndex, handle);
         const position = handle.transferPosition ?? 0;
         const remaining = fullBuffer.length - position;
         const requestedSize = bufferSize === BUFFER_SIZE_SERVER_DETERMINED ? remaining : bufferSize;

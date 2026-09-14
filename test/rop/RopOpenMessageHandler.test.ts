@@ -73,7 +73,7 @@ describe("RopOpenMessageHandler Tests", () => {
         expect(response.readUInt8()).toBe(0); // RowCount
         expect(response.hasMore()).toBe(false);
 
-        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "message:msg1" });
+        expect(context.session.handles[5]).toMatchObject({ type: "message", entityUid: "message:msg1" });
         expect(messageRepo.findOne).toHaveBeenCalledWith("msg1", { ignoreACL: true });
     });
 
@@ -93,7 +93,7 @@ describe("RopOpenMessageHandler Tests", () => {
         expect(readTypedString(response)).toBeUndefined(); // SubjectPrefix
         expect(readTypedString(response)).toBe("Standup"); // NormalizedSubject
 
-        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "calendarEvent:evt1" });
+        expect(context.session.handles[5]).toMatchObject({ type: "message", entityUid: "calendarEvent:evt1" });
         expect((context.calendarEventRepo as any).findOne).toHaveBeenCalledWith("evt1", { ignoreACL: true });
     });
 
@@ -113,7 +113,7 @@ describe("RopOpenMessageHandler Tests", () => {
         expect(readTypedString(response)).toBeUndefined(); // SubjectPrefix
         expect(readTypedString(response)).toBe("Jane Doe"); // NormalizedSubject
 
-        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "contact:c1" });
+        expect(context.session.handles[5]).toMatchObject({ type: "message", entityUid: "contact:c1" });
         expect((context.contactRepo as any).findOne).toHaveBeenCalledWith("c1", { ignoreACL: true });
     });
 
@@ -149,7 +149,7 @@ describe("RopOpenMessageHandler Tests", () => {
         expect(readTypedString(response)).toBeUndefined();
         expect(readTypedString(response)).toBe("Ship it");
 
-        expect(context.session.handles[5]).toEqual({ type: "message", entityUid: "task:t1" });
+        expect(context.session.handles[5]).toMatchObject({ type: "message", entityUid: "task:t1" });
         expect((context.taskRepo as any).findOne).toHaveBeenCalledWith("t1", { ignoreACL: true });
     });
 

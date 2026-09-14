@@ -5,6 +5,7 @@
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
 import { PropertyType, writePropertyTag } from "../../src/codec/PropertyValue.js";
 import { RopOpenStreamHandler } from "../../src/rop/RopOpenStreamHandler.js";
+import { RopReadStreamHandler } from "../../src/rop/RopReadStreamHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { InMemoryBlobStore } from "../testDoubles.js";
@@ -71,7 +72,23 @@ describe("RopOpenStreamHandler Tests", () => {
             propertyId: 0x1000,
             propertyType: PropertyType.PtypString,
             streamPosition: 0,
+            generation: 1,
         });
+    });
+
+    it("Parses the body once at open time and serves later reads from the per-handle cache.", async () => {
+        const context = await makeContext();
+        await new RopOpenStreamHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+        const findOne = (context.messageRepo as any).findOne;
+        expect(findOne).toHaveBeenCalledTimes(1);
+
+        const readRequest = new BufferWriter();
+        readRequest.writeUInt8(0).writeUInt8(6).writeUInt16LE(4);
+        await new RopReadStreamHandler().handle(new BufferReader(readRequest.toBuffer()), new BufferWriter(), context);
+        await new RopReadStreamHandler().handle(new BufferReader(readRequest.toBuffer()), new BufferWriter(), context);
+
+        expect(findOne).toHaveBeenCalledTimes(1);
+        expect(context.session.handles[6].streamPosition).toBe(8);
     });
 
     it("Opens PidTagBody in Create (write) mode against a fresh draft message handle, StreamSize always 0.", async () => {
@@ -95,7 +112,10 @@ describe("RopOpenStreamHandler Tests", () => {
             propertyId: 0x1000,
             propertyType: PropertyType.PtypString,
             writeTargetHandleIndex: 5,
+            writeTargetGeneration: undefined,
             writeBufferBase64: "",
+            writeSize: 0,
+            generation: 1,
         });
     });
 

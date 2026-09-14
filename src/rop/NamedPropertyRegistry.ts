@@ -32,9 +32,13 @@ function keyFor(propertyName: PropertyName): string {
         : JSON.stringify({ guid: propertyName.guid.toLowerCase(), kind: "name", name: propertyName.name });
 }
 
-/** The highest numeric property ID a `PropertyTag`'s 16-bit `PropertyId` field can carry at all - not a
- * pragmatic-subset choice, an absolute wire-format ceiling (`writeUInt16LE` cannot encode anything past this). */
-const LAST_NAMED_PROPERTY_ID = 0xffff;
+/** The most distinct named properties one session registers. The registry is saved with the session on every
+ * `Execute`, and a name can be up to 255 bytes, so letting a client fill the whole `0x8000`-`0xFFFF` ID space
+ * would make every request carry megabytes of session state. Real clients register a few hundred at most. */
+export const MAX_NAMED_PROPERTIES_PER_SESSION = 4096;
+
+/** The highest numeric property ID handed out - see `MAX_NAMED_PROPERTIES_PER_SESSION`. */
+const LAST_NAMED_PROPERTY_ID = FIRST_NAMED_PROPERTY_ID + MAX_NAMED_PROPERTIES_PER_SESSION - 1;
 
 /**
  * Returns `propertyName`'s existing numeric property ID if an earlier `RopGetPropertyIdsFromNames` call in
@@ -53,8 +57,8 @@ const LAST_NAMED_PROPERTY_ID = 0xffff;
  * lifetime, so a linear scan repeated once per property per row is quadratic over a session that resolves many
  * named properties.
  *
- * Once `nextNamedPropertyId` would exceed `LAST_NAMED_PROPERTY_ID` (32,768 distinct names already registered
- * this session - the entire `0x8000`-`0xFFFF` numeric ID space this pragmatic subset has to hand out), a *new*
+ * Once `nextNamedPropertyId` would exceed `LAST_NAMED_PROPERTY_ID` (`MAX_NAMED_PROPERTIES_PER_SESSION` distinct
+ * names already registered this session), a *new*
  * name can no longer be assigned a real ID; this returns `0x0000` for it instead of throwing, the exact value
  * `[MS-OXCPRPT]`'s own `RopGetPropertyIdsFromNames` processing rules already use for "this `PropertyName`
  * could not be resolved" (the same value this pragmatic subset already produces for a `Kind = 0xFF` entry) -

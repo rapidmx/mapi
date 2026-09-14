@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyTag, PropertyType, readPropertyTag } from "../codec/PropertyValue.js";
-import { PID_TAG_BODY, resolveMessageBodyBytes } from "./MessageBodyStream.js";
+import { assignHandle } from "../MapiSessionManager.js";
+import { loadStreamBody, PID_TAG_BODY } from "./MessageBodyStream.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
 const ROP_ID_OPEN_STREAM = 0x2b;
@@ -62,25 +63,27 @@ export class RopOpenStreamHandler implements RopHandler {
 
         let streamSize: number;
         if (openModeFlags === OPEN_MODE_READ_ONLY) {
-            const bytes = await resolveMessageBodyBytes(handle.entityUid, context.messageRepo, context.blobStore);
-            streamSize = bytes.length;
-            context.session.handles[outputHandleIndex] = {
+            const stream = assignHandle(context.session, outputHandleIndex, {
                 type: "stream",
                 entityUid: handle.entityUid,
                 propertyId: propertyTag.propertyId,
                 propertyType: propertyTag.propertyType,
                 streamPosition: 0,
-            };
+            });
+            // Parsed once here and cached per handle, not re-parsed by every RopReadStream.
+            streamSize = (await loadStreamBody(context, outputHandleIndex, stream)).length;
         } else {
             streamSize = 0;
-            context.session.handles[outputHandleIndex] = {
+            assignHandle(context.session, outputHandleIndex, {
                 type: "stream",
                 entityUid: handle.entityUid,
                 propertyId: propertyTag.propertyId,
                 propertyType: propertyTag.propertyType,
                 writeTargetHandleIndex: inputHandleIndex,
+                writeTargetGeneration: handle.generation,
                 writeBufferBase64: "",
-            };
+                writeSize: 0,
+            });
         }
 
         writer.writeUInt8(ROP_ID_OPEN_STREAM);

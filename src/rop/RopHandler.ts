@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { RepoUtils } from "@rapidrest/service-core";
-import type { BlobStore } from "@rapidmx/restapi";
+import type { AuditLogParams, BlobStore } from "@rapidmx/restapi";
 import type { ScanPipeline } from "@rapidmx/restapi/scan";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
@@ -57,6 +57,9 @@ export interface RopContext {
     blobStore: BlobStore;
     scanPipeline: ScanPipeline;
     mailTransport: any;
+    /** Records an audit log entry as the calling user, the same way the REST routes do. Optional like the repos
+     * above: absent when the route has no audit log class configured, in which case nothing is recorded. */
+    audit?: (params: AuditLogParams) => Promise<void>;
 }
 
 /**

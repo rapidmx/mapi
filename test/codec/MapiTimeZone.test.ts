@@ -7,6 +7,13 @@
 import { BufferReader } from "../../src/codec/BufferCursor.js";
 import { decodeTimeZoneStruct, encodeTimeZoneStruct } from "../../src/codec/MapiTimeZone.js";
 
+/** A 48-byte TimeZoneStruct with the given lBias and no DST. */
+function structWithBias(bias: number): Buffer {
+    const buffer = Buffer.alloc(48);
+    buffer.writeInt32LE(bias, 0);
+    return buffer;
+}
+
 describe("MapiTimeZone Tests", () => {
     describe("UTC", () => {
         it("Encodes UTC as a 48-byte, all-zero-except-nothing struct.", () => {
@@ -55,9 +62,33 @@ describe("MapiTimeZone Tests", () => {
             expect(decodeTimeZoneStruct(new BufferReader(encoded))).toBe("Etc/GMT-8");
         });
 
-        it("Rounds a half-hour-offset zone (Asia/Kolkata, UTC+5:30) to the nearest whole hour on decode.", () => {
+        it("Keeps a half-hour offset (Asia/Kolkata, UTC+5:30) on decode instead of rounding it to a whole hour.", () => {
             const encoded = encodeTimeZoneStruct("Asia/Kolkata", new Date("2026-01-15T00:00:00.000Z"));
-            expect(decodeTimeZoneStruct(new BufferReader(encoded))).toBe("Etc/GMT-6");
+            expect(encoded.readInt32LE(0)).toBe(-330);
+            expect(decodeTimeZoneStruct(new BufferReader(encoded))).toBe("Asia/Kolkata");
+        });
+
+        it("Keeps a quarter-hour offset (UTC+5:45) as Asia/Kathmandu.", () => {
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(-345)))).toBe("Asia/Kathmandu");
+        });
+
+        it("Decodes a minute offset with no DST-less zone to a fixed-offset identifier Intl accepts.", () => {
+            const zone = decodeTimeZoneStruct(new BufferReader(structWithBias(210))); // UTC-3:30
+            expect(zone).toBe("-03:30");
+            // Round-trips through encode without losing the minutes.
+            expect(encodeTimeZoneStruct(zone, new Date("2026-01-15T00:00:00.000Z")).readInt32LE(0)).toBe(210);
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(-765)))).toBe("+12:45");
+        });
+
+        it("Decodes the extreme whole-hour offsets UTC-12 and UTC+14 to their Etc/GMT zones.", () => {
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(720)))).toBe("Etc/GMT+12");
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(-840)))).toBe("Etc/GMT-14");
+        });
+
+        it("Decodes an out-of-range bias (beyond UTC-12/UTC+14) as UTC instead of an invalid zone name.", () => {
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(721)))).toBe("UTC");
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(-841)))).toBe("UTC");
+            expect(decodeTimeZoneStruct(new BufferReader(structWithBias(-600000)))).toBe("UTC");
         });
 
         it("Encodes a zero-offset zone that isn't literally named 'UTC' (Africa/Abidjan) with lBias=0, exercising the bare-'GMT' offset-string branch.", () => {
@@ -67,8 +98,10 @@ describe("MapiTimeZone Tests", () => {
     });
 
     describe("Error handling", () => {
-        it("Throws encoding an unrecognized IANA zone identifier.", () => {
-            expect(() => encodeTimeZoneStruct("Not/AZone", new Date("2026-01-15T00:00:00.000Z"))).toThrow();
+        it("Encodes an unrecognized zone identifier as UTC instead of throwing.", () => {
+            const encoded = encodeTimeZoneStruct("Not/AZone", new Date("2026-01-15T00:00:00.000Z"));
+            expect(encoded.length).toBe(48);
+            expect(encoded.readInt32LE(0)).toBe(0);
         });
     });
 });

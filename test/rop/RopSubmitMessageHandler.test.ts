@@ -211,6 +211,59 @@ describe("RopSubmitMessageHandler Tests", () => {
         expect(options).toEqual({ ignoreACL: true });
     });
 
+    it("Stores the Sent Items copy with the Message-ID, conversation and raw MIME scanAndRelay actually relayed.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "55": "Tracked", "3588": "to@example.com" } };
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+
+        const relayedRaw: Buffer = context.mailTransport.send.mock.calls[0][0].raw;
+        const relayedHeaders = await simpleParser(relayedRaw);
+        const [savedMessage] = (context.messageRepo as any).create.mock.calls[0];
+        expect(savedMessage.messageId).toBe(relayedHeaders.messageId!.replace(/^<|>$/g, ""));
+        expect(savedMessage.messageId).not.toMatch(/@mapi$/);
+        expect(typeof savedMessage.conversationId).toBe("string");
+        expect(savedMessage).toHaveProperty("encrypted");
+        const stored = await (context.blobStore as InMemoryBlobStore).get(savedMessage.bodyBlobKey);
+        expect(stored.equals(relayedRaw)).toBe(true);
+    });
+
+    it.each([
+        ["a CR/LF header injection", "to@example.com\r\nBcc: victim@example.com"],
+        ["a display-name form", "Jane <jane@example.com>"],
+        ["a non-address", "not-an-address"],
+    ])("Returns MAPI_E_INVALID_OBJECT without sending when a recipient is %s.", async (_label, badAddress) => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": `ok@example.com; ${badAddress}` } };
+        const writer = new BufferWriter();
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect((context.scanPipeline as any).run).not.toHaveBeenCalled();
+        expect(context.mailTransport.send).not.toHaveBeenCalled();
+    });
+
+    it("Ignores a write stream left over from an earlier message that used the same handle index.", async () => {
+        const context = makeContext();
+        const staleBytes = Buffer.concat([Buffer.from("Stale body.", "utf16le"), Buffer.from([0, 0])]);
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            generation: 9,
+            draftProperties: { "3588": "to@example.com", "4096": "Current inline body." },
+        };
+        context.session.handles[6] = { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: 4, writeBufferBase64: staleBytes.toString("base64") };
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+
+        const [rawSent] = (context.scanPipeline as any).run.mock.calls[0];
+        expect((await simpleParser(rawSent as Buffer)).text?.trim()).toBe("Current inline body.");
+    });
+
     it("Prefers a RopWriteStream-accumulated body over an inline PidTagBody draftProperty.", async () => {
         const context = makeContext();
         const streamText = "Body written via RopWriteStream.";
@@ -339,6 +392,8 @@ describe("RopSubmitMessageHandler Tests", () => {
         function makeCalendarEvent(overrides: Record<string, unknown> = {}) {
             return {
                 uid: "evt1",
+                mailboxUid: "mailbox-1",
+                organizer: { address: "Owner@Example.com" },
                 icalUid: "abc-123@mapi",
                 sequence: 0,
                 title: "Standup",
@@ -403,7 +458,7 @@ describe("RopSubmitMessageHandler Tests", () => {
             expect(scanPipeline.run).not.toHaveBeenCalled();
         });
 
-        it("Skips sending when the mailbox has no resolvable envelope-from address, even with attendees present.", async () => {
+        it("Returns MAPI_E_INVALID_OBJECT without sending when the caller's mailbox can't be resolved to confirm they organize it.", async () => {
             const event = makeCalendarEvent({ attendees: [{ address: "attendee@example.com" }] });
             const context = makeContext({
                 calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any,
@@ -422,9 +477,58 @@ describe("RopSubmitMessageHandler Tests", () => {
             const response = new BufferReader(writer.toBuffer());
             response.readUInt8();
             response.readUInt8();
-            expect(response.readUInt32LE()).toBe(0); // still success - the appointment itself already exists
+            expect(response.readUInt32LE()).toBe(0x80070005);
             const scanPipeline = context.scanPipeline as any;
             expect(scanPipeline.run).not.toHaveBeenCalled();
+        });
+
+        it("Refuses to send invites for an attendee's own copy of someone else's meeting.", async () => {
+            const event = makeCalendarEvent({ organizer: { address: "boss@example.com" }, attendees: [{ address: "owner@example.com" }, { address: "x@example.com" }] });
+            const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any });
+            context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment" } };
+            const writer = new BufferWriter();
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+            const response = new BufferReader(writer.toBuffer());
+            response.readUInt8();
+            response.readUInt8();
+            expect(response.readUInt32LE()).toBe(0x80070005);
+            expect((context.scanPipeline as any).run).not.toHaveBeenCalled();
+            expect(context.mailTransport.send).not.toHaveBeenCalled();
+        });
+
+        it("Refuses an event that belongs to another mailbox, even if the organizer address matches.", async () => {
+            const event = makeCalendarEvent({ mailboxUid: "mailbox-2", attendees: [{ address: "x@example.com" }] });
+            const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "owner@example.com" }) };
+            const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any, mailboxRepo: mailboxRepo as any });
+            context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment" } };
+            const writer = new BufferWriter();
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+            const response = new BufferReader(writer.toBuffer());
+            response.readUInt8();
+            response.readUInt8();
+            expect(response.readUInt32LE()).toBe(0x80070005);
+            expect(mailboxRepo.findOne).not.toHaveBeenCalled();
+        });
+
+        it("Accepts an organizer address that is one of the mailbox's aliases, and leaves a malformed attendee out of the invite.", async () => {
+            const event = makeCalendarEvent({
+                organizer: { address: "alias@example.com" },
+                attendees: [{ address: "good@example.com" }, { address: "bad@example.com\r\nBcc: victim@example.com" }],
+            });
+            const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "owner@example.com", aliasAddresses: ["Alias@example.com"] }) };
+            const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any, mailboxRepo: mailboxRepo as any });
+            context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment" } };
+            const writer = new BufferWriter();
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+            const [rawSent, envelope] = (context.scanPipeline as any).run.mock.calls[0];
+            expect(envelope.to).toEqual(["good@example.com"]);
+            expect((rawSent as Buffer).toString()).not.toContain("victim@example.com");
         });
 
         it("Sends a real iCalendar METHOD:REQUEST invite to every attendee, without creating a Sent Items message.", async () => {

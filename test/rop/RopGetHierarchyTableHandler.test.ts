@@ -48,7 +48,13 @@ describe("RopGetHierarchyTableHandler Tests", () => {
             entityUid: "folder:top1",
             rows: ["folder:child1", "folder:child2"],
             cursor: 0,
+            generation: 1,
         });
+        // The mailbox's folders are fetched with explicit paging and sort, not the repo's 100-row default.
+        expect(folderRepo.find).toHaveBeenCalledWith(
+            { mailboxUid: "mailbox-1", sort: { name: "ASC", uid: "ASC" }, limit: 1000, page: 0 },
+            { ignoreACL: true, limit: 1000, page: 0 },
+        );
     });
 
     it("Returns MAPI_E_INVALID_OBJECT when InputHandleIndex isn't a folder handle.", async () => {

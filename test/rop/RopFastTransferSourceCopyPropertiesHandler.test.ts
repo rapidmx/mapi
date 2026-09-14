@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
-import { PropertyType, readTaggedPropertyValue, writePropertyTag } from "../../src/codec/PropertyValue.js";
+import { MAX_PROPERTY_TAG_COUNT, PropertyType, readTaggedPropertyValue, writePropertyTag } from "../../src/codec/PropertyValue.js";
+import { MAX_FAST_TRANSFER_BYTES } from "../../src/rop/FastTransferStream.js";
+import { handleDataCache, handleDataKey } from "../../src/rop/HandleDataCache.js";
 import { RopFastTransferSourceCopyPropertiesHandler } from "../../src/rop/RopFastTransferSourceCopyPropertiesHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
@@ -86,8 +88,7 @@ describe("RopFastTransferSourceCopyPropertiesHandler Tests", () => {
         expect(response.readUInt8()).toBe(6);
         expect(response.readUInt32LE()).toBe(0);
 
-        const outputHandle = context.session.handles[6];
-        const buffer = Buffer.from(outputHandle?.transferBufferBase64 ?? "", "base64");
+        const buffer = cachedTransfer(context);
         const reader = new BufferReader(buffer);
         expect(readTaggedPropertyValue(reader)).toEqual({ propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Hi" });
         expect(reader.hasMore()).toBe(false);
@@ -101,8 +102,7 @@ describe("RopFastTransferSourceCopyPropertiesHandler Tests", () => {
 
         await handler.handle(new BufferReader(buildRequest({})), writer, context);
 
-        const outputHandle = context.session.handles[6];
-        const buffer = Buffer.from(outputHandle?.transferBufferBase64 ?? "", "base64");
+        const buffer = cachedTransfer(context);
         expect(buffer.length).toBe(0);
     });
 
@@ -119,5 +119,45 @@ describe("RopFastTransferSourceCopyPropertiesHandler Tests", () => {
         );
 
         expect(context.session.handles[6]?.type).toBe("fastTransfer");
+        expect(context.session.handles[6]?.transferSourceType).toBe("folder");
+    });
+
+    it("Returns MAPI_E_TOO_BIG, creating no handle, for more than MAX_PROPERTY_TAG_COUNT tags.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "folder", entityUid: "folder:f1" };
+        const tags = Array.from({ length: MAX_PROPERTY_TAG_COUNT + 1 }, () => ({ propertyId: 0x3001, propertyType: PropertyType.PtypString }));
+        const writer = new BufferWriter();
+
+        await new RopFastTransferSourceCopyPropertiesHandler().handle(new BufferReader(buildRequest({ includedTags: tags })), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80040305);
+        expect(response.hasMore()).toBe(false);
+        expect(context.session.handles[6]).toBeUndefined();
+    });
+
+    it("Returns MAPI_E_TOO_BIG, creating no handle, when the built stream exceeds MAX_FAST_TRANSFER_BYTES.", async () => {
+        const subject = "a".repeat(MAX_FAST_TRANSFER_BYTES / 2 + 1); // UTF-16: two bytes per character
+        const context = makeContext({ messageRepo: { findOne: vi.fn().mockResolvedValue({ uid: "m1", subject }) } as any });
+        context.session.handles[5] = { type: "message", entityUid: "message:m1" };
+        const writer = new BufferWriter();
+
+        await new RopFastTransferSourceCopyPropertiesHandler().handle(
+            new BufferReader(buildRequest({ includedTags: [{ propertyId: 0x0037, propertyType: PropertyType.PtypString }] })),
+            writer,
+            context,
+        );
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x80040305);
+        expect(context.session.handles[6]).toBeUndefined();
     });
 });
+
+function cachedTransfer(context: RopContext): Buffer {
+    return handleDataCache.get(handleDataKey(context.session.uid, 6, context.session.handles[6].generation))!;
+}

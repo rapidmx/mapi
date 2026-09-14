@@ -62,7 +62,7 @@ describe("RopCreateMessageHandler Tests", () => {
         expect(response.readUInt8()).toBe(0); // HasMessageId
         expect(response.hasMore()).toBe(false);
 
-        expect(context.session.handles[5]).toEqual({
+        expect(context.session.handles[5]).toMatchObject({
             type: "message",
             entityUid: "",
             draftFolderUid: "folder:inbox-uid",

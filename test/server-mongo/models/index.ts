@@ -4,4 +4,13 @@
 // alongside its models, and a wildcard re-export here would make the ClassLoader also discover and eagerly
 // initialize every REST route/job class restapi defines - none of which this MAPI-only test harness
 // configures dependencies for.
-export { CalendarEventMongo, ContactMongo, FolderMongo, LabelMongo, MailboxMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
+export {
+    AuditLogEntryMongo,
+    CalendarEventMongo,
+    ContactMongo,
+    FolderMongo,
+    LabelMongo,
+    MailboxMongo,
+    MessageMongo,
+    TaskMongo,
+} from "@rapidmx/restapi/mongo";

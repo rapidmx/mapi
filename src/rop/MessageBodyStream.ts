@@ -6,6 +6,9 @@ import { simpleParser } from "mailparser";
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Message, type BlobStore } from "@rapidmx/restapi";
 import { BufferWriter } from "../codec/BufferCursor.js";
+import type { MapiObjectHandle } from "../MapiSessionManager.js";
+import { handleDataCache, handleDataKey } from "./HandleDataCache.js";
+import type { RopContext } from "./RopHandler.js";
 
 /** `PidTagBody` (`[MS-OXPROPS]`): property ID `0x1000`, `PtypString`. The only streamable property this
  * pragmatic subset supports via `RopOpenStream`/`RopReadStream` - `PidTagHtml`/`PidTagRtfCompressed` are a
@@ -24,12 +27,7 @@ export const PID_TAG_BODY = 0x1000;
  * `sanitizedHtmlBlobKey` - `PidTagBody` is specifically the plain-text body per `[MS-OXPROPS]`, unlike EAS's
  * `Body` element, which can carry either format tagged by its own `Type` field.
  *
- * Recomputed on every call rather than cached anywhere (including on the `"stream"` handle itself) -
- * `MapiSessionContext` is serialized through `RedisCache`'s JSON round trip for multi-instance deployments, so
- * a raw `Buffer` stored there wouldn't survive it (the same class of gap this codebase already documented for
- * `Date` fields, see `MapiSessionContext`'s own doc comment). A documented, pragmatic trade-off: a large body
- * read across several `RopReadStream` calls re-parses the MIME source each time rather than once - correct,
- * not byte-perfect-efficient.
+ * Does no caching itself - `loadStreamBody` below is what the stream ROPs call.
  */
 export async function resolveMessageBodyBytes(target: string, messageRepo: RepoUtils<any>, blobStore: BlobStore): Promise<Buffer> {
     const uid = target.slice("message:".length);
@@ -42,4 +40,21 @@ export async function resolveMessageBodyBytes(target: string, messageRepo: RepoU
     const writer = new BufferWriter();
     writer.writeNullTerminatedUtf16LE(parsed.text ?? "");
     return writer.toBuffer();
+}
+
+/**
+ * The body bytes for the read stream at `handleIndex`. Parsed once and kept in `HandleDataCache` (outside the
+ * session JSON) for the life of the handle, so reading a large body in many `RopReadStream` chunks costs one
+ * fetch and one MIME parse instead of one per chunk. A cache miss (eviction, or a request served by another
+ * replica) just resolves the body again.
+ */
+export async function loadStreamBody(context: RopContext, handleIndex: number, stream: MapiObjectHandle): Promise<Buffer> {
+    const key = handleDataKey(context.session.uid, handleIndex, stream.generation);
+    const cached = handleDataCache.get(key);
+    if (cached) {
+        return cached;
+    }
+    const bytes = await resolveMessageBodyBytes(stream.entityUid, context.messageRepo, context.blobStore);
+    handleDataCache.set(key, bytes);
+    return bytes;
 }

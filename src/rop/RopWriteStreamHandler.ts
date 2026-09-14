@@ -11,15 +11,34 @@ const ROP_ID_WRITE_STREAM = 0x2d;
  * stream (or doesn't exist)" - the same constant `RopReadStreamHandler` uses for its own analogous check. */
 const ERROR_INVALID_OBJECT = 0x80070005;
 
+/** `MAPI_E_TOO_BIG`, for a write that would take the stream past `MAX_WRITE_STREAM_BYTES`. */
+const ERROR_TOO_BIG = 0x80040305;
+
+/** The largest body a write stream accumulates. The buffer lives in session state, which is re-saved on every
+ * `Execute`, so it has to stay small. */
+export const MAX_WRITE_STREAM_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Appends `data` to the base64 string `existing`, touching only its last 4-character quantum. Base64 of a byte
+ * count divisible by 3 has no padding and concatenates cleanly; only a padded final quantum (1 or 2 bytes) has to
+ * be decoded and re-encoded together with the new bytes. Re-encoding the whole accumulated buffer on every write
+ * made a body written in many chunks quadratic.
+ */
+export function appendBase64(existing: string, data: Buffer): string {
+    if (!existing.endsWith("=")) {
+        return existing + data.toString("base64");
+    }
+    const tail = Buffer.from(existing.slice(-4), "base64");
+    return existing.slice(0, -4) + Buffer.concat([tail, data]).toString("base64");
+}
+
 /**
  * `RopWriteStream` (`[MS-OXCPRPT]`/`[MS-OXCROPS]`): writes bytes to a stream opened in `ReadWrite`/`Create`
  * mode (`RopOpenStreamHandler`'s write-mode branch - the only kind of writable stream this pragmatic subset
  * ever produces, always a `RopCreateMessage` draft's `PidTagBody`). Accumulates `Data` into the stream handle's
- * `writeBufferBase64` field, decode-concat-reencode each call rather than a naive string concatenation of
- * per-call base64 chunks - base64 is not concatenation-safe (a chunk's padding only belongs at the true end of
- * the data), so reassembling the real bytes requires decoding what's accumulated so far, appending the new raw
- * bytes, and re-encoding the whole thing. `RopSaveChangesMessageHandler`/`RopSubmitMessageHandler` decode this
- * buffer back to the final body text once composing is complete.
+ * `writeBufferBase64` field (see `appendBase64` for how that avoids re-encoding everything written so far), up
+ * to `MAX_WRITE_STREAM_BYTES`; a write past that fails with `MAPI_E_TOO_BIG` and nothing is appended.
+ * `RopSubmitMessageHandler` decodes this buffer back to the final body text once composing is complete.
  *
  * Like `RopReadStream`, `[MS-OXCROPS]` documents only one combined response-buffer shape for this ROP (no
  * separate Success/Failure pages) - `WrittenSize` is always present, `0` standing in for the failure case.
@@ -44,8 +63,17 @@ export class RopWriteStreamHandler implements RopHandler {
             return;
         }
 
-        const existing: Buffer = handle.writeBufferBase64 ? Buffer.from(handle.writeBufferBase64, "base64") : Buffer.alloc(0);
-        handle.writeBufferBase64 = Buffer.concat([existing, data]).toString("base64");
+        const existing: string = handle.writeBufferBase64 ?? "";
+        const existingSize: number = handle.writeSize ?? Buffer.byteLength(existing, "base64");
+        if (existingSize + data.length > MAX_WRITE_STREAM_BYTES) {
+            writer.writeUInt8(ROP_ID_WRITE_STREAM);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt32LE(ERROR_TOO_BIG);
+            writer.writeUInt16LE(0); // WrittenSize
+            return;
+        }
+        handle.writeBufferBase64 = appendBase64(existing, data);
+        handle.writeSize = existingSize + data.length;
 
         writer.writeUInt8(ROP_ID_WRITE_STREAM);
         writer.writeUInt8(inputHandleIndex);

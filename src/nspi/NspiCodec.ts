@@ -4,8 +4,10 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import {
+    MAX_PROPERTY_TAG_COUNT,
     PropertyType,
     readPropertyTag,
+    readPropertyTagArray,
     readTaggedPropertyValue,
     writePropertyTag,
     writePropertyValue,
@@ -85,10 +87,10 @@ export const BLANK_STAT: Stat = {
  * structures (`[MS-OXCDATA]` §2.9 - the same `PropertyType`-then-`PropertyId` encoding `PropertyValue.ts`'s own
  * `readPropertyTag`/`writePropertyTag` already implement). */
 export function readLargePropertyTagArray(reader: BufferReader): PropertyTag[] {
-    const count = reader.readUInt32LE();
-    const tags: PropertyTag[] = [];
-    for (let i = 0; i < count; i++) {
-        tags.push(readPropertyTag(reader));
+    const tags = readPropertyTagArray(reader, reader.readUInt32LE());
+    if (!tags) {
+        // Every requested column is resolved for every returned row, so the count is capped like EMSMDB's.
+        throw new RangeError(`NspiCodec: a LargePropertyTagArray may hold at most ${MAX_PROPERTY_TAG_COUNT} tags.`);
     }
     return tags;
 }

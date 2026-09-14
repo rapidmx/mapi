@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
-import { readPropertyTag, writePropertyValue } from "../codec/PropertyValue.js";
+import { readPropertyTagArray, writePropertyValue } from "../codec/PropertyValue.js";
 import { resolvePropertyValues } from "./PropertyResolvers.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -14,6 +14,9 @@ const ROP_ID_GET_PROPERTIES_SPECIFIC = 0x07;
  * use for their own analogous checks. Attachment/Logon objects (also spec-valid targets for this ROP) aren't
  * supported in this pragmatic subset. */
 const ERROR_INVALID_OBJECT = 0x80070005;
+
+/** `MAPI_E_TOO_BIG`, for more than `MAX_PROPERTY_TAG_COUNT` requested tags. */
+const ERROR_TOO_BIG = 0x80040305;
 
 /**
  * `RopGetPropertiesSpecific` (`[MS-OXCPRPT]`/`[MS-OXCROPS]`): fetches named property values for a single
@@ -40,17 +43,13 @@ export class RopGetPropertiesSpecificHandler implements RopHandler {
         const inputHandleIndex: number = reader.readUInt8();
         reader.readUInt16LE(); // PropertySizeLimit - no truncation support in this pragmatic subset
         reader.readUInt16LE(); // WantUnicode - this pragmatic subset always encodes strings the same way regardless
-        const propertyTagCount: number = reader.readUInt16LE();
-        const propertyTags: { propertyId: number; propertyType: number }[] = [];
-        for (let i = 0; i < propertyTagCount; i++) {
-            propertyTags.push(readPropertyTag(reader));
-        }
+        const propertyTags = readPropertyTagArray(reader, reader.readUInt16LE());
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || (handle.type !== "folder" && handle.type !== "message")) {
+        if (!handle || (handle.type !== "folder" && handle.type !== "message") || !propertyTags) {
             writer.writeUInt8(ROP_ID_GET_PROPERTIES_SPECIFIC);
             writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+            writer.writeUInt32LE(propertyTags ? ERROR_INVALID_OBJECT : ERROR_TOO_BIG);
             return;
         }
 

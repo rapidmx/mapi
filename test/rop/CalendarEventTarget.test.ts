@@ -69,7 +69,10 @@ describe("CalendarEventTarget Tests", () => {
             const targets = await resolveFolderCalendarEvents("folder-1", calendarEventRepo as any);
 
             expect(targets).toEqual(["calendarEvent:evt1", "calendarEvent:evt2"]);
-            expect(calendarEventRepo.find).toHaveBeenCalledWith({ folderUid: "folder-1" }, { ignoreACL: true });
+            expect(calendarEventRepo.find).toHaveBeenCalledWith(
+                { folderUid: "folder-1", sort: { startDate: "DESC", uid: "ASC" }, limit: 1000, page: 0 },
+                { ignoreACL: true, limit: 1000, page: 0 },
+            );
         });
     });
 });

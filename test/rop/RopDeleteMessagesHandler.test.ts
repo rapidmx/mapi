@@ -6,6 +6,7 @@ import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
 import { RopDeleteMessagesHandler } from "../../src/rop/RopDeleteMessagesHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
+import { AuditAction } from "@rapidmx/restapi";
 
 function buildRequest({
     logonId = 0,
@@ -112,6 +113,32 @@ describe("RopDeleteMessagesHandler Tests", () => {
         expect(response.readUInt32LE()).toBe(0);
         expect(response.readUInt8()).toBe(1); // PartialCompletion
         expect((context.messageRepo as any).delete).toHaveBeenCalledTimes(1);
+    });
+
+    it("Audits a deleted message as MESSAGE_DELETE when the context records audits.", async () => {
+        const audit = vi.fn().mockResolvedValue(undefined);
+        const context = makeContext({
+            audit,
+            messageRepo: {
+                findOne: vi.fn().mockResolvedValue({ uid: "m1", mailboxUid: "mailbox-1", subject: "Bye", folderUid: "f1" }),
+                delete: vi.fn().mockResolvedValue(undefined),
+            } as any,
+        });
+        context.session.handles[5] = { type: "folder", entityUid: "folder:f1" };
+        context.session.messageIds = { "1": "message:m1", "2": "message:gone" };
+        (context.messageRepo as any).findOne.mockResolvedValueOnce({ uid: "m1", mailboxUid: "mailbox-1", subject: "Bye", folderUid: "f1" }).mockResolvedValueOnce(undefined);
+
+        await new RopDeleteMessagesHandler().handle(new BufferReader(buildRequest({ messageIds: [1n, 2n] })), new BufferWriter(), context);
+
+        expect((context.messageRepo as any).delete).toHaveBeenCalledTimes(2);
+        expect(audit).toHaveBeenCalledTimes(1); // a message that no longer exists has nothing to audit
+        expect(audit).toHaveBeenCalledWith({
+            action: AuditAction.MESSAGE_DELETE,
+            targetType: "Message",
+            targetUid: "m1",
+            mailboxUid: "mailbox-1",
+            details: { subject: "Bye", folderUid: "f1" },
+        });
     });
 
     it("Handles an empty MessageIds list, reporting success with PartialCompletion=false.", async () => {

@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Task } from "@rapidmx/restapi";
+import type { RepoSort } from "./RepoPaging.js";
 
 /**
  * The `RopGetContentsTable`/`RopOpenMessage` analog of `MessageTarget.ts`, for a `Folder` of type `TASKS`:
@@ -35,9 +36,5 @@ export async function resolveTaskInfo(target: string, taskRepo: RepoUtils<any>):
     };
 }
 
-/** Resolves the tasks directly in `folderUid`, as `"task:<uid>"` target strings, for `RopGetContentsTable`
- * against a `TASKS`-type folder. */
-export async function resolveFolderTasks(folderUid: string, taskRepo: RepoUtils<any>): Promise<string[]> {
-    const tasks: Task[] = await taskRepo.find({ folderUid }, { ignoreACL: true });
-    return tasks.map((t) => `task:${t.uid}`);
-}
+/** The order a `TASKS` folder's contents table lists tasks in (see `ContentsTable.ts`). */
+export const TASK_SORT: RepoSort = { title: "ASC", uid: "ASC" };

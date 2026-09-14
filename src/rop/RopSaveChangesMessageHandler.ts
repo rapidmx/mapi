@@ -133,20 +133,29 @@ export class RopSaveChangesMessageHandler implements RopHandler {
                 ignoreACL: true,
             });
             if (existing) {
+                const updated = {
+                    uid: existing.uid,
+                    version: existing.version,
+                    title: decoded.title ?? existing.title,
+                    location: decoded.location ?? existing.location,
+                    startDate: decoded.startDate ?? existing.startDate,
+                    endDate: decoded.endDate ?? existing.endDate,
+                    busyStatus: decoded.busyStatus ?? existing.busyStatus,
+                    recurrenceRule: decoded.recurrenceRule ?? existing.recurrenceRule,
+                    timezone: decoded.timezone ?? existing.timezone,
+                    reminderMinutesBeforeStart: decoded.reminderMinutesBeforeStart ?? existing.reminderMinutesBeforeStart,
+                    // An attendee who is still invited keeps their recorded response.
+                    attendees:
+                        attendees.length > 0
+                            ? attendees.map(
+                                  (attendee) =>
+                                      existing.attendees.find((prior) => prior.address.toLowerCase() === attendee.address.toLowerCase()) ??
+                                      attendee,
+                              )
+                            : existing.attendees,
+                };
                 await context.calendarEventRepo.update(
-                    {
-                        uid: existing.uid,
-                        version: existing.version,
-                        title: decoded.title ?? existing.title,
-                        location: decoded.location ?? existing.location,
-                        startDate: decoded.startDate ?? existing.startDate,
-                        endDate: decoded.endDate ?? existing.endDate,
-                        busyStatus: decoded.busyStatus ?? existing.busyStatus,
-                        recurrenceRule: decoded.recurrenceRule ?? existing.recurrenceRule,
-                        timezone: decoded.timezone ?? existing.timezone,
-                        reminderMinutesBeforeStart: decoded.reminderMinutesBeforeStart ?? existing.reminderMinutesBeforeStart,
-                        attendees: attendees.length > 0 ? attendees : existing.attendees,
-                    },
+                    { ...updated, sequence: (existing.sequence ?? 0) + (isSchedulingRelevantChange(existing, updated) ? 1 : 0) },
                     existing,
                     { ignoreACL: true },
                 );
@@ -181,6 +190,27 @@ export class RopSaveChangesMessageHandler implements RopHandler {
         handle.entityUid = `calendarEvent:${created.uid}`;
         return BigInt(assignOrGetMid(context.session, handle.entityUid));
     }
+}
+
+/**
+ * `true` when an update changes what attendees were invited to: the start or end time, location, recurrence, or
+ * who is invited. The same fields restapi's `BaseCalendarEventRoute.update()` bumps `sequence` for (a MAPI save
+ * never sets `status`), so an edit made in Outlook is re-sent to attendees and supersedes their copy (RFC 5546
+ * `SEQUENCE`) exactly like one made through REST.
+ */
+export function isSchedulingRelevantChange(
+    existing: Pick<CalendarEvent, "startDate" | "endDate" | "location" | "recurrenceRule" | "attendees">,
+    updated: Pick<CalendarEvent, "startDate" | "endDate" | "location" | "recurrenceRule" | "attendees">,
+): boolean {
+    const addresses = (attendees: Attendee[]): string =>
+        JSON.stringify(attendees.map((attendee) => attendee.address.toLowerCase()).sort());
+    return (
+        new Date(updated.startDate).getTime() !== new Date(existing.startDate).getTime() ||
+        new Date(updated.endDate).getTime() !== new Date(existing.endDate).getTime() ||
+        (updated.location ?? "") !== (existing.location ?? "") ||
+        JSON.stringify(updated.recurrenceRule ?? null) !== JSON.stringify(existing.recurrenceRule ?? null) ||
+        addresses(updated.attendees) !== addresses(existing.attendees)
+    );
 }
 
 /** Every field but `attendeeAddresses` is deliberately optional and left `undefined` when this particular

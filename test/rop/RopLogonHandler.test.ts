@@ -85,7 +85,7 @@ describe("RopLogonHandler Tests", () => {
 
         // All 13 folders are virtual placeholders since folderRepo.find() always returned [].
         expect(Object.values(context.session.folderIds).every((v) => v.startsWith("virtual:"))).toBe(true);
-        expect(context.session.handles[3]).toEqual({ type: "logon", entityUid: MAILBOX_UID });
+        expect(context.session.handles[3]).toEqual({ type: "logon", entityUid: MAILBOX_UID, generation: 1 });
     });
 
     it("Resolves Inbox/Outbox/Sent Items/Deleted Items to a real Folder when one exists, leaving the rest virtual.", async () => {

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { resolveFolderTasks, resolveTaskInfo } from "../../src/rop/TaskTarget.js";
+import { resolveTaskInfo } from "../../src/rop/TaskTarget.js";
 
 describe("TaskTarget Tests", () => {
     describe("resolveTaskInfo", () => {
@@ -24,17 +24,6 @@ describe("TaskTarget Tests", () => {
             expect(info.title).toBe("");
             expect(info.completed).toBe(false);
             expect(info.dueDate).toBeUndefined();
-        });
-    });
-
-    describe("resolveFolderTasks", () => {
-        it("Returns each task as a task:<uid> target string.", async () => {
-            const taskRepo = { find: vi.fn().mockResolvedValue([{ uid: "t1" }, { uid: "t2" }]) };
-
-            const targets = await resolveFolderTasks("folder-1", taskRepo as any);
-
-            expect(targets).toEqual(["task:t1", "task:t2"]);
-            expect(taskRepo.find).toHaveBeenCalledWith({ folderUid: "folder-1" }, { ignoreACL: true });
         });
     });
 });

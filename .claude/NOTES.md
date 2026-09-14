@@ -348,3 +348,70 @@ Each finding was confirmed in code first. Not committed; no version or peerDepen
     merge and sort, so `TotalRecs` counts at most what was fetched, not every match.
   - Tests are in `test/RegexPatternUtils.test.ts` (copied) and `test/nspi/NspiGetMatchesHandler.test.ts`
     (truncation and limit clamping; existing expectations updated for `limit`).
+
+### 2026-09-14 (3) — Round-3 review fixes (limits, session consistency, deletes, calendar, streams)
+
+Each of the 15 findings was confirmed in code before fixing; all 15 were real. Not committed; no version or
+peerDependency changes. 575 tests pass (was 495); coverage 100% statements/functions/lines, 99.12% branches;
+`yarn lint` and `npx tsc --noEmit -p .` clean. (`tsconfig.test.json` still reports its pre-existing `RopContext`
+fixture errors; it isn't part of the gate.)
+
+- **Framing (1).** `decodeExecuteRequest()` (exported from `BaseMapiEmsmdbRoute.ts`) rejects `RopBufferSize` over
+  32767 or past the body, and any decode error, with a 400. `decodeRopBuffer` rejects a handle table over 255 entries
+  or with a partial entry. `encodeRopBuffer` writes the table as one buffer.
+- **Tag arrays (2).** `readPropertyTagArray()` in `PropertyValue.ts` caps at `MAX_PROPERTY_TAG_COUNT = 256`. Past the
+  cap it skips the bytes and returns `undefined`, so EMSMDB `RopSetColumns`/`RopGetPropertiesSpecific`/FastTransfer
+  CopyTo/CopyProperties answer `MAPI_E_TOO_BIG` and later ROPs still parse. NSPI `readLargePropertyTagArray` throws.
+  NSPI `MinimalIds` is skipped with one bounds-checked read instead of a loop.
+- **Sessions (3, 8, 13).** `MapiSessionManager` no longer uses `RedisCache`: its per-process copy was served without
+  checking Redis, so replicas diverged. It now injects the `cache` Redis client (`@Redis("cache", false)`) and uses
+  `RedisMapiSessionStore` (every load is a Redis GET; save is a Lua compare-and-set on `version`), or
+  `MemoryMapiSessionStore` without Redis (JSON strings, so loads are independent copies). `save()` returns
+  `"saved" | "conflict" | "missing"`. On conflict, Execute answers `X-ResponseCode: 15` (Invalid Sequence); on
+  missing, session-not-found. Side effects of that request's ROPs have already happened; only its handle changes are
+  dropped. `create()` keeps a per-user index key and ends the oldest session past `MAX_SESSIONS_PER_USER = 20`.
+  `load()` ends sessions older than `MAX_SESSION_LIFETIME_MS = 24h`. Execute also checks
+  `resolveCallerMailboxUid(user) === session.mailboxUid` every time.
+- **Deletes (4, 5, 6).** restapi's `assertNotOnLegalHold` is NOT exported from the package root (only used inside
+  restapi), so `RopDeleteFolder` never purges: `DELETE_HARD_DELETE` is ignored and everything is soft-deleted, which a
+  hold allows. Messages deleted by `RopDeleteFolder` and `RopDeleteMessages` are audited as `MESSAGE_DELETE` through
+  `recordAuditLog` via an optional `RopContext.audit`. The routes set `auditLogClass` (`AuditLogEntryMongo`/`SQL`);
+  the Mongo test server now exports `AuditLogEntryMongo` so the integration test can check the row. The subfolder walk
+  is iterative, has a visited set, and is limited to `MAX_FOLDER_DEPTH = 32` and `MAX_FOLDERS_PER_DELETE = 1000`
+  (else `MAPI_E_TOO_COMPLEX`). Every child and item query is filtered by `mailboxUid`. Items are paged, at most
+  `MAX_ITEMS_PER_DELETE = 10000` per ROP; past that it reports `PartialCompletion` and keeps the remaining folders.
+- **Paging (6).** `RepoPaging.ts` (`findPage`/`findAllCapped`/`findWindow`) always passes `limit`/`page`/`sort` in
+  both query and options and ends sorts with `uid`. Contents tables no longer snapshot rows: `RopGetContentsTable`
+  stores `contentsKind`, and `RopQueryRows` reads just the window (`ContentsTable.ts`), at most 500 rows per call.
+  Trade-off: an item added or removed between QueryRows calls can shift later rows. Sorts: messages
+  `receivedDate DESC`, events `startDate DESC`, contacts `displayName`, tasks `title`, folders `name`. Hierarchy
+  tables and FastTransfer folder dumps still resolve lists up front, capped at 10000. `resolveFolderContacts`/
+  `resolveFolderTasks` were removed (unused).
+- **Streams and handle data (7, 8, 15).** `HandleDataCache.ts` is a process-local, byte-bounded LRU with TTL
+  (256 MB, 15 min) for a read stream's decoded body (parsed once at `RopOpenStream`) and a FastTransfer stream. A miss
+  (another replica, eviction) rebuilds from the handle, so it never returns wrong data. Keys include the handle's
+  `generation`. `transferBufferBase64` is gone; FastTransfer handles keep `transferSourceType`/`transferColumns`/
+  `transferExcludeIds`, and a stream over 32 MB fails with `MAPI_E_TOO_BIG`. `RopWriteStream` appends base64 by
+  re-encoding only the last quantum (`appendBase64`) and caps at 4 MB. Named properties are capped at 4096 per
+  session. `RopDispatcher` stops after 1024 ROPs. Every handle assignment goes through `assignHandle()` (fresh
+  `generation`); `releaseHandle()` (used by `RopRelease` and by reassigning an index) drops cached data and releases
+  write streams whose `writeTargetHandleIndex`/`writeTargetGeneration` match. `resolveDraftBody` also matches the
+  generation.
+- **Calendar (9, 10).** `RopSaveChangesMessage` bumps `sequence` when start, end, location, recurrence or the invited
+  addresses change (same fields as restapi's `BaseCalendarEventRoute.update()`), and keeps a still-invited attendee's
+  response. `submitAppointment` only sends when the event is in the caller's mailbox and the organizer is one of the
+  caller's addresses. `submitMeetingResponse` now mirrors REST `respond()`: it finds the caller's own copy
+  (`icalUid` + `mailboxUid`, preferring the exception whose `recurrenceId` date matches the GlobalObjectId instance
+  bytes), updates it (decline soft-deletes it), and sends an iTIP REPLY built with restapi's `buildEventIcs` through
+  `mailTransport.send`, swallowing send errors. It never touches the organizer's copy.
+- **Submit (11, 14).** The Sent Items copy stores `scanAndRelay`'s returned `raw`, `messageId`, `conversationId` and
+  `encrypted`. Address helpers moved to `AddressList.ts`: `isPlainEmailAddress` rejects whitespace (CR/LF),
+  display-name forms and separators. Submit refuses the whole send if any recipient is invalid; attendee lists and
+  invites drop invalid addresses.
+- **Time zones (12).** `decodeTimeZoneStruct` keeps minutes: a whole-hour offset gives `Etc/GMT±N`, a known DST-less
+  fractional offset gives a real zone (`Asia/Kolkata`, `Asia/Kathmandu`, ...), anything else gives a fixed offset like
+  `"-03:30"` (Node's `Intl` accepts it). Offsets outside UTC-12..UTC+14 decode as `UTC`. `encodeTimeZoneStruct` falls
+  back to UTC for a zone `Intl` rejects instead of throwing.
+- Tests: new `test/ProtocolLimits.test.ts`, `test/MapiSessionManager.test.ts` (fake Redis client emulating the
+  CAS script), `test/rop/HandleDataCache.test.ts`, plus Mongo integration tests for the 400, mailbox reassignment,
+  conflict/missing save (spy on `MapiSessionManager.prototype.save`) and delete + audit row.

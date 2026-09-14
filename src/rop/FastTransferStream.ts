@@ -5,8 +5,9 @@
 import { Folder, FolderType } from "@rapidmx/restapi";
 import { BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyType, writeTaggedPropertyValue } from "../codec/PropertyValue.js";
-import type { MapiObjectHandle } from "../MapiSessionManager.js";
+import { assignHandle, type MapiObjectHandle } from "../MapiSessionManager.js";
 import { resolveFolderCalendarEvents } from "./CalendarEventTarget.js";
+import { handleDataCache, handleDataKey } from "./HandleDataCache.js";
 import { resolveFolderMessages } from "./MessageTarget.js";
 import { resolvePropertyValues } from "./PropertyResolvers.js";
 import type { RopContext } from "./RopHandler.js";
@@ -122,4 +123,59 @@ export async function buildFastTransferStream(
     }
 
     return writer.toBuffer();
+}
+
+/** The largest FastTransfer stream built for one handle; a larger source fails with `MAPI_E_TOO_BIG`. */
+export const MAX_FAST_TRANSFER_BYTES = 32 * 1024 * 1024;
+
+/** Rebuilds a `"fastTransfer"` handle's stream from what the handle records about its source. */
+function rebuildFastTransferStream(transfer: MapiObjectHandle, context: RopContext): Promise<Buffer> {
+    return buildFastTransferStream({ type: transfer.transferSourceType!, entityUid: transfer.entityUid }, context, {
+        columns: transfer.transferColumns,
+        excludePropertyIds: new Set(transfer.transferExcludeIds ?? []),
+    });
+}
+
+/**
+ * The built stream for the `"fastTransfer"` handle at `handleIndex`. Kept in `HandleDataCache` rather than the
+ * session JSON, so paging a large stream out doesn't re-save it to the session store on every `Execute`. A cache
+ * miss rebuilds it from the source.
+ */
+export async function loadFastTransferBuffer(context: RopContext, handleIndex: number, transfer: MapiObjectHandle): Promise<Buffer> {
+    const key = handleDataKey(context.session.uid, handleIndex, transfer.generation);
+    const cached = handleDataCache.get(key);
+    if (cached) {
+        return cached;
+    }
+    const buffer = await rebuildFastTransferStream(transfer, context);
+    handleDataCache.set(key, buffer);
+    return buffer;
+}
+
+/**
+ * Shared by `RopFastTransferSourceCopyTo`/`CopyProperties`: builds the stream for `source`, and on success stores a
+ * `"fastTransfer"` handle at `outputHandleIndex` with the stream cached. Returns `false`, storing nothing, when the
+ * stream exceeds `MAX_FAST_TRANSFER_BYTES`.
+ */
+export async function openFastTransferHandle(
+    context: RopContext,
+    outputHandleIndex: number,
+    source: MapiObjectHandle,
+    options: { columns?: PropertyColumn[]; excludePropertyIds?: number[] },
+): Promise<boolean> {
+    const transfer: MapiObjectHandle = {
+        type: "fastTransfer",
+        entityUid: source.entityUid,
+        transferSourceType: source.type === "folder" ? "folder" : "message",
+        transferColumns: options.columns,
+        transferExcludeIds: options.excludePropertyIds,
+        transferPosition: 0,
+    };
+    const buffer = await rebuildFastTransferStream(transfer, context);
+    if (buffer.length > MAX_FAST_TRANSFER_BYTES) {
+        return false;
+    }
+    assignHandle(context.session, outputHandleIndex, transfer);
+    handleDataCache.set(handleDataKey(context.session.uid, outputHandleIndex, transfer.generation), buffer);
+    return true;
 }

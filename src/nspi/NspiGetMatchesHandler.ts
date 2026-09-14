@@ -137,10 +137,8 @@ export async function handleNspiGetMatches(req: HttpRequest, res: HttpResponse, 
     }
     if (reader.readUInt8()) {
         // MinimalIds (an Explicit Table) - not honored, see function doc comment
-        const minimalIdCount = reader.readUInt32LE();
-        for (let i = 0; i < minimalIdCount; i++) {
-            reader.readUInt32LE();
-        }
+        // Skipped in one bounds-checked read rather than a loop over a client-supplied 32-bit count.
+        reader.readBytes(reader.readUInt32LE() * 4);
     }
     reader.readUInt32LE(); // InterfaceOptionFlags - reserved, always 0
     const searchTerm = reader.readUInt8() ? extractContentRestrictionSearchTerm(reader) : undefined;

@@ -14,6 +14,7 @@ import {
 } from "@rapidmx/restapi";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
+import { isPlainEmailAddress, splitAddressList } from "./AddressList.js";
 import { submitMeetingResponse } from "./MeetingMessageClassHandler.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -47,19 +48,8 @@ const MESSAGE_CLASS_APPOINTMENT_PREFIX = "IPM.Appointment";
  * function's own doc comment. */
 const MESSAGE_CLASS_MEETING_RESPONSE_PREFIX = "IPM.Schedule.Meeting.Resp.";
 
-/** Splits a `PidTagDisplayTo`/`Cc`/`Bcc`-style string on the semicolons real Outlook separates recipients
- * with (also tolerating commas, in case a client or test harness uses that convention instead), trimming and
- * dropping empty entries. Exported since `RopSaveChangesMessageHandler.ts` reads the same accumulated
- * `PidTagDisplayTo`/`Cc` draft properties to build a Calendar item's attendee list. */
-export function parseAddressList(value: string | undefined): string[] {
-    if (!value) {
-        return [];
-    }
-    return value
-        .split(/[;,]/)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
-}
+// Re-exported for existing importers; the implementation lives in AddressList.ts.
+export { isPlainEmailAddress, parseAddressList } from "./AddressList.js";
 
 /**
  * `RopSubmitMessage` (`[MS-OXOMSG]`/`[MS-OXCROPS]`): sends a composed message - the actual trigger point for
@@ -135,13 +125,15 @@ export class RopSubmitMessageHandler implements RopHandler {
             return;
         }
 
-        const to = parseAddressList(properties[String(PID_TAG_DISPLAY_TO)]);
-        const cc = parseAddressList(properties[String(PID_TAG_DISPLAY_CC)]);
-        const bcc = parseAddressList(properties[String(PID_TAG_DISPLAY_BCC)]);
+        const to = splitAddressList(properties[String(PID_TAG_DISPLAY_TO)]);
+        const cc = splitAddressList(properties[String(PID_TAG_DISPLAY_CC)]);
+        const bcc = splitAddressList(properties[String(PID_TAG_DISPLAY_BCC)]);
         const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
         const envelopeFrom: string | undefined = mailbox?.primarySmtpAddress;
 
-        if (!envelopeFrom || to.length + cc.length + bcc.length === 0) {
+        // Refuse the whole send over one malformed recipient rather than silently dropping it.
+        const allValid = [...to, ...cc, ...bcc].every(isPlainEmailAddress);
+        if (!envelopeFrom || to.length + cc.length + bcc.length === 0 || !allValid) {
             writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
@@ -216,22 +208,26 @@ export class RopSubmitMessageHandler implements RopHandler {
             return;
         }
 
-        const { sanitizedHtmlBlobKey } = await scanAndRelay(raw, envelopeFrom, envelopeTo, context.scanPipeline, context.mailTransport, context.blobStore);
+        const relayed = await scanAndRelay(raw, envelopeFrom, envelopeTo, context.scanPipeline, context.mailTransport, context.blobStore);
 
-        await context.blobStore.put(bodyBlobKey, raw, { contentType: "message/rfc822" });
+        // The Sent Items copy stores exactly what was relayed: scanAndRelay may have added a Message-ID header, and
+        // that header's value (plus the thread it derived) is what recipients' copies carry and what recall targets.
+        await context.blobStore.put(bodyBlobKey, relayed.raw, { contentType: "message/rfc822" });
         const sentFolder = await findOrCreateWellKnownFolder(context.folderRepo, context.folderClass, context.mailboxUid, FolderType.SENT_ITEMS);
         await context.messageRepo.create(
             new context.messageClass({
                 folderUid: sentFolder.uid,
                 mailboxUid: context.mailboxUid,
-                messageId: `${crypto.randomUUID()}@mapi`,
+                messageId: relayed.messageId,
+                conversationId: relayed.conversationId,
+                encrypted: relayed.encrypted,
                 subject,
                 from: { address: envelopeFrom, type: RecipientType.TO },
                 recipients,
                 sentDate: new Date(),
                 receivedDate: new Date(),
                 bodyBlobKey,
-                sanitizedHtmlBlobKey,
+                sanitizedHtmlBlobKey: relayed.sanitizedHtmlBlobKey,
                 bodyPreview: bodyText.slice(0, 200),
                 flags: { read: true, flagged: false, answered: false, forwarded: false },
                 importance: MessageImportance.NORMAL,
@@ -265,30 +261,33 @@ export class RopSubmitMessageHandler implements RopHandler {
     private async submitAppointment(handle: MapiObjectHandle, context: RopContext, writer: BufferWriter, inputHandleIndex: number): Promise<void> {
         const uid = handle.entityUid.startsWith("calendarEvent:") ? handle.entityUid.slice("calendarEvent:".length) : undefined;
         const event: CalendarEvent | undefined = uid ? await context.calendarEventRepo.findOne(uid, { ignoreACL: true }) : undefined;
-        if (!event) {
+        const mailbox = event?.mailboxUid === context.mailboxUid ? await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true }) : undefined;
+        const callerAddresses: string[] = mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a: string) => a.toLowerCase()) : [];
+        // Only the organizer sends invites. An attendee's own copy of a meeting (delivered into their calendar) is
+        // also a CalendarEvent they can open and submit, which would otherwise mail a REQUEST to every attendee as if
+        // they had organized it.
+        if (!event || !callerAddresses.includes((event.organizer?.address ?? "").toLowerCase())) {
             writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
             return;
         }
 
-        if (event.attendees.length > 0) {
-            const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
-            const envelopeFrom: string | undefined = mailbox?.primarySmtpAddress;
-            if (envelopeFrom) {
-                const attendeeAddresses = event.attendees.map((attendee) => attendee.address);
-                const ics = buildMeetingRequestIcs(event, envelopeFrom);
-                const raw: Buffer = await new MailComposer({
-                    from: envelopeFrom,
-                    to: attendeeAddresses,
-                    subject: event.title,
-                    text: `You have been invited to: ${event.title}`,
-                    icalEvent: { method: "REQUEST", content: ics },
-                })
-                    .compile()
-                    .build();
-                await scanAndRelay(raw, envelopeFrom, attendeeAddresses, context.scanPipeline, context.mailTransport, context.blobStore);
-            }
+        const attendees = event.attendees.filter((attendee) => isPlainEmailAddress(attendee.address));
+        if (attendees.length > 0) {
+            const envelopeFrom: string = mailbox.primarySmtpAddress;
+            const attendeeAddresses = attendees.map((attendee) => attendee.address);
+            const ics = buildMeetingRequestIcs({ ...event, attendees }, envelopeFrom);
+            const raw: Buffer = await new MailComposer({
+                from: envelopeFrom,
+                to: attendeeAddresses,
+                subject: event.title,
+                text: `You have been invited to: ${event.title}`,
+                icalEvent: { method: "REQUEST", content: ics },
+            })
+                .compile()
+                .build();
+            await scanAndRelay(raw, envelopeFrom, attendeeAddresses, context.scanPipeline, context.mailTransport, context.blobStore);
         }
 
         writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
@@ -342,10 +341,17 @@ function buildMeetingRequestIcs(event: CalendarEvent, organizerAddress: string):
 /** Prefers a `RopWriteStream`-accumulated body (the real path a large body takes) over an inline `PidTagBody`
  * set directly via `RopSetProperties` (only realistic for a short body small enough to set inline) - see
  * `RopOpenStreamHandler`'s write-mode branch for how `writeTargetHandleIndex` links a stream handle back to the
- * draft message handle it was opened against. */
+ * draft message handle it was opened against. The generation must match too, so a stream left over from an
+ * earlier message at the same handle index never supplies this message's body. */
 function resolveDraftBody(context: RopContext, messageHandleIndex: number, properties: Record<string, string>): string {
+    const generation = context.session.handles[messageHandleIndex].generation;
     for (const candidate of Object.values(context.session.handles)) {
-        if (candidate.type === "stream" && candidate.writeTargetHandleIndex === messageHandleIndex && candidate.writeBufferBase64) {
+        if (
+            candidate.type === "stream" &&
+            candidate.writeTargetHandleIndex === messageHandleIndex &&
+            candidate.writeTargetGeneration === generation &&
+            candidate.writeBufferBase64
+        ) {
             const raw = Buffer.from(candidate.writeBufferBase64, "base64");
             return raw.toString("utf16le").replace(/\0+$/, "");
         }
