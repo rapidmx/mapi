@@ -18,6 +18,7 @@ const ROP_ID_RELEASE = 0x01;
  */
 export class RopReleaseHandler implements RopHandler {
     public readonly ropId = ROP_ID_RELEASE;
+    public readonly hasNoResponse = true;
 
     public handle(reader: BufferReader, _writer: BufferWriter, context: RopContext): void {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track per-logon-id state separately

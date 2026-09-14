@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { BufferReader, BufferWriter } from "./BufferCursor.js";
+import { BufferReader, BufferWriter, DecodeError } from "./BufferCursor.js";
 import { decodeGuid, encodeGuid } from "./MapiGuid.js";
 
 /**
@@ -163,7 +163,8 @@ export function readPropertyValue(reader: BufferReader, type: PropertyType): Pro
         case PropertyType.PtypMultipleBinary:
             return readCountedArray(reader, () => reader.readBytes(reader.readUInt16LE()));
         default:
-            throw new Error(`PropertyValue: unsupported PropertyType 0x${(type as number).toString(16)}`);
+            // The value's size is unknown, so nothing after it in the request can be located.
+            throw new DecodeError(`PropertyValue: unsupported PropertyType 0x${(type as number).toString(16)}`);
     }
 }
 
@@ -238,7 +239,7 @@ export function writePropertyValue(writer: BufferWriter, type: PropertyType, val
 function readCountedArray<T>(reader: BufferReader, readOne: () => T): T[] {
     const count = reader.readUInt32LE();
     if (count > reader.remaining) {
-        throw new RangeError(`PropertyValue.readCountedArray(): element count ${count} exceeds the remaining buffer size (${reader.remaining}).`);
+        throw new DecodeError(`PropertyValue.readCountedArray(): element count ${count} exceeds the remaining buffer size (${reader.remaining}).`);
     }
     const values: T[] = [];
     for (let i = 0; i < count; i++) {

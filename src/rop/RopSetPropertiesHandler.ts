@@ -30,6 +30,9 @@ const ROP_ID_SET_PROPERTIES = 0x0a;
  * subset's compose/send path ever needs to set properties on. */
 const ERROR_INVALID_OBJECT = 0x80070005;
 
+/** `MAPI_E_INVALID_PARAMETER`: `PropertyValues` couldn't be decoded, or didn't match `PropertyValueSize`. */
+const ERROR_INVALID_PARAMETER = 0x80070057;
+
 // The small, well-known set of plain (non-named) properties this pragmatic subset's compose/send path tracks -
 // exactly what RopSubmitMessageHandler/RopSaveChangesMessageHandler need to build a MIME message or persist a
 // CalendarEvent (Subject, an inline small body, the PidTagDisplayTo/Cc/Bcc "cached recipient display string"
@@ -119,18 +122,25 @@ export class RopSetPropertiesHandler implements RopHandler {
         // PropertyValueSize covers the PropertyValueCount field itself plus PropertyValues, counted from right
         // here (immediately after the PropertyValueSize field, before PropertyValueCount is read).
         const propertyValuesEnd: number = reader.position + propertyValueSize;
-        const propertyValueCount: number = reader.readUInt16LE();
-        const values: TaggedPropertyValue[] = [];
-        for (let i = 0; i < propertyValueCount; i++) {
-            values.push(readTaggedPropertyValue(reader));
+        let values: TaggedPropertyValue[] | undefined = [];
+        try {
+            const propertyValueCount: number = reader.readUInt16LE();
+            for (let i = 0; i < propertyValueCount; i++) {
+                values.push(readTaggedPropertyValue(reader));
+            }
+        } catch {
+            values = undefined; // e.g. an unsupported property type, whose size can't be known
         }
-        // PropertyValueSize is a byte-count check the request buffer itself provides for framing purposes (so a
-        // generic ROP-skipping implementation could skip this ROP without decoding it) - this handler already
-        // decoded PropertyValues field-by-field above, so the only remaining use is confirming the reader ended
-        // up exactly where PropertyValueSize said it would, catching a malformed request loudly rather than
-        // silently misaligning every ROP that follows in the same RopsList.
-        if (reader.position !== propertyValuesEnd) {
-            throw new Error("RopSetProperties: PropertyValueSize did not match the decoded PropertyValues length.");
+        // PropertyValueSize frames this ROP, so a list that couldn't be decoded, or decoded to a different length, is
+        // skipped by it and only this ROP fails; the ROPs after it are still where PropertyValueSize says. When
+        // PropertyValueSize itself points past the request, seek throws and the whole request is rejected.
+        const decodedEnd = reader.position;
+        reader.seek(propertyValuesEnd);
+        if (!values || decodedEnd !== propertyValuesEnd) {
+            writer.writeUInt8(ROP_ID_SET_PROPERTIES);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt32LE(ERROR_INVALID_PARAMETER);
+            return;
         }
 
         const handle = context.session.handles[inputHandleIndex];

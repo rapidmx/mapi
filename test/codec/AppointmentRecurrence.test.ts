@@ -189,38 +189,34 @@ describe("AppointmentRecurrence Tests", () => {
             expect(() => decodeAppointmentRecurrence(new BufferReader(encoded))).toThrow(/unsupported PatternType/);
         });
 
-        it("Throws decoding a nonzero DeletedInstanceCount (recurrence exceptions unsupported).", () => {
+        it("Decodes deleted occurrences into exceptions instead of throwing, ignoring modified ones and the ExceptionInfo blocks.", () => {
             const rule: RecurrenceRule = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
             const start = new Date("2026-09-07T14:00:00.000Z");
             const end = new Date("2026-09-07T15:00:00.000Z");
             const encoded = encodeAppointmentRecurrence(rule, start, end);
-            // RecurrencePattern (no PatternTypeSpecific bytes for Day): ReaderVersion(2)+WriterVersion(2)+
-            // RecurFrequency(2)+PatternType(2)+CalendarType(2)+FirstDateTime(4)+Period(4)+SlidingFlag(4)+
-            // EndType(4)+OccurrenceCount(4)+FirstDOW(4) = 34, then DeletedInstanceCount(4) at offset 34.
-            encoded.writeUInt32LE(1, 34);
-            expect(() => decodeAppointmentRecurrence(new BufferReader(encoded))).toThrow(/DeletedInstanceCount/);
+            // RecurrencePattern (no PatternTypeSpecific bytes for Day) is 34 bytes up to DeletedInstanceCount.
+            const minutes = (iso: string) => Math.round((Date.parse(iso) - Date.UTC(1601, 0, 1)) / 60000);
+            const deleted = [minutes("2026-09-09T00:00:00.000Z"), minutes("2026-09-10T00:00:00.000Z")];
+            const modified = [minutes("2026-09-10T00:00:00.000Z")];
+            const lists = Buffer.alloc(4 + deleted.length * 4 + 4 + modified.length * 4);
+            let offset = lists.writeUInt32LE(deleted.length, 0);
+            deleted.forEach((value) => (offset = lists.writeUInt32LE(value, offset)));
+            offset = lists.writeUInt32LE(modified.length, offset);
+            modified.forEach((value) => (offset = lists.writeUInt32LE(value, offset)));
+            const withExceptions = Buffer.concat([encoded.subarray(0, 34), lists, encoded.subarray(42)]);
+            // ExceptionCount (after StartDate/EndDate and the four outer version/offset fields) says one ExceptionInfo follows.
+            withExceptions.writeUInt16LE(1, 34 + lists.length + 8 + 16);
+
+            const decoded = decodeAppointmentRecurrence(new BufferReader(withExceptions));
+
+            expect(decoded.freq).toBe(RecurrenceFrequency.DAILY);
+            expect(decoded.exceptions).toEqual([new Date("2026-09-09T14:00:00.000Z")]);
         });
 
-        it("Throws decoding a nonzero ModifiedInstanceCount (recurrence exceptions unsupported).", () => {
-            const rule: RecurrenceRule = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
-            const start = new Date("2026-09-07T14:00:00.000Z");
-            const end = new Date("2026-09-07T15:00:00.000Z");
-            const encoded = encodeAppointmentRecurrence(rule, start, end);
-            // ModifiedInstanceCount(4) immediately follows DeletedInstanceCount(4) at offset 34, so offset 38.
-            encoded.writeUInt32LE(1, 38);
-            expect(() => decodeAppointmentRecurrence(new BufferReader(encoded))).toThrow(/ModifiedInstanceCount/);
-        });
-
-        it("Throws decoding a nonzero outer ExceptionCount (exceptions unsupported).", () => {
-            const rule: RecurrenceRule = { freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] };
-            const start = new Date("2026-09-07T14:00:00.000Z");
-            const end = new Date("2026-09-07T15:00:00.000Z");
-            const encoded = encodeAppointmentRecurrence(rule, start, end);
-            // Inner RecurrencePattern for Day is 34+4(Deleted)+4(Modified)+4(StartDate)+4(EndDate) = 50 bytes,
-            // then outer ReaderVersion2(4)+WriterVersion2(4)+StartTimeOffset(4)+EndTimeOffset(4) = 16, so
-            // ExceptionCount(2) sits at offset 50+16 = 66.
-            encoded.writeUInt16LE(1, 66);
-            expect(() => decodeAppointmentRecurrence(new BufferReader(encoded))).toThrow(/ExceptionCount/);
+        it("Rejects an instance date count larger than the pattern.", () => {
+            const encoded = encodeAppointmentRecurrence({ freq: RecurrenceFrequency.DAILY, interval: 1, exceptions: [] }, new Date(), new Date());
+            encoded.writeUInt32LE(0x40000000, 34);
+            expect(() => decodeAppointmentRecurrence(new BufferReader(encoded))).toThrow(RangeError);
         });
 
         it("Throws encoding an unsupported RecurrenceFrequency value.", () => {

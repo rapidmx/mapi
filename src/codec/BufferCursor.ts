@@ -20,6 +20,18 @@
  *
  * @author Jean-Philippe Steinmetz
  */
+/**
+ * A request that can't be decoded: truncated, or carrying a value (such as an unknown property type) whose wire
+ * size can't be determined. `RopDispatcher` answers the whole `Execute` with a 400 for one of these, since the bytes
+ * of every later ROP can no longer be located.
+ */
+export class DecodeError extends RangeError {
+    public constructor(message: string) {
+        super(message);
+        this.name = "DecodeError";
+    }
+}
+
 export class BufferReader {
     private offset: number;
 
@@ -40,6 +52,14 @@ export class BufferReader {
 
     public hasMore(): boolean {
         return this.offset < this.buffer.length;
+    }
+
+    /** Moves to `position` (backwards or forwards). Throws a `RangeError` for a position outside the buffer. */
+    public seek(position: number): void {
+        if (position < 0 || position > this.buffer.length) {
+            throw new RangeError(`BufferReader.seek(${position}): out of range (buffer length ${this.buffer.length}).`);
+        }
+        this.offset = position;
     }
 
     public readUInt8(): number {
@@ -161,82 +181,95 @@ export class BufferReader {
  * byte-array accumulator, adapted for multi-byte little-endian fields instead of single bytes. */
 export class BufferWriter {
     private readonly chunks: Buffer[] = [];
+    private byteLength = 0;
+
+    /** The number of bytes written so far. */
+    public get length(): number {
+        return this.byteLength;
+    }
+
+    private push(...buffers: Buffer[]): void {
+        for (const buffer of buffers) {
+            this.chunks.push(buffer);
+            this.byteLength += buffer.length;
+        }
+    }
 
     public writeUInt8(value: number): this {
         const buf = Buffer.alloc(1);
         buf.writeUInt8(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeInt16LE(value: number): this {
         const buf = Buffer.alloc(2);
         buf.writeInt16LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeUInt16LE(value: number): this {
         const buf = Buffer.alloc(2);
         buf.writeUInt16LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeInt32LE(value: number): this {
         const buf = Buffer.alloc(4);
         buf.writeInt32LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeUInt32LE(value: number): this {
         const buf = Buffer.alloc(4);
         buf.writeUInt32LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeFloatLE(value: number): this {
         const buf = Buffer.alloc(4);
         buf.writeFloatLE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeDoubleLE(value: number): this {
         const buf = Buffer.alloc(8);
         buf.writeDoubleLE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeBigInt64LE(value: bigint): this {
         const buf = Buffer.alloc(8);
         buf.writeBigInt64LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeBigUInt64LE(value: bigint): this {
         const buf = Buffer.alloc(8);
         buf.writeBigUInt64LE(value, 0);
-        this.chunks.push(buf);
+        this.push(buf);
         return this;
     }
 
     public writeBytes(value: Buffer): this {
-        this.chunks.push(value);
+        this.push(value);
         return this;
     }
 
     public writeNullTerminatedUtf16LE(value: string): this {
-        this.chunks.push(Buffer.from(value, "utf16le"), Buffer.from([0x00, 0x00]));
+        this.push(Buffer.from(value, "utf16le"), Buffer.from([0x00, 0x00]));
         return this;
     }
 
     public writeNullTerminatedString8(value: string): this {
-        this.chunks.push(Buffer.from(value, "utf-8"), Buffer.from([0x00]));
+        this.push(Buffer.from(value, "utf-8"), Buffer.from([0x00]));
         return this;
     }
 

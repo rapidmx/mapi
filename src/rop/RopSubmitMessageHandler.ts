@@ -14,9 +14,10 @@ import {
 } from "@rapidmx/restapi";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
-import { isPlainEmailAddress, splitAddressList } from "./AddressList.js";
+import { isPlainEmailAddress, resolveRecipientList, type ResolvedRecipient } from "./AddressList.js";
 import { submitMeetingResponse } from "./MeetingMessageClassHandler.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
+import { readWriteStream } from "./RopWriteStreamHandler.js";
 
 const ROP_ID_SUBMIT_MESSAGE = 0x32;
 
@@ -25,6 +26,15 @@ const ROP_ID_SUBMIT_MESSAGE = 0x32;
  * pragmatic subset as a generic "can't do this" signal, not a claim of exact per-condition `[MS-OXCRPC]`
  * return-value-table parity. */
 const ERROR_INVALID_OBJECT = 0x80070005;
+
+/** `MAPI_E_INVALID_PARAMETER`: the draft has no recipients, a recipient that isn't a usable address, or no sender. */
+const ERROR_INVALID_PARAMETER = 0x80070057;
+
+/** `MAPI_E_NOT_FOUND`: a recipient given only by display name matches no single contact of the caller's. */
+const ERROR_NOT_FOUND = 0x8004010f;
+
+/** `MAPI_E_CALL_FAILED`: the body written through `RopWriteStream` can no longer be reassembled (its chunks expired). */
+const ERROR_CALL_FAILED = 0x80004005;
 
 // The same well-known property IDs RopSetPropertiesHandler tracks - duplicated here (rather than imported)
 // since importing them would only save a handful of literals; see that file for the real documentation of what
@@ -51,6 +61,12 @@ const MESSAGE_CLASS_MEETING_RESPONSE_PREFIX = "IPM.Schedule.Meeting.Resp.";
 // Re-exported for existing importers; the implementation lives in AddressList.ts.
 export { isPlainEmailAddress, parseAddressList } from "./AddressList.js";
 
+function writeResult(writer: BufferWriter, inputHandleIndex: number, returnValue: number): void {
+    writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
+    writer.writeUInt8(inputHandleIndex);
+    writer.writeUInt32LE(returnValue);
+}
+
 /**
  * `RopSubmitMessage` (`[MS-OXOMSG]`/`[MS-OXCROPS]`): sends a composed message - the actual trigger point for
  * this pragmatic subset's compose/send pipeline, since `RopSaveChangesMessage` itself does no real persistence
@@ -68,12 +84,12 @@ export { isPlainEmailAddress, parseAddressList } from "./AddressList.js";
  * pragmatic subset's ROP coverage doesn't include. Instead, addressing is read from `PidTagDisplayTo`/
  * `DisplayCc`/`DisplayBcc` - the same semicolon-separated "cached recipient display string" properties real
  * Outlook *also* always sets via `RopSetProperties` alongside `RopModifyRecipients` (as a display-only
- * convenience cache). This works correctly for the common case of composing to bare, unresolved email
- * addresses (nothing to resolve to a distinct display name) - the case this library's own integration tests
- * exercise - but is **not** a substitute for real recipient rows: a client that resolves typed names against an
- * address book before submitting would populate these fields with display names, not addresses, and this
- * pragmatic subset has no way to recover a real SMTP address from a bare display name. Documented here rather
- * than silently producing wrong addressing.
+ * convenience cache). Entries are separated by `;` and parsed with nodemailer's `addressparser`, so both bare
+ * addresses and resolved `Name <address>` forms work. A client that resolved a name against an address book may
+ * write the display name alone; that is looked up among the caller's own contacts (see `resolveRecipientList`), and
+ * a name matching no single contact fails the submit with `MAPI_E_NOT_FOUND`. It is still **not** a substitute for
+ * real recipient rows (there is no recipient table to fall back on), so the whole send is refused rather than sent to
+ * fewer people than the user addressed. A malformed recipient fails with `MAPI_E_INVALID_PARAMETER`.
  *
  * `SubmitFlags` (`PreprocessOnly`, ...) is decoded to advance past it correctly but not honored - this
  * pragmatic subset has no transport-agent preprocessing distinction to vary by flag.
@@ -117,31 +133,35 @@ export class RopSubmitMessageHandler implements RopHandler {
             return;
         }
         if (messageClass.startsWith(MESSAGE_CLASS_MEETING_RESPONSE_PREFIX)) {
-            await submitMeetingResponse(messageClass, properties, context);
-            writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(0); // ReturnValue - success, see MeetingMessageClassHandler's own doc comment
-            // on why every failure mode there is a silent no-op rather than surfaced here.
+            writeResult(writer, inputHandleIndex, await submitMeetingResponse(messageClass, properties, context));
             return;
         }
 
-        const to = splitAddressList(properties[String(PID_TAG_DISPLAY_TO)]);
-        const cc = splitAddressList(properties[String(PID_TAG_DISPLAY_CC)]);
-        const bcc = splitAddressList(properties[String(PID_TAG_DISPLAY_BCC)]);
+        const resolutions = [
+            await resolveRecipientList(properties[String(PID_TAG_DISPLAY_TO)], context),
+            await resolveRecipientList(properties[String(PID_TAG_DISPLAY_CC)], context),
+            await resolveRecipientList(properties[String(PID_TAG_DISPLAY_BCC)], context),
+        ];
+        const [to, cc, bcc] = resolutions.map((resolution) => resolution.recipients);
         const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
         const envelopeFrom: string | undefined = mailbox?.primarySmtpAddress;
 
-        // Refuse the whole send over one malformed recipient rather than silently dropping it.
-        const allValid = [...to, ...cc, ...bcc].every(isPlainEmailAddress);
-        if (!envelopeFrom || to.length + cc.length + bcc.length === 0 || !allValid) {
-            writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+        // Refuse the whole send over one malformed or unresolvable recipient rather than silently dropping it.
+        if (!envelopeFrom || to.length + cc.length + bcc.length === 0 || resolutions.some((resolution) => resolution.invalid.length > 0)) {
+            writeResult(writer, inputHandleIndex, ERROR_INVALID_PARAMETER);
+            return;
+        }
+        if (resolutions.some((resolution) => resolution.unresolved.length > 0)) {
+            writeResult(writer, inputHandleIndex, ERROR_NOT_FOUND);
             return;
         }
 
         const subject = properties[String(PID_TAG_SUBJECT)] ?? "";
-        const bodyText = resolveDraftBody(context, inputHandleIndex, properties);
+        const bodyText = await resolveDraftBody(context, inputHandleIndex, properties);
+        if (bodyText === undefined) {
+            writeResult(writer, inputHandleIndex, ERROR_CALL_FAILED);
+            return;
+        }
         const requestReceipt = properties[String(PID_TAG_READ_RECEIPT_REQUESTED)] === "true";
         // "Do not deliver before" - a real Outlook compose option, tracked as a plain ISO-8601 string by
         // RopSetPropertiesHandler.stringifyValue()'s PtypTime encoding.
@@ -151,9 +171,9 @@ export class RopSubmitMessageHandler implements RopHandler {
 
         const raw: Buffer = await new MailComposer({
             from: envelopeFrom,
-            to,
-            cc,
-            bcc,
+            to: to.map(mailAddress),
+            cc: cc.map(mailAddress),
+            bcc: bcc.map(mailAddress),
             subject,
             text: bodyText,
             // A real Disposition-Notification-To request, mirroring BaseMessageRoute.send()'s own explicit
@@ -165,13 +185,13 @@ export class RopSubmitMessageHandler implements RopHandler {
         })
             .compile()
             .build();
-        const envelopeTo = [...to, ...cc, ...bcc];
+        const envelopeTo = [...to, ...cc, ...bcc].map((recipient) => recipient.address);
 
         const bodyBlobKey = `bodies/${crypto.randomUUID()}`;
         const recipients = [
-            ...to.map((address) => ({ address, type: RecipientType.TO })),
-            ...cc.map((address) => ({ address, type: RecipientType.CC })),
-            ...bcc.map((address) => ({ address, type: RecipientType.BCC })),
+            ...to.map((recipient) => storedRecipient(recipient, RecipientType.TO)),
+            ...cc.map((recipient) => storedRecipient(recipient, RecipientType.CC)),
+            ...bcc.map((recipient) => storedRecipient(recipient, RecipientType.BCC)),
         ];
 
         if (isDeferred) {
@@ -338,22 +358,33 @@ function buildMeetingRequestIcs(event: CalendarEvent, organizerAddress: string):
     return lines.join("\r\n");
 }
 
+/** A recipient as nodemailer's `MailComposer` takes it: a display name only when there is one. */
+function mailAddress(recipient: ResolvedRecipient): string | { name: string; address: string } {
+    return recipient.name ? { name: recipient.name, address: recipient.address } : recipient.address;
+}
+
+/** A recipient as the Sent Items copy stores it. */
+function storedRecipient(recipient: ResolvedRecipient, type: RecipientType): { address: string; displayName?: string; type: RecipientType } {
+    return { address: recipient.address, ...(recipient.name ? { displayName: recipient.name } : {}), type };
+}
+
 /** Prefers a `RopWriteStream`-accumulated body (the real path a large body takes) over an inline `PidTagBody`
  * set directly via `RopSetProperties` (only realistic for a short body small enough to set inline) - see
  * `RopOpenStreamHandler`'s write-mode branch for how `writeTargetHandleIndex` links a stream handle back to the
  * draft message handle it was opened against. The generation must match too, so a stream left over from an
- * earlier message at the same handle index never supplies this message's body. */
-function resolveDraftBody(context: RopContext, messageHandleIndex: number, properties: Record<string, string>): string {
+ * earlier message at the same handle index never supplies this message's body. `undefined` when the stream's
+ * chunks can no longer be reassembled - sending a truncated body would be worse than failing. */
+async function resolveDraftBody(context: RopContext, messageHandleIndex: number, properties: Record<string, string>): Promise<string | undefined> {
     const generation = context.session.handles[messageHandleIndex].generation;
-    for (const candidate of Object.values(context.session.handles)) {
+    for (const [index, candidate] of Object.entries(context.session.handles)) {
         if (
             candidate.type === "stream" &&
             candidate.writeTargetHandleIndex === messageHandleIndex &&
             candidate.writeTargetGeneration === generation &&
-            candidate.writeBufferBase64
+            candidate.writeSize
         ) {
-            const raw = Buffer.from(candidate.writeBufferBase64, "base64");
-            return raw.toString("utf16le").replace(/\0+$/, "");
+            const raw = await readWriteStream(context, Number(index), candidate);
+            return raw?.toString("utf16le").replace(/\0+$/, "");
         }
     }
     return properties[String(PID_TAG_BODY)] ?? "";

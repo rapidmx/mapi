@@ -415,3 +415,76 @@ fixture errors; it isn't part of the gate.)
 - Tests: new `test/ProtocolLimits.test.ts`, `test/MapiSessionManager.test.ts` (fake Redis client emulating the
   CAS script), `test/rop/HandleDataCache.test.ts`, plus Mongo integration tests for the 400, mailbox reassignment,
   conflict/missing save (spy on `MapiSessionManager.prototype.save`) and delete + audit row.
+
+### 2026-09-14 (4) — Round-4 review fixes (FastTransfer, output size, sessions, meetings, recipients)
+
+All 13 findings (at HEAD feac876) were confirmed in code before fixing; all were real. Not committed; no version or
+peerDependency changes. 632 tests pass (was 575); coverage 100% statements/functions/lines, 98.92% branches;
+`yarn lint` and `npx tsc --noEmit -p .` clean.
+
+- **FastTransfer (1).** New `HandleDataStore` (`HandleDataCache.ts`): `RedisHandleDataStore` (base64 values in Redis,
+  `mapi.handle.<key>`, local LRU in front) when the `cache` Redis client exists, else `MemoryHandleDataStore`.
+  `MapiSessionManager.handleDataStore` picks one; the route passes it as `RopContext.handleData` (`handleDataStoreOf`
+  falls back to the process store). Built streams are stored with `FAST_TRANSFER_TTL_SECONDS = 600`.
+  `loadFastTransferBuffer` returns the stream, `"tooBig"` or `"lost"`: a miss rebuilds only while
+  `transferPosition === 0`; mid-transfer it fails with `MAPI_E_CALL_FAILED` instead of paging a different stream. The
+  32 MB cap applies to rebuilds, and `buildFastTransferStream` checks size after every item (`FastTransferTooBigError`).
+- **Output size (2).** `decodeExecuteRequest` now returns `maxRopOut` (default 65535 when absent). `dispatchRops`
+  takes `{ maxOutputBytes }` (route: `MaxRopOut - 2 - 4*handles`, never over `MAX_ROPS_LIST_BYTES = 65533`), sets
+  `context.ropOutputRemaining` per ROP, and replaces a response that still doesn't fit with `RopBufferTooSmall`
+  (`0xFF`, SizeNeeded, the remaining request bytes) and stops. `RopReadStream` clamps to the room; `GetBuffer` honors
+  `MaximumBufferSize` for `0xBABE` (earlier it ignored it) and the room, answering `NoRoom` at zero room;
+  `RopQueryRows` returns only rows that fit (cursor advances past just those), `ecBufferTooSmall` when none fit.
+- **Generations (3).** `MapiObjectHandle.generation`/`writeTargetGeneration` are now `crypto.randomUUID()` strings
+  (`nextHandleGeneration` removed), so a request whose save lost can't reuse a cache key.
+- **Session size (4).** Session = two keys with a hash tag: `mapi.session.{id}` (JSON) and `mapi.session.{id}.version`;
+  the CAS Lua compares the version key only (no `cjson`). `save()` returns `"tooBig"` past `MAX_SESSION_BYTES = 4 MB`
+  (Execute: `X-ResponseCode 0`, body `ErrorCode MAPI_E_TOO_BIG`). Write streams store offset-keyed chunks in the
+  `HandleDataStore` (`writeStreamKey`, Redis hash field per offset, so a retried write replaces its chunk); only
+  `writeSize` stays in the session (`writeBufferBase64`/`appendBase64` removed). `readWriteStream` reassembles;
+  Submit fails `MAPI_E_CALL_FAILED` when chunks are gone. MIDs are capped at `MAX_MESSAGE_IDS = 20000`, evicting the
+  oldest via `session.firstMessageId`. Folder IDs are not capped (bounded by the mailbox's folders, 10000 cap).
+- **Occurrence responses (5).** `submitMeetingResponse` returns a ReturnValue. With an instance date and no exception
+  copy, the series is never deleted/updated for accept/tentative; decline appends the occurrence start (series local
+  time on that date in the event tz, DST-aware) to the caller's `recurrenceRule.exceptions`. The REPLY carries
+  `RECURRENCE-ID` (restapi's `buildEventIcs` emits it when `recurrenceId` is set, and drops `RRULE`). Exception copies
+  match by `recurrenceId` date in the event's time zone (invalid tz -> UTC).
+- **Per-ROP failures (6).** `dispatchRops` wraps its reader in a Proxy that turns reader `RangeError`s into
+  `DecodeError` (new, `BufferCursor.ts`, extends `RangeError`); `readPropertyValue`'s unknown type and
+  `readCountedArray` throw `DecodeError` too. Unknown RopId/`DecodeError` -> route saves the session, then 400. Any
+  other handler error -> that ROP's partial output is dropped and a failure response written: RopId, the byte at
+  `responseHandleIndexOffset` (default 2; 3 for ROPs echoing OutputHandleIndex), `MAPI_E_CALL_FAILED` (or
+  `MAPI_E_TOO_COMPLEX` for the budget), plus `failureTailBytes` zeros (Read/WriteStream); `hasNoResponse` for
+  RopRelease. `decodeAppointmentRecurrence` reads deleted instance dates into `exceptions` (minus same-day modified
+  ones, plus StartTimeOffset) and stops before ExceptionInfo instead of throwing. `RopSetProperties` uses the new
+  `BufferReader.seek` to skip to `PropertyValueSize`'s end and answers `MAPI_E_INVALID_PARAMETER` for mismatched or
+  undecodable values; a size past the request still throws (400).
+- **Lock/replay (7).** Execute takes `mapi.session.{id}.lock` (SET NX PX, `SESSION_LOCK_TTL_MS = 120s`, token-checked
+  release) before loading; busy -> `X-ResponseCode 15` with no side effects. The last response is stored per session
+  with its `X-RequestId` (`.last` key); a repeated id is answered from it without dispatching or saving.
+  `MapiSequence` validation skipped: the test client (and many real retries) resend the Connect cookie, and lock +
+  replay cover overlap and retries.
+- **Work budget (8).** New `rop/ExecuteBudget.ts`: 20000 rows resolved (`resolvePropertyValues` charges one per call)
+  and 64 MB built (FastTransfer streams, parsed bodies) per Execute; `bodies` dedupes body parses by message target.
+- **GlobalObjectId (9).** Non-vCal ids decode to the uppercase hex of the whole blob with bytes 16-19 zeroed
+  ([MS-OXCICAL]); lookup retries lowercase. `globalObjectIdInstanceDate` exported. Unknown class / missing or malformed
+  id -> `MAPI_E_INVALID_PARAMETER`; no match / not an attendee -> `MAPI_E_NOT_FOUND`.
+- **Recipients (10).** `AddressList.ts`: split on `;` only, each entry via nodemailer's `addressparser` (already a
+  dependency; `nodemailer/lib/addressparser/index.js`), control chars stripped from names, CR/LF entries invalid.
+  Bare names resolve against the caller's contacts (exact `displayName`, exactly one match, first valid email).
+  Submit: invalid/no recipients or no sender -> `MAPI_E_INVALID_PARAMETER`, unresolved names -> `MAPI_E_NOT_FOUND`
+  (was `0x80070005`, access denied). There is still no recipient table (no RopModifyRecipients) to fall back on.
+  MIME To/Cc/Bcc carry display names; Sent Items recipients store `displayName`.
+- **Response codes (11).** Context not found is `X-ResponseCode 10` ([MS-OXCMAPIHTTP] "Context Not Found"; no spec
+  copy in the repo, value from the spec's response-code table); `0x80040111` only in the body `ErrorCode`.
+- **Concurrent Connects (12).** Per-user index is a sorted set updated by one Lua script (prune dead, evict oldest to
+  under the cap, ZADD). The script builds session key names from ids (not in KEYS) - fine on one Redis node, not
+  cluster-safe. The memory store does the same synchronously.
+- **REPLY send (13).** restapi's `sendOrThrow` is NOT exported from the package root, so `rop/TransportSend.ts` copies
+  its rule (throw unless accepted > 0 and rejected == 0); keep in sync. A failed REPLY -> `MAPI_E_CALL_FAILED`, the
+  response stays recorded.
+- Tests: new `test/Round4Review.test.ts`, `test/fakeRedis.ts` (script-aware fake used by `MapiSessionManager.test.ts`
+  and `HandleDataCache.test.ts`); Mongo integration tests for code 10, lock busy (spy `acquireLock`), X-RequestId
+  replay, 400-after-save, MaxRopOut -> RopBufferTooSmall, `tooBig`.
+- Lesson: bash heredocs containing some quote/backtick mixes fail in this environment (`unexpected EOF`); write
+  scripts with the Write tool instead.

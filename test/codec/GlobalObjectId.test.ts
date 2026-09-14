@@ -5,7 +5,7 @@
 // GlobalObjectId is pure binary-format logic with no DI/DB dependency, tested directly here - same precedent as
 // test/mapi/codec/AppointmentRecurrence.test.ts.
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
-import { decodeGlobalObjectId, encodeGlobalObjectId } from "../../src/codec/GlobalObjectId.js";
+import { decodeGlobalObjectId, encodeGlobalObjectId, globalObjectIdInstanceDate } from "../../src/codec/GlobalObjectId.js";
 
 describe("GlobalObjectId Tests", () => {
     it("Round-trips an icalUid.", () => {
@@ -44,20 +44,27 @@ describe("GlobalObjectId Tests", () => {
         expect(data[data.length - 1]).toBe(0x00);
     });
 
-    it("Decodes a bare OutlookID-shaped blob (no vCal-Uid marker) as raw UTF-8 bytes, for completeness against a native-Exchange-generated GlobalObjectId this server never itself produces.", () => {
+    it("Decodes a native OutlookID (no vCal-Uid marker) as the uppercase hex of the whole id with the instance date zeroed, not as text.", () => {
         const writer = new BufferWriter();
         const byteArrayId = Buffer.from([0x04, 0x00, 0x00, 0x00, 0x82, 0x00, 0xe0, 0x00, 0x74, 0xc5, 0xb7, 0x10, 0x1a, 0x82, 0xe0, 0x08]);
         writer.writeBytes(byteArrayId);
-        writer.writeUInt8(0);
-        writer.writeUInt8(0);
-        writer.writeUInt8(0);
-        writer.writeUInt8(0);
+        writer.writeUInt8(0x07);
+        writer.writeUInt8(0xea);
+        writer.writeUInt8(10);
+        writer.writeUInt8(8);
         writer.writeBigUInt64LE(0n);
         writer.writeBytes(Buffer.alloc(8));
-        const rawData = Buffer.from("some-raw-outlook-id-bytes", "utf-8");
+        const rawData = Buffer.from([0xff, 0xfe, 0x00, 0x81]); // binary, not valid UTF-8
         writer.writeUInt32LE(rawData.length);
         writer.writeBytes(rawData);
-        expect(decodeGlobalObjectId(new BufferReader(writer.toBuffer()))).toBe("some-raw-outlook-id-bytes");
+        const blob = writer.toBuffer();
+        const expected = Buffer.from(blob);
+        expected.fill(0, 16, 20);
+
+        expect(decodeGlobalObjectId(new BufferReader(blob))).toBe(expected.toString("hex").toUpperCase());
+        expect(decodeGlobalObjectId(new BufferReader(blob))).toMatch(/^040000008200E00074C5B7101A82E008000000000/);
+        expect(globalObjectIdInstanceDate(blob)).toBe("2026-10-08");
+        expect(globalObjectIdInstanceDate(expected)).toBeUndefined();
     });
 
     it("Round-trips a non-ASCII icalUid correctly via UTF-8 byte length (not string length).", () => {

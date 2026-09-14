@@ -48,7 +48,7 @@ describe("RopGetHierarchyTableHandler Tests", () => {
             entityUid: "folder:top1",
             rows: ["folder:child1", "folder:child2"],
             cursor: 0,
-            generation: 1,
+            generation: expect.any(String),
         });
         // The mailbox's folders are fetched with explicit paging and sort, not the repo's 100-row default.
         expect(folderRepo.find).toHaveBeenCalledWith(

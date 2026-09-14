@@ -142,17 +142,39 @@ describe("RopSetPropertiesHandler Tests", () => {
         expect(context.session.handles[5]?.draftProperties).toEqual({ "55": "Hi" });
     });
 
-    it("Throws if PropertyValueSize does not match the decoded PropertyValues length (malformed request).", () => {
+    it("Rejects a PropertyValueSize pointing past the request (the following ROPs can't be located).", () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: {} };
+        const malformed = buildRequest({ values: [{ propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Hi" }] });
+        // Corrupt PropertyValueSize (bytes 2-3, little-endian) to reach past the end of the request.
+        malformed.writeUInt16LE(9999, 2);
+
+        expect(() => new RopSetPropertiesHandler().handle(new BufferReader(malformed), new BufferWriter(), context)).toThrow(RangeError);
+    });
+
+    it("Fails just this ROP with MAPI_E_INVALID_PARAMETER, skipping to PropertyValueSize's end, when the values don't match it or can't be decoded.", () => {
         const context = makeContext();
         context.session.handles[5] = { type: "message", entityUid: "", draftProperties: {} };
         const handler = new RopSetPropertiesHandler();
-        const writer = new BufferWriter();
+        const request = buildRequest({ values: [{ propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Hi" }] });
 
-        const malformed = buildRequest({ values: [{ propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Hi" }] });
-        // Corrupt PropertyValueSize (bytes 2-3, little-endian) to no longer match the real encoded length.
-        malformed.writeUInt16LE(9999, 2);
+        // PropertyValueSize two bytes larger than the values, with those two bytes (then the next ROP's byte) present.
+        const tooLong = Buffer.concat([request, Buffer.from([0xaa, 0xbb, 0x01])]);
+        tooLong.writeUInt16LE(tooLong.readUInt16LE(2) + 2, 2);
+        const tooLongReader = new BufferReader(tooLong);
+        const tooLongWriter = new BufferWriter();
+        handler.handle(tooLongReader, tooLongWriter, context);
+        expect(tooLongWriter.toBuffer().readUInt32LE(2)).toBe(0x80070057);
+        expect(tooLongReader.readUInt8()).toBe(0x01);
 
-        expect(() => handler.handle(new BufferReader(malformed), writer, context)).toThrow(/PropertyValueSize/);
+        // An unsupported property type: its size is unknown, but PropertyValueSize still frames the ROP.
+        const unsupported = new BufferWriter().writeUInt8(0).writeUInt8(5).writeUInt16LE(2 + 4 + 3).writeUInt16LE(1).writeUInt16LE(0x0999).writeUInt16LE(0x0037).writeBytes(Buffer.from([1, 2, 3, 0x02])).toBuffer();
+        const unsupportedReader = new BufferReader(unsupported);
+        const unsupportedWriter = new BufferWriter();
+        handler.handle(unsupportedReader, unsupportedWriter, context);
+        expect(unsupportedWriter.toBuffer().readUInt32LE(2)).toBe(0x80070057);
+        expect(unsupportedReader.readUInt8()).toBe(0x02);
+        expect(context.session.handles[5].draftProperties).toEqual({});
     });
 
     describe("Calendar named-property tracking", () => {

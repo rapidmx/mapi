@@ -17,34 +17,38 @@ const ERROR_INVALID_OBJECT = 0x80070005;
  * size". */
 const BUFFER_SIZE_SERVER_DETERMINED = 0xbabe;
 
-/** The response's own `TransferBufferSize` field is a 16-bit count (`[MS-OXCFXICS]`'s own `RopFastTransferSourceGetBuffer`
- * response-buffer page), so a single call can never actually return more than this many bytes. For the
- * `0xBABE` "server-determined" sentinel this caps what would otherwise be "the entire remaining buffer in one
- * call" (only spec-valid when that buffer happens to fit in a `uint16`) down to the same paging behavior a
- * client-specified `BufferSize` already gets - `writeUInt16LE` throwing `RangeError` for an out-of-range value
- * is not spec-valid for any size of transfer. */
+/** The response's own `TransferBufferSize` field is a 16-bit count, so a single call never returns more than this. */
 const MAX_TRANSFER_BUFFER_SIZE = 0xffff;
 
-/** `TransferStatus` values (`[MS-OXCFXICS]` §2.2.3.1.1.5.2, confirmed this session) - only the two this
- * pragmatic subset (which never errors mid-transfer once a `"fastTransfer"` handle exists, and never returns
- * `NoRoom`) ever produces. */
+/** `MAPI_E_TOO_BIG`: rebuilding the stream passed `MAX_FAST_TRANSFER_BYTES`. */
+const ERROR_TOO_BIG = 0x80040305;
+
+/** `MAPI_E_CALL_FAILED`: the stream was lost part-way through paging and can't be continued - see
+ * `loadFastTransferBuffer`. The client starts the transfer again. */
+const ERROR_TRANSFER_LOST = 0x80004005;
+
+/** The response bytes before `TransferBuffer`: RopId, InputHandleIndex, ReturnValue, TransferStatus,
+ * InProgressCount, TotalStepCount, Reserved, TransferBufferSize. */
+const RESPONSE_HEADER_BYTES = 15;
+
+/** `TransferStatus` values (`[MS-OXCFXICS]` §2.2.3.1.1.5.2). */
 const TRANSFER_STATUS_PARTIAL = 0x0001;
+const TRANSFER_STATUS_NO_ROOM = 0x0002;
 const TRANSFER_STATUS_DONE = 0x0003;
 
 /**
  * `RopFastTransferSourceGetBuffer` (`[MS-OXCFXICS]`/`[MS-OXCROPS]`, RopId `0x4E`): pages the FastTransfer
  * stream a prior `RopFastTransferSourceCopyTo`/`CopyProperties` built (`FastTransferStream.ts`) out of its
- * `"fastTransfer"` handle, `BufferSize` bytes at a time (or the entire remaining buffer, capped to
- * `MAX_TRANSFER_BUFFER_SIZE`, for the `0xBABE` "server-determined" sentinel - `MaximumBufferSize`, present only
- * in that case, is decoded to advance the reader correctly but not honored, since honoring it would mean
- * returning *more* than one chunk can carry, not less). Reports `Done` once the whole buffer has been returned
- * across one or more calls, `Partial` otherwise - `NoRoom` and `Error` are never produced (a `"fastTransfer"`
- * handle, once created, always has a complete, already-valid buffer to page from).
+ * `"fastTransfer"` handle, `BufferSize` bytes at a time. For the `0xBABE` "server-determined" sentinel the server
+ * picks the size, up to the client's `MaximumBufferSize`.
  *
- * `BackoffTime` is never emitted (this pragmatic subset never returns the one `ReturnValue` that field is
- * conditional on), and the failure path (`ERROR_INVALID_OBJECT`) omits every field after `ReturnValue` entirely
- * - the same "just the fixed header, no success-only tail" shape every other failing handler in this pragmatic
- * subset already uses, not a specific claim about the real spec's own error-path byte layout.
+ * Every chunk is also held to the room left in this request's ROP output buffer (`context.ropOutputRemaining`) and
+ * the 16-bit `TransferBufferSize`. Reports `Done` once the whole stream has been returned, `Partial` otherwise, and
+ * `NoRoom` when the output buffer has no space for any bytes this time (the client asks again in a new request).
+ *
+ * Fails with `MAPI_E_TOO_BIG` when a stream that had to be rebuilt is too large, and with `MAPI_E_CALL_FAILED` when
+ * the stream was lost part-way through (see `loadFastTransferBuffer`) - never with bytes from a different stream.
+ * Failure responses carry only `ReturnValue`, like every other failing handler here. `BackoffTime` is never emitted.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -55,31 +59,30 @@ export class RopFastTransferSourceGetBufferHandler implements RopHandler {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session
         const inputHandleIndex: number = reader.readUInt8();
         const bufferSize: number = reader.readUInt16LE();
-        if (bufferSize === BUFFER_SIZE_SERVER_DETERMINED) {
-            reader.readUInt16LE(); // MaximumBufferSize - see class doc comment
-        }
+        const requestedSize = bufferSize === BUFFER_SIZE_SERVER_DETERMINED ? reader.readUInt16LE() : bufferSize;
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || handle.type !== "fastTransfer") {
+        const loaded = handle?.type === "fastTransfer" ? await loadFastTransferBuffer(context, inputHandleIndex, handle) : undefined;
+        if (!loaded || typeof loaded === "string") {
             writer.writeUInt8(ROP_ID_GET_BUFFER);
             writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
+            writer.writeUInt32LE(!loaded ? ERROR_INVALID_OBJECT : loaded === "tooBig" ? ERROR_TOO_BIG : ERROR_TRANSFER_LOST);
             return;
         }
 
-        const fullBuffer = await loadFastTransferBuffer(context, inputHandleIndex, handle);
         const position = handle.transferPosition ?? 0;
-        const remaining = fullBuffer.length - position;
-        const requestedSize = bufferSize === BUFFER_SIZE_SERVER_DETERMINED ? remaining : bufferSize;
-        const chunkSize = Math.min(requestedSize, remaining, MAX_TRANSFER_BUFFER_SIZE);
-        const chunk = fullBuffer.subarray(position, position + chunkSize);
+        const remaining = loaded.length - position;
+        const room = Math.max(0, (context.ropOutputRemaining ?? Infinity) - RESPONSE_HEADER_BYTES);
+        const chunkSize = Math.min(requestedSize, remaining, MAX_TRANSFER_BUFFER_SIZE, room);
+        const chunk = loaded.subarray(position, position + chunkSize);
         handle.transferPosition = position + chunk.length;
-        const done = handle.transferPosition >= fullBuffer.length;
+        const done = position + chunk.length >= loaded.length;
+        const status = done ? TRANSFER_STATUS_DONE : room === 0 ? TRANSFER_STATUS_NO_ROOM : TRANSFER_STATUS_PARTIAL;
 
         writer.writeUInt8(ROP_ID_GET_BUFFER);
         writer.writeUInt8(inputHandleIndex);
         writer.writeUInt32LE(0); // ReturnValue - success
-        writer.writeUInt16LE(done ? TRANSFER_STATUS_DONE : TRANSFER_STATUS_PARTIAL);
+        writer.writeUInt16LE(status);
         writer.writeUInt16LE(0); // InProgressCount - no real progress tracking in this pragmatic subset
         writer.writeUInt16LE(1); // TotalStepCount - pragmatic constant, only ever used for progress-bar display
         writer.writeUInt8(0); // Reserved

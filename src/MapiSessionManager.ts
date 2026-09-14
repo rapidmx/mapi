@@ -2,9 +2,10 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { DatabaseDecorators, SimpleEntity } from "@rapidrest/service-core";
-import { handleDataCache, handleDataKey } from "./rop/HandleDataCache.js";
+import { handleDataCache, handleDataKey, MemoryHandleDataStore, RedisHandleDataStore, type HandleDataStore } from "./rop/HandleDataCache.js";
 const { Init } = ObjectDecorators;
 const { Redis } = DatabaseDecorators;
 
@@ -17,6 +18,15 @@ export const MAX_SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
 /** The most sessions one user may hold at once. `Connect` past this ends that user's oldest session. */
 export const MAX_SESSIONS_PER_USER = 20;
+
+/** The largest a serialized session may grow. Everything that grows with use is capped on its own (handles by their
+ * one-byte index, named properties, MIDs; write streams live outside the session); this is the backstop, and a save
+ * past it fails with `MAPI_E_TOO_BIG` rather than storing megabytes every later request has to load. */
+export const MAX_SESSION_BYTES = 4 * 1024 * 1024;
+
+/** How long an `Execute` holds its session's lock. Longer than any request should take; a crashed pod's lock simply
+ * expires. The session save is still compare-and-set, so an expired lock can't corrupt state. */
+export const SESSION_LOCK_TTL_MS = 120 * 1000;
 
 /** Tags what a ROP-assigned integer handle (the `ServerObjectHandleTable` index space) refers to.
  * `entityUid` for a `"folder"` handle is one of `session.folderIds`' own value strings (`"virtual:<name>"` or
@@ -32,7 +42,8 @@ export const MAX_SESSIONS_PER_USER = 20;
  * `PidTagBody`/`PtypString`, see `MessageBodyStream.ts`), and `streamPosition` how many bytes `RopReadStream` has
  * already returned. A read stream's decoded body lives in `HandleDataCache`, not here. A write stream (opened
  * `ReadWrite`/`Create` against a `RopCreateMessage` draft's `PidTagBody`) records the draft it belongs to in
- * `writeTargetHandleIndex`/`writeTargetGeneration`, and its accumulated bytes in `writeBufferBase64`/`writeSize`.
+ * `writeTargetHandleIndex`/`writeTargetGeneration`, and how many bytes have been written in `writeSize`. The bytes
+ * themselves are chunks in the `HandleDataStore` (see `RopWriteStreamHandler`), not session state.
  *
  * A `"message"` handle from `RopCreateMessage` (a draft not yet `RopSaveChangesMessage`d) has `entityUid: ""`
  * and instead carries `draftFolderUid` (the folder it will belong to) and `draftProperties` (the small,
@@ -45,12 +56,13 @@ export const MAX_SESSIONS_PER_USER = 20;
  * needed to rebuild its stream (`transferSourceType`, `transferColumns`/`transferExcludeIds`) plus the paging
  * cursor `transferPosition`; the built stream itself lives in `HandleDataCache`.
  *
- * `generation` is unique per assignment within a session (see `assignHandle`), so data keyed by handle index can
- * tell a handle apart from a later one that reuses the same index. */
+ * `generation` is a random nonce per assignment (see `assignHandle`), so data keyed by handle index can tell a handle
+ * apart from a later one that reuses the same index - including one assigned by a request whose session changes were
+ * never saved, which a per-session counter would hand out again. */
 export interface MapiObjectHandle {
     type: "logon" | "folder" | "message" | "table" | "stream" | "fastTransfer";
     entityUid: string;
-    generation?: number;
+    generation?: string;
     rows?: string[];
     contentsKind?: "message" | "calendarEvent" | "contact" | "task";
     columns?: { propertyId: number; propertyType: number }[];
@@ -61,8 +73,7 @@ export interface MapiObjectHandle {
     draftFolderUid?: string;
     draftProperties?: Record<string, string>;
     writeTargetHandleIndex?: number;
-    writeTargetGeneration?: number;
-    writeBufferBase64?: string;
+    writeTargetGeneration?: string;
     writeSize?: number;
     transferSourceType?: "folder" | "message";
     transferColumns?: { propertyId: number; propertyType: number }[];
@@ -85,7 +96,6 @@ export class MapiSessionContext extends SimpleEntity {
     public version = 0;
     public handles: Record<number, MapiObjectHandle> = {};
     public nextHandleIndex = 1;
-    public nextHandleGeneration = 1;
     public createdAt: string = new Date().toISOString();
     /** This session's FID assignments for the 13 `RopLogon` special folders, keyed by FID (decimal string),
      * valued `"virtual:<name>"` or `"folder:<uid>"` - see `RopLogonHandler`'s own doc comment. Populated by
@@ -107,6 +117,9 @@ export class MapiSessionContext extends SimpleEntity {
     /** The reverse of `messageIds` (target -> MID) plus a monotonic counter. */
     public messageTargetIds: Record<string, number> = {};
     public nextMessageId = 1;
+    /** The oldest MID still mapped. Past `MAX_MESSAGE_IDS` mapped MIDs the oldest are dropped - see
+     * `MessageTarget.assignOrGetMid`. */
+    public firstMessageId = 1;
 
     /** This session's `RopGetPropertyIdsFromNames` mapping table (`[MS-OXCPRPT]` §2.2.12), keyed by a JSON
      * string encoding of the `{guid, kind, lid|name}` `PropertyName` the numeric ID was assigned to - see
@@ -130,7 +143,7 @@ export class MapiSessionContext extends SimpleEntity {
  */
 export function assignHandle(session: MapiSessionContext, index: number, handle: MapiObjectHandle): MapiObjectHandle {
     releaseHandle(session, index);
-    handle.generation = session.nextHandleGeneration++;
+    handle.generation = crypto.randomUUID();
     session.handles[index] = handle;
     return handle;
 }
@@ -155,26 +168,79 @@ export function releaseHandle(session: MapiSessionContext, index: number): void 
 }
 
 /** The outcome of `MapiSessionManager.save()`. `"conflict"` means another request saved the session first;
- * `"missing"` that it expired or was ended. */
-export type SessionSaveResult = "saved" | "conflict" | "missing";
+ * `"missing"` that it expired or was ended; `"tooBig"` that it grew past `MAX_SESSION_BYTES` and was not saved. */
+export type SessionSaveResult = "saved" | "conflict" | "missing" | "tooBig";
 
-/** The storage a `MapiSessionManager` runs on: Redis when a `cache` datastore is configured, otherwise memory. */
+/**
+ * The storage a `MapiSessionManager` runs on: Redis when a `cache` datastore is configured, otherwise memory.
+ *
+ * A session is two entries: its JSON (`sessionKey`) and its version (`<sessionKey>.version`). A save compares the
+ * version entry only, so Redis never has to parse the session JSON.
+ */
 export interface MapiSessionStore {
     get(key: string): Promise<string | undefined>;
-    exists(key: string): Promise<boolean>;
-    put(key: string, value: string, ttlSeconds: number): Promise<void>;
-    compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<SessionSaveResult>;
+    create(key: string, value: string, ttlSeconds: number): Promise<void>;
+    compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<"saved" | "conflict" | "missing">;
     delete(key: string): Promise<void>;
+    /** Atomically records `sessionId` in the user's index (ordered by `createdAtMs`): drops ids whose session is gone,
+     * ends the oldest sessions until fewer than `max` remain, then adds it. Returns the ids it ended. */
+    addToUserIndex(indexKey: string, sessionId: string, createdAtMs: number, max: number, ttlSeconds: number): Promise<string[]>;
+    /** `SET NX` with a TTL: `true` when the lock was free and is now held with `token`. */
+    acquireLock(key: string, token: string, ttlMs: number): Promise<boolean>;
+    /** Releases the lock only if it is still held with `token`. */
+    releaseLock(key: string, token: string): Promise<void>;
+    getValue(key: string): Promise<string | undefined>;
+    putValue(key: string, value: string, ttlSeconds: number): Promise<void>;
 }
 
-/** Atomically replaces the session only when its stored `version` still equals the expected one. Returns 1 when
- * saved, 0 on a version mismatch and -1 when the key no longer exists. */
-const COMPARE_AND_SET_SCRIPT = `
-local current = redis.call('GET', KEYS[1])
-if not current then return -1 end
-local ok, decoded = pcall(cjson.decode, current)
-if not ok or tonumber(decoded['version']) ~= tonumber(ARGV[1]) then return 0 end
+/** Creates a session at version 0. KEYS: session, version. ARGV: json, ttl. */
+export const CREATE_SCRIPT = `
+redis.call('SETEX', KEYS[1], ARGV[2], ARGV[1])
+redis.call('SETEX', KEYS[2], ARGV[2], '0')
+return 1
+`;
+
+/** Replaces the session only when its version entry still equals the expected one, without decoding the session.
+ * KEYS: session, version. ARGV: expected version, json, ttl. Returns 1 saved, 0 on a version mismatch, -1 when gone. */
+export const COMPARE_AND_SET_SCRIPT = `
+local current = redis.call('GET', KEYS[2])
+if not current or redis.call('EXISTS', KEYS[1]) == 0 then return -1 end
+if tonumber(current) ~= tonumber(ARGV[1]) then return 0 end
 redis.call('SETEX', KEYS[1], ARGV[3], ARGV[2])
+redis.call('SETEX', KEYS[2], ARGV[3], tostring(tonumber(ARGV[1]) + 1))
+return 1
+`;
+
+/** Adds a session to its user's sorted-set index in one step, so concurrent Connects can't each see room under the
+ * cap. KEYS: index. ARGV: session id, created-at score, max, index ttl, session key prefix, session key suffix. The
+ * session keys it checks and deletes are built from the ids, so they aren't declared in KEYS (fine on one Redis node,
+ * not on a cluster). Returns the ids it ended. */
+export const ADD_TO_USER_INDEX_SCRIPT = `
+local function sessionKey(id) return ARGV[5] .. id .. ARGV[6] end
+for _, id in ipairs(redis.call('ZRANGE', KEYS[1], 0, -1)) do
+  if redis.call('EXISTS', sessionKey(id)) == 0 then redis.call('ZREM', KEYS[1], id) end
+end
+local ended = {}
+while redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) do
+  local oldest = redis.call('ZRANGE', KEYS[1], 0, 0)[1]
+  redis.call('ZREM', KEYS[1], oldest)
+  redis.call('DEL', sessionKey(oldest), sessionKey(oldest) .. '.version')
+  table.insert(ended, oldest)
+end
+redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
+redis.call('EXPIRE', KEYS[1], ARGV[4])
+return ended
+`;
+
+/** KEYS: lock. ARGV: token, ttl ms. Returns 1 when acquired. */
+export const ACQUIRE_LOCK_SCRIPT = `
+if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then return 1 end
+return 0
+`;
+
+/** KEYS: lock. ARGV: token. Deletes the lock only while this token still holds it. */
+export const RELEASE_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
 return 1
 `;
 
@@ -187,32 +253,127 @@ export class RedisMapiSessionStore implements MapiSessionStore {
         return (await this.client.get(key)) ?? undefined;
     }
 
-    public async exists(key: string): Promise<boolean> {
-        return (await this.client.exists(key)) > 0;
+    public async create(key: string, value: string, ttlSeconds: number): Promise<void> {
+        await this.client.eval(CREATE_SCRIPT, { keys: [key, versionKey(key)], arguments: [value, String(ttlSeconds)] });
     }
 
-    public async put(key: string, value: string, ttlSeconds: number): Promise<void> {
-        await this.client.setEx(key, ttlSeconds, value);
-    }
-
-    public async compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<SessionSaveResult> {
+    public async compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<"saved" | "conflict" | "missing"> {
         const result = Number(
-            await this.client.eval(COMPARE_AND_SET_SCRIPT, { keys: [key], arguments: [String(expectedVersion), value, String(ttlSeconds)] }),
+            await this.client.eval(COMPARE_AND_SET_SCRIPT, {
+                keys: [key, versionKey(key)],
+                arguments: [String(expectedVersion), value, String(ttlSeconds)],
+            }),
         );
         return result === 1 ? "saved" : result === 0 ? "conflict" : "missing";
     }
 
     public async delete(key: string): Promise<void> {
-        await this.client.del(key);
+        await this.client.del([key, versionKey(key)]);
+    }
+
+    public async addToUserIndex(indexKey: string, sessionId: string, createdAtMs: number, max: number, ttlSeconds: number): Promise<string[]> {
+        const ended: unknown[] = await this.client.eval(ADD_TO_USER_INDEX_SCRIPT, {
+            keys: [indexKey],
+            arguments: [sessionId, String(createdAtMs), String(max), String(ttlSeconds), SESSION_KEY_PREFIX, SESSION_KEY_SUFFIX],
+        });
+        return ended.map(String);
+    }
+
+    public async acquireLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+        return Number(await this.client.eval(ACQUIRE_LOCK_SCRIPT, { keys: [key], arguments: [token, String(ttlMs)] })) === 1;
+    }
+
+    public async releaseLock(key: string, token: string): Promise<void> {
+        await this.client.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [token] });
+    }
+
+    public async getValue(key: string): Promise<string | undefined> {
+        return (await this.client.get(key)) ?? undefined;
+    }
+
+    public async putValue(key: string, value: string, ttlSeconds: number): Promise<void> {
+        await this.client.setEx(key, ttlSeconds, value);
     }
 }
 
-/** A single-process `MapiSessionStore`. Values are stored as JSON strings so every load hands out an independent
- * copy, exactly like the Redis store. */
+/** A single-process `MapiSessionStore`. Values are stored as strings so every load hands out an independent copy,
+ * exactly like the Redis store. No method awaits between reading and writing, so each one is atomic. */
 export class MemoryMapiSessionStore implements MapiSessionStore {
     private readonly entries = new Map<string, { value: string; expiresAt: number }>();
+    private readonly indexes = new Map<string, Map<string, number>>();
 
     public async get(key: string): Promise<string | undefined> {
+        return this.read(key);
+    }
+
+    public async create(key: string, value: string, ttlSeconds: number): Promise<void> {
+        this.sweep();
+        this.write(key, value, ttlSeconds);
+        this.write(versionKey(key), "0", ttlSeconds);
+    }
+
+    public async compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<"saved" | "conflict" | "missing"> {
+        const version = this.read(versionKey(key));
+        if (version === undefined || this.read(key) === undefined) {
+            return "missing";
+        }
+        if (Number(version) !== expectedVersion) {
+            return "conflict";
+        }
+        this.write(key, value, ttlSeconds);
+        this.write(versionKey(key), String(expectedVersion + 1), ttlSeconds);
+        return "saved";
+    }
+
+    public async delete(key: string): Promise<void> {
+        this.entries.delete(key);
+        this.entries.delete(versionKey(key));
+    }
+
+    public async addToUserIndex(indexKey: string, sessionId: string, createdAtMs: number, max: number): Promise<string[]> {
+        const members = this.indexes.get(indexKey) ?? new Map<string, number>();
+        this.indexes.set(indexKey, members);
+        for (const id of [...members.keys()]) {
+            if (this.read(SESSION_KEY_PREFIX + id + SESSION_KEY_SUFFIX) === undefined) {
+                members.delete(id);
+            }
+        }
+        const oldestFirst = [...members.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id);
+        const ended: string[] = [];
+        while (members.size >= max) {
+            const oldest = oldestFirst.shift()!;
+            members.delete(oldest);
+            this.entries.delete(SESSION_KEY_PREFIX + oldest + SESSION_KEY_SUFFIX);
+            this.entries.delete(versionKey(SESSION_KEY_PREFIX + oldest + SESSION_KEY_SUFFIX));
+            ended.push(oldest);
+        }
+        members.set(sessionId, createdAtMs);
+        return ended;
+    }
+
+    public async acquireLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+        if (this.read(key) !== undefined) {
+            return false;
+        }
+        this.entries.set(key, { value: token, expiresAt: Date.now() + ttlMs });
+        return true;
+    }
+
+    public async releaseLock(key: string, token: string): Promise<void> {
+        if (this.read(key) === token) {
+            this.entries.delete(key);
+        }
+    }
+
+    public async getValue(key: string): Promise<string | undefined> {
+        return this.read(key);
+    }
+
+    public async putValue(key: string, value: string, ttlSeconds: number): Promise<void> {
+        this.write(key, value, ttlSeconds);
+    }
+
+    private read(key: string): string | undefined {
         const entry = this.entries.get(key);
         if (entry && entry.expiresAt <= Date.now()) {
             this.entries.delete(key);
@@ -221,30 +382,8 @@ export class MemoryMapiSessionStore implements MapiSessionStore {
         return entry?.value;
     }
 
-    public async exists(key: string): Promise<boolean> {
-        return (await this.get(key)) !== undefined;
-    }
-
-    public async put(key: string, value: string, ttlSeconds: number): Promise<void> {
-        this.sweep();
+    private write(key: string, value: string, ttlSeconds: number): void {
         this.entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
-    }
-
-    public async compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<SessionSaveResult> {
-        // No await between the read and the write, so no other request can interleave.
-        const entry = this.entries.get(key);
-        if (!entry || entry.expiresAt <= Date.now()) {
-            return "missing";
-        }
-        if (JSON.parse(entry.value).version !== expectedVersion) {
-            return "conflict";
-        }
-        this.entries.set(key, { value, expiresAt: Date.now() + ttlSeconds * 1000 });
-        return "saved";
-    }
-
-    public async delete(key: string): Promise<void> {
-        this.entries.delete(key);
     }
 
     private sweep(): void {
@@ -257,8 +396,17 @@ export class MemoryMapiSessionStore implements MapiSessionStore {
     }
 }
 
-function sessionKey(sessionId: string): string {
-    return `mapi.session.${encodeURIComponent(sessionId)}`;
+// A session's keys put its id in a hash tag, so its JSON, version, lock and last response share one cluster slot.
+const SESSION_KEY_PREFIX = "mapi.session.{";
+const SESSION_KEY_SUFFIX = "}";
+
+/** The store key of a session's JSON. */
+export function sessionKey(sessionId: string): string {
+    return SESSION_KEY_PREFIX + encodeURIComponent(sessionId) + SESSION_KEY_SUFFIX;
+}
+
+function versionKey(key: string): string {
+    return `${key}.version`;
 }
 
 function userIndexKey(userUid: string): string {
@@ -273,7 +421,9 @@ function userIndexKey(userUid: string): string {
  * `RedisCache`, whose per-process copy served a session without checking Redis, so with several replicas one pod
  * could run ROPs against handles another pod had already changed. Saves are compare-and-set on `version`: when
  * two requests on the same session overlap, the second save reports `"conflict"` instead of overwriting the
- * first request's handles.
+ * first request's handles. `Execute` also holds the session's lock (`acquireLock`) while it runs, so an overlapping
+ * request is turned away before it has any side effects, and keeps its last response (`storeResponse`) so a retry of
+ * the same request is answered again instead of being run twice.
  */
 export class MapiSessionManager {
     @Redis("cache", false)
@@ -281,30 +431,28 @@ export class MapiSessionManager {
 
     private store?: MapiSessionStore;
 
+    /** Where handlers keep FastTransfer streams and write-stream chunks: in Redis next to the sessions when configured,
+     * so any replica can continue a transfer. */
+    public handleDataStore?: HandleDataStore;
+
     @Init
     public init(): void {
         this.store = this.redisClient ? new RedisMapiSessionStore(this.redisClient) : new MemoryMapiSessionStore();
+        this.handleDataStore = this.redisClient ? new RedisHandleDataStore(this.redisClient) : new MemoryHandleDataStore();
     }
 
     /** Creates a session for `userUid`, ending that user's oldest sessions if they already hold
      * `MAX_SESSIONS_PER_USER`. */
     public async create(mailboxUid: string, userUid: string): Promise<MapiSessionContext> {
         const context = new MapiSessionContext({ mailboxUid, userUid });
-        await this.store!.put(sessionKey(context.uid), JSON.stringify(context), SESSION_TTL_SECONDS);
-
-        const indexKey = userIndexKey(userUid);
-        const indexed: string[] = JSON.parse((await this.store!.get(indexKey)) ?? "[]");
-        const live: string[] = [];
-        for (const id of indexed) {
-            if (await this.store!.exists(sessionKey(id))) {
-                live.push(id);
-            }
-        }
-        while (live.length >= MAX_SESSIONS_PER_USER) {
-            await this.destroy(live.shift()!);
-        }
-        live.push(context.uid);
-        await this.store!.put(indexKey, JSON.stringify(live), MAX_SESSION_LIFETIME_MS / 1000);
+        await this.store!.create(sessionKey(context.uid), JSON.stringify(context), SESSION_TTL_SECONDS);
+        await this.store!.addToUserIndex(
+            userIndexKey(userUid),
+            encodeURIComponent(context.uid),
+            Date.now(),
+            MAX_SESSIONS_PER_USER,
+            MAX_SESSION_LIFETIME_MS / 1000,
+        );
         return context;
     }
 
@@ -323,11 +471,16 @@ export class MapiSessionManager {
         return session;
     }
 
-    /** Saves `context` only if nobody else saved it since it was loaded, bumping its `version` on success. */
+    /** Saves `context` only if nobody else saved it since it was loaded and it is within `MAX_SESSION_BYTES`,
+     * bumping its `version` on success. */
     public async save(context: MapiSessionContext): Promise<SessionSaveResult> {
         const expected = context.version;
         context.version = expected + 1;
-        const result = await this.store!.compareAndSet(sessionKey(context.uid), expected, JSON.stringify(context), SESSION_TTL_SECONDS);
+        const json = JSON.stringify(context);
+        const result: SessionSaveResult =
+            Buffer.byteLength(json) > MAX_SESSION_BYTES
+                ? "tooBig"
+                : await this.store!.compareAndSet(sessionKey(context.uid), expected, json, SESSION_TTL_SECONDS);
         if (result !== "saved") {
             context.version = expected;
         }
@@ -336,5 +489,28 @@ export class MapiSessionManager {
 
     public async destroy(sessionId: string): Promise<void> {
         await this.store!.delete(sessionKey(sessionId));
+    }
+
+    /** Takes the session's `Execute` lock. Returns the token to release it with, or `undefined` while another
+     * request holds it. */
+    public async acquireLock(sessionId: string): Promise<string | undefined> {
+        const token = crypto.randomUUID();
+        return (await this.store!.acquireLock(`${sessionKey(sessionId)}.lock`, token, SESSION_LOCK_TTL_MS)) ? token : undefined;
+    }
+
+    public async releaseLock(sessionId: string, token: string): Promise<void> {
+        await this.store!.releaseLock(`${sessionKey(sessionId)}.lock`, token);
+    }
+
+    /** The response last sent on this session, if it answered `requestId`. */
+    public async storedResponse(sessionId: string, requestId: string): Promise<Buffer | undefined> {
+        const json = await this.store!.getValue(`${sessionKey(sessionId)}.last`);
+        const stored: { requestId: string; body: string } | undefined = json ? JSON.parse(json) : undefined;
+        return stored?.requestId === requestId ? Buffer.from(stored.body, "base64") : undefined;
+    }
+
+    /** Remembers `body` as this session's answer to `requestId`. Only the latest request is kept. */
+    public async storeResponse(sessionId: string, requestId: string, body: Buffer): Promise<void> {
+        await this.store!.putValue(`${sessionKey(sessionId)}.last`, JSON.stringify({ requestId, body: body.toString("base64") }), SESSION_TTL_SECONDS);
     }
 }

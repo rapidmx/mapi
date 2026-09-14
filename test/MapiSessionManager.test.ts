@@ -3,51 +3,21 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import {
+    ACQUIRE_LOCK_SCRIPT,
+    COMPARE_AND_SET_SCRIPT,
+    MapiSessionContext,
     MapiSessionManager,
+    MAX_SESSION_BYTES,
     MAX_SESSION_LIFETIME_MS,
     MAX_SESSIONS_PER_USER,
     MemoryMapiSessionStore,
     RedisMapiSessionStore,
+    SESSION_LOCK_TTL_MS,
     SESSION_TTL_SECONDS,
+    sessionKey,
 } from "../src/MapiSessionManager.js";
-
-/** A node-redis stand-in holding values in a Map. `eval` applies the compare-and-set script's semantics (the only
- * script the store runs), so the store's handling of each result can be exercised without a Redis server. */
-class FakeRedisClient {
-    public readonly values = new Map<string, string>();
-    public readonly ttls = new Map<string, number>();
-    public readonly eval = vi.fn(async (_script: string, options: { keys: string[]; arguments: string[] }) => {
-        const [key] = options.keys;
-        const [expectedVersion, value, ttl] = options.arguments;
-        const current = this.values.get(key);
-        if (current === undefined) {
-            return -1;
-        }
-        if (Number(JSON.parse(current).version) !== Number(expectedVersion)) {
-            return 0;
-        }
-        this.values.set(key, value);
-        this.ttls.set(key, Number(ttl));
-        return 1;
-    });
-
-    public async get(key: string): Promise<string | null> {
-        return this.values.get(key) ?? null;
-    }
-
-    public async exists(key: string): Promise<number> {
-        return this.values.has(key) ? 1 : 0;
-    }
-
-    public async setEx(key: string, ttl: number, value: string): Promise<void> {
-        this.values.set(key, value);
-        this.ttls.set(key, ttl);
-    }
-
-    public async del(key: string): Promise<void> {
-        this.values.delete(key);
-    }
-}
+import { MemoryHandleDataStore, RedisHandleDataStore } from "../src/rop/HandleDataCache.js";
+import { FakeRedisClient } from "./fakeRedis.js";
 
 function memoryManager(): MapiSessionManager {
     const manager = new MapiSessionManager();
@@ -104,6 +74,17 @@ describe("MapiSessionManager Tests", () => {
             expect(await manager.save(stored)).toBe("saved");
         });
 
+        it("Compares the separate version entry, not the version inside the session JSON.", async () => {
+            const { manager } = build();
+            const created = await manager.create("mailbox-1", "user-1");
+            const loaded = (await manager.load(created.uid))!;
+            // A client can't forge its way past a conflict by carrying a different version in the JSON it saves.
+            loaded.version = 5;
+            expect(await manager.save(loaded)).toBe("conflict");
+            loaded.version = 0;
+            expect(await manager.save(loaded)).toBe("saved");
+        });
+
         it("Reports a save of a destroyed session as missing instead of recreating it.", async () => {
             const { manager } = build();
             const created = await manager.create("mailbox-1", "user-1");
@@ -112,6 +93,17 @@ describe("MapiSessionManager Tests", () => {
 
             expect(await manager.save(loaded)).toBe("missing");
             expect(await manager.load(created.uid)).toBeUndefined();
+        });
+
+        it("Refuses to save a session larger than MAX_SESSION_BYTES, keeping the stored one.", async () => {
+            const { manager } = build();
+            const created = await manager.create("mailbox-1", "user-1");
+            const loaded = (await manager.load(created.uid))!;
+            loaded.handles[1] = { type: "table", entityUid: "folder:x", rows: ["x".repeat(MAX_SESSION_BYTES)] };
+
+            expect(await manager.save(loaded)).toBe("tooBig");
+            expect(loaded.version).toBe(0);
+            expect((await manager.load(created.uid))!.handles[1]).toBeUndefined();
         });
 
         it("Ends a session older than MAX_SESSION_LIFETIME_MS on load, however recently it was used.", async () => {
@@ -145,6 +137,45 @@ describe("MapiSessionManager Tests", () => {
             expect(await manager.load(overLimit.uid)).toBeDefined();
             expect(await manager.load(other.uid)).toBeDefined();
         });
+
+        it("Keeps the per-user cap when many Connects run concurrently.", async () => {
+            const { manager } = build();
+            const created = await Promise.all(Array.from({ length: MAX_SESSIONS_PER_USER * 2 }, () => manager.create("mailbox-1", "user-1")));
+
+            const live = (await Promise.all(created.map((session) => manager.load(session.uid)))).filter(Boolean);
+            expect(live).toHaveLength(MAX_SESSIONS_PER_USER);
+        });
+
+        it("Lets one request at a time hold a session's lock, released only by its own token.", async () => {
+            const { manager } = build();
+            const token = await manager.acquireLock("session-1");
+            expect(token).toEqual(expect.any(String));
+            expect(await manager.acquireLock("session-1")).toBeUndefined();
+            expect(await manager.acquireLock("session-2")).toBeDefined();
+
+            await manager.releaseLock("session-1", "someone-else");
+            expect(await manager.acquireLock("session-1")).toBeUndefined();
+            await manager.releaseLock("session-1", token);
+            expect(await manager.acquireLock("session-1")).toBeDefined();
+        });
+
+        it("Remembers the last response for its X-RequestId only.", async () => {
+            const { manager } = build();
+            expect(await manager.storedResponse("session-1", "req-1")).toBeUndefined();
+
+            await manager.storeResponse("session-1", "req-1", Buffer.from([1, 2, 3]));
+            expect(await manager.storedResponse("session-1", "req-1")).toEqual(Buffer.from([1, 2, 3]));
+            expect(await manager.storedResponse("session-1", "req-2")).toBeUndefined();
+            expect(await manager.storedResponse("session-2", "req-1")).toBeUndefined();
+
+            await manager.storeResponse("session-1", "req-2", Buffer.from([4]));
+            expect(await manager.storedResponse("session-1", "req-1")).toBeUndefined();
+        });
+    });
+
+    it("Uses shared handle data storage on Redis, and process memory otherwise.", () => {
+        expect(memoryManager().handleDataStore).toBeInstanceOf(MemoryHandleDataStore);
+        expect(redisManager(new FakeRedisClient()).handleDataStore).toBeInstanceOf(RedisHandleDataStore);
     });
 
     it("Redis store: never serves a stale per-process copy - a change saved through another replica is seen on the next load.", async () => {
@@ -161,7 +192,7 @@ describe("MapiSessionManager Tests", () => {
         expect((await podA.load(created.uid))!.handles[3]).toEqual({ type: "folder", entityUid: "folder:x" });
     });
 
-    it("Redis store: saves through the compare-and-set script with the session TTL.", async () => {
+    it("Redis store: saves through the compare-and-set script against the version key, with the session TTL.", async () => {
         const client = new FakeRedisClient();
         const manager = redisManager(client);
         const created = await manager.create("mailbox-1", "user-1");
@@ -169,32 +200,50 @@ describe("MapiSessionManager Tests", () => {
 
         await manager.save(loaded);
 
-        expect(client.eval).toHaveBeenCalledWith(expect.stringContaining("SETEX"), {
-            keys: [`mapi.session.${created.uid}`],
+        const key = `mapi.session.{${created.uid}}`;
+        expect(sessionKey(created.uid)).toBe(key);
+        expect(client.eval).toHaveBeenCalledWith(COMPARE_AND_SET_SCRIPT, {
+            keys: [key, `${key}.version`],
             arguments: ["0", expect.any(String), String(SESSION_TTL_SECONDS)],
         });
-        expect(client.ttls.get(`mapi.session.${created.uid}`)).toBe(SESSION_TTL_SECONDS);
+        expect(COMPARE_AND_SET_SCRIPT).not.toContain("cjson");
+        expect(client.ttls.get(key)).toBe(SESSION_TTL_SECONDS);
+        expect(client.values.get(`${key}.version`)).toBe("1");
     });
 
-    it("RedisMapiSessionStore maps a missing key to undefined/false.", async () => {
+    it("Redis store: takes the lock with SET NX and a TTL.", async () => {
+        const client = new FakeRedisClient();
+        await redisManager(client).acquireLock("s1");
+        expect(client.eval).toHaveBeenCalledWith(ACQUIRE_LOCK_SCRIPT, { keys: ["mapi.session.{s1}.lock"], arguments: [expect.any(String), String(SESSION_LOCK_TTL_MS)] });
+    });
+
+    it("RedisMapiSessionStore maps a missing key to undefined.", async () => {
         const store = new RedisMapiSessionStore(new FakeRedisClient());
         expect(await store.get("nope")).toBeUndefined();
-        expect(await store.exists("nope")).toBe(false);
+        expect(await store.getValue("nope")).toBeUndefined();
     });
 
-    it("MemoryMapiSessionStore expires entries after their TTL, for reads, saves and later writes.", async () => {
+    it("MemoryMapiSessionStore expires entries after their TTL, for reads, saves, locks and later writes.", async () => {
         vi.useFakeTimers();
         const store = new MemoryMapiSessionStore();
-        await store.put("a", JSON.stringify({ version: 0 }), 1);
-        await store.put("b", JSON.stringify({ version: 0 }), 1);
-        expect(await store.exists("a")).toBe(true);
+        await store.create("a", JSON.stringify({ version: 0 }), 1);
+        await store.create("b", JSON.stringify({ version: 0 }), 1);
+        expect(await store.acquireLock("lock", "t", 500)).toBe(true);
+        expect(await store.get("a")).toBeDefined();
 
         vi.advanceTimersByTime(1001);
 
         expect(await store.get("a")).toBeUndefined();
         expect(await store.compareAndSet("b", 0, "{}", 1)).toBe("missing");
-        await store.put("c", "{}", 10); // sweeps the expired "b"
-        expect(await store.exists("b")).toBe(false);
-        expect(await store.exists("c")).toBe(true);
+        expect(await store.acquireLock("lock", "t2", 500)).toBe(true);
+        await store.create("c", "{}", 10); // sweeps the expired "b"
+        expect((store as any).entries.has("b")).toBe(false);
+        expect(await store.get("c")).toBe("{}");
+    });
+
+    it("MapiSessionContext starts MIDs and handles at 1.", () => {
+        const session = new MapiSessionContext({ mailboxUid: "m", userUid: "u" });
+        expect(session.firstMessageId).toBe(1);
+        expect(session.nextMessageId).toBe(1);
     });
 });

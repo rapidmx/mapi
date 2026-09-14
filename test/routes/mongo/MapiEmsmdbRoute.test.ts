@@ -253,16 +253,16 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
     });
 
     describe("Execute", () => {
-        it("Returns a session-not-found error code when no MapiContext cookie is presented.", async () => {
+        it("Returns X-ResponseCode 10 (Context Not Found), with the HRESULT only in the body, when no MapiContext cookie is presented.", async () => {
             await createMailbox(owner.uid);
             const emptyRop = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
             const result = await execute("", emptyRop);
 
             expect(result.status).toBe(200);
-            expect(result.headers["x-responsecode"]).not.toBe("0");
+            expect(result.headers["x-responsecode"]).toBe("10");
             const reader = new BufferReader(result.body);
             expect(reader.readUInt32LE()).toBe(0); // StatusCode
-            expect(reader.readUInt32LE()).not.toBe(0); // ErrorCode
+            expect(reader.readUInt32LE()).toBe(0x80040111); // ErrorCode
         });
 
         it("Echoes back an empty but well-formed ROP buffer, preserving the handle table, for a valid session.", async () => {
@@ -311,7 +311,7 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             const result = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
 
             expect(result.status).toBe(200);
-            expect(result.headers["x-responsecode"]).toBe(String(0x80040111));
+            expect(result.headers["x-responsecode"]).toBe("10");
         });
 
         it("Fails a request whose session was saved by an overlapping request first, with X-ResponseCode 15, and a vanished session as not-found.", async () => {
@@ -326,13 +326,115 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
                 expect(conflictBody.readUInt32LE()).toBe(15);
 
                 const missing = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
-                expect(missing.headers["x-responsecode"]).toBe(String(0x80040111));
+                expect(missing.headers["x-responsecode"]).toBe("10");
+                expect(new BufferReader(missing.body).readBytes(8).readUInt32LE(4)).toBe(0x80040111);
             } finally {
                 save.mockRestore();
             }
 
             const ok = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
             expect(ok.headers["x-responsecode"]).toBe("0");
+        });
+
+        it("Turns away a request that overlaps another one on the same session before running any ROP.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const lock = vi.spyOn(MapiSessionManager.prototype, "acquireLock").mockResolvedValueOnce(undefined);
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            try {
+                const overlapping = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.from([0x01, 0x00, 0x00]), handleTable: [0] }));
+                expect(overlapping.headers["x-responsecode"]).toBe("15");
+                expect(save).not.toHaveBeenCalled();
+            } finally {
+                lock.mockRestore();
+                save.mockRestore();
+            }
+            // The lock is released after every request, so the next one runs.
+            const next = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+            expect(next.headers["x-responsecode"]).toBe("0");
+        });
+
+        it("Answers a retried X-RequestId with the stored response instead of running its ROPs again.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+            const body = new BufferWriter();
+            const ropBuffer = encodeRopBuffer({ ropsList: logon, handleTable: [0xffffffff] });
+            body.writeUInt32LE(0).writeUInt32LE(ropBuffer.length).writeBytes(ropBuffer).writeUInt32LE(0x10008).writeUInt32LE(0);
+            const send = (requestId: string) =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": requestId },
+                    body.toBuffer(),
+                );
+
+            const first = await send("{guid}:1");
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            try {
+                const retry = await send("{guid}:1");
+                expect(retry.headers["x-responsecode"]).toBe("0");
+                expect(retry.body.equals(first.body)).toBe(true);
+                expect(save).not.toHaveBeenCalled();
+
+                await send("{guid}:2");
+                expect(save).toHaveBeenCalledTimes(1);
+            } finally {
+                save.mockRestore();
+            }
+        });
+
+        it("Answers 400 for a ROP it can't decode, after saving the handles the ROPs before it created.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            try {
+                const result = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.concat([logon, Buffer.from([0x99, 0x00])]), handleTable: [0xffffffff] }));
+                expect(result.status).toBe(400);
+                expect(save).toHaveBeenCalledTimes(1);
+                expect((await save.mock.results[0].value)).toBe("saved");
+                expect(save.mock.calls[0][0].handles[0]).toMatchObject({ type: "logon" });
+            } finally {
+                save.mockRestore();
+            }
+        });
+
+        it("Holds ROP responses to MaxRopOut, answering RopBufferTooSmall for one that doesn't fit.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+            const ropBuffer = encodeRopBuffer({ ropsList: logon, handleTable: [0xffffffff] });
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(ropBuffer.length).writeBytes(ropBuffer).writeUInt32LE(40).writeUInt32LE(0).toBuffer();
+
+            const result = await mapiRequest(
+                server.getApplication(),
+                baseUrl,
+                { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie },
+                body,
+            );
+
+            const reader = new BufferReader(result.body);
+            reader.readBytes(12);
+            const { ropsList } = decodeRopBuffer(reader.readBytes(reader.readUInt32LE()));
+            // 40 - RopSize (2) - one handle table entry (4) leaves 34 bytes: too few for RopLogon's response.
+            expect(ropsList[0]).toBe(0xff);
+            expect(ropsList.readUInt16LE(1)).toBeGreaterThan(34);
+            expect(ropsList.subarray(3)).toEqual(logon);
+        });
+
+        it("Fails a request that would grow the session past its size cap with MAPI_E_TOO_BIG.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const save = vi.spyOn(MapiSessionManager.prototype, "save").mockResolvedValueOnce("tooBig");
+            try {
+                const result = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+                expect(result.headers["x-responsecode"]).toBe("0");
+                expect(result.body.readUInt32LE(4)).toBe(0x80040305);
+                expect(result.body.readUInt32LE(12)).toBe(0); // no RopBuffer
+            } finally {
+                save.mockRestore();
+            }
         });
     });
 

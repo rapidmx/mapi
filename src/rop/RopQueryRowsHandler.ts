@@ -22,6 +22,12 @@ const ORIGIN_BOOKMARK_END = 0x02;
  * again from the new cursor position. */
 export const MAX_ROWS_PER_QUERY = 500;
 
+/** `ecBufferTooSmall`: not even one row fits in the room left in the ROP output buffer. */
+const ERROR_BUFFER_TOO_SMALL = 0x0000047d;
+
+/** RopId, InputHandleIndex, ReturnValue, Origin and RowCount. */
+const RESPONSE_HEADER_BYTES = 9;
+
 /**
  * `RopQueryRows` (`[MS-OXCTABL]`/`[MS-OXCROPS]`): fetches up to `RowCount` rows from an already-configured
  * table (`RopGetHierarchyTable` + `RopSetColumns`), advancing the table's cursor. Confirmed field-by-field
@@ -75,7 +81,6 @@ export class RopQueryRowsHandler implements RopHandler {
         const slice: string[] = table.contentsKind
             ? await resolveContentsWindow(context, table, cursor, count)
             : (table.rows ?? []).slice(cursor, cursor + count);
-        table.cursor = cursor + slice.length;
 
         // Shared across every row this call resolves - see ResolutionCache's own doc comment for why: without
         // it, a hierarchy table's `hasChildren` column (or a calendar table's organizer/attendee resolution)
@@ -83,15 +88,31 @@ export class RopQueryRowsHandler implements RopHandler {
         // call.
         const cache: ResolutionCache = {};
         const rowBuffers: Buffer[] = [];
+        // Only as many rows as fit in the room left in this request's ROP output buffer; the rest stay for the next
+        // call, since the cursor only advances past rows actually returned.
+        let room = (context.ropOutputRemaining ?? Infinity) - RESPONSE_HEADER_BYTES;
         for (const target of slice) {
-            rowBuffers.push(await this.buildRow(context, target, table.columns ?? [], cache));
+            const row = await this.buildRow(context, target, table.columns ?? [], cache);
+            if (row.length > room) {
+                break;
+            }
+            room -= row.length;
+            rowBuffers.push(row);
         }
+        if (rowBuffers.length === 0 && slice.length > 0) {
+            // Not even one row fits: [MS-OXCTABL] ecBufferTooSmall, and the cursor stays put.
+            writer.writeUInt8(ROP_ID_QUERY_ROWS);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt32LE(ERROR_BUFFER_TOO_SMALL);
+            return;
+        }
+        table.cursor = cursor + rowBuffers.length;
 
         writer.writeUInt8(ROP_ID_QUERY_ROWS);
         writer.writeUInt8(inputHandleIndex);
         writer.writeUInt32LE(0); // ReturnValue - success
         writer.writeUInt8(ORIGIN_BOOKMARK_END);
-        writer.writeUInt16LE(slice.length);
+        writer.writeUInt16LE(rowBuffers.length);
         for (const rowBuffer of rowBuffers) {
             writer.writeBytes(rowBuffer);
         }

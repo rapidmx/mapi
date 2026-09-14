@@ -7,6 +7,8 @@ import type { AuditLogParams, BlobStore } from "@rapidmx/restapi";
 import type { ScanPipeline } from "@rapidmx/restapi/scan";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
+import type { ExecuteBudget } from "./ExecuteBudget.js";
+import { defaultHandleDataStore, type HandleDataStore } from "./HandleDataCache.js";
 
 /**
  * Everything a `RopHandler` needs beyond the raw ROP bytes it decodes itself. `folderRepo`/`mailboxRepo` are
@@ -60,6 +62,20 @@ export interface RopContext {
     /** Records an audit log entry as the calling user, the same way the REST routes do. Optional like the repos
      * above: absent when the route has no audit log class configured, in which case nothing is recorded. */
     audit?: (params: AuditLogParams) => Promise<void>;
+    /** Shared storage for FastTransfer streams and write-stream chunks. Absent in unit tests, where
+     * `defaultHandleDataStore` (this process only) is used - see `handleDataStoreOf`. */
+    handleData?: HandleDataStore;
+    /** This request's work budget, set by `dispatchRops`. Absent when a handler runs on its own. */
+    budget?: ExecuteBudget;
+    /** The bytes still free in this request's ROP output buffer for the current ROP's response, set by
+     * `dispatchRops` before each ROP. Handlers returning variable-size data (`RopReadStream`,
+     * `RopFastTransferSourceGetBuffer`, `RopQueryRows`) shrink their response to fit. Absent means unlimited. */
+    ropOutputRemaining?: number;
+}
+
+/** The `HandleDataStore` a handler should use for `context`. */
+export function handleDataStoreOf(context: Pick<RopContext, "handleData">): HandleDataStore {
+    return context.handleData ?? defaultHandleDataStore;
 }
 
 /**
@@ -72,5 +88,13 @@ export interface RopContext {
 export interface RopHandler {
     /** The `RopId` byte this handler processes (e.g. `0xFE` for `RopLogon`). */
     readonly ropId: number;
+    /** Where the handle index a failure response echoes sits in the request, counting the `RopId` byte as 0. Most
+     * ROPs echo `InputHandleIndex` (2, the default); ROPs that create an object echo `OutputHandleIndex` (3). Used
+     * by `RopDispatcher` to write a failure response when the handler throws. */
+    readonly responseHandleIndexOffset?: number;
+    /** Zero bytes a failure response carries after `ReturnValue` (`RopReadStream`'s `DataSize`, ...). */
+    readonly failureTailBytes?: number;
+    /** `true` for a ROP that never has a response (`RopRelease`), so a failure writes nothing either. */
+    readonly hasNoResponse?: boolean;
     handle(reader: BufferReader, writer: BufferWriter, context: RopContext): Promise<void> | void;
 }

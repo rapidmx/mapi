@@ -5,10 +5,11 @@
 import { simpleParser } from "mailparser";
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
 import { RopSubmitMessageHandler } from "../../src/rop/RopSubmitMessageHandler.js";
-import type { RopContext } from "../../src/rop/RopHandler.js";
+import { handleDataStoreOf, type RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { AvVerdict, FolderType, SpamVerdict } from "@rapidmx/restapi";
 import { InMemoryBlobStore } from "../testDoubles.js";
+import { writeStreamKey } from "../../src/rop/RopWriteStreamHandler.js";
 
 function buildRequest({ logonId = 0, inputHandleIndex = 5, submitFlags = 0 }): Buffer {
     const writer = new BufferWriter();
@@ -83,7 +84,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         expect(response.hasMore()).toBe(false);
     });
 
-    it("Returns MAPI_E_INVALID_OBJECT when the draft has no recipients at all.", async () => {
+    it("Returns MAPI_E_INVALID_PARAMETER when the draft has no recipients at all.", async () => {
         const context = makeContext();
         context.session.handles[5] = {
             type: "message",
@@ -99,11 +100,11 @@ describe("RopSubmitMessageHandler Tests", () => {
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
-        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(response.readUInt32LE()).toBe(0x80070057);
         expect(context.mailTransport.send).not.toHaveBeenCalled();
     });
 
-    it("Returns MAPI_E_INVALID_OBJECT when the draft handle has no draftProperties at all.", async () => {
+    it("Returns MAPI_E_INVALID_PARAMETER when the draft handle has no draftProperties at all.", async () => {
         const context = makeContext();
         context.session.handles[5] = { type: "message", entityUid: "", draftFolderUid: "folder:f1" };
         const handler = new RopSubmitMessageHandler();
@@ -114,7 +115,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
-        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(response.readUInt32LE()).toBe(0x80070057);
     });
 
     it("Succeeds with an empty Subject and body when neither was ever set, only a recipient.", async () => {
@@ -142,7 +143,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         expect((parsed.text ?? "").trim()).toBe("");
     });
 
-    it("Returns MAPI_E_INVALID_OBJECT when the mailbox has no resolvable primarySmtpAddress.", async () => {
+    it("Returns MAPI_E_INVALID_PARAMETER when the mailbox has no resolvable primarySmtpAddress.", async () => {
         const context = makeContext({ mailboxRepo: { findOne: vi.fn().mockResolvedValue(undefined) } as any });
         context.session.handles[5] = {
             type: "message",
@@ -158,7 +159,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
-        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(response.readUInt32LE()).toBe(0x80070057);
     });
 
     it("Builds and sends a real MIME message from Subject/DisplayTo/DisplayCc/inline Body, then saves a Sent Items copy.", async () => {
@@ -230,9 +231,9 @@ describe("RopSubmitMessageHandler Tests", () => {
 
     it.each([
         ["a CR/LF header injection", "to@example.com\r\nBcc: victim@example.com"],
-        ["a display-name form", "Jane <jane@example.com>"],
-        ["a non-address", "not-an-address"],
-    ])("Returns MAPI_E_INVALID_OBJECT without sending when a recipient is %s.", async (_label, badAddress) => {
+        ["a display name with a malformed address", "Jane <jane@>"],
+        ["an address-shaped value addressparser can't use", "<>"],
+    ])("Returns MAPI_E_INVALID_PARAMETER without sending when a recipient is %s.", async (_label, badAddress) => {
         const context = makeContext();
         context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": `ok@example.com; ${badAddress}` } };
         const writer = new BufferWriter();
@@ -242,9 +243,71 @@ describe("RopSubmitMessageHandler Tests", () => {
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
         response.readUInt8();
-        expect(response.readUInt32LE()).toBe(0x80070005);
+        expect(response.readUInt32LE()).toBe(0x80070057);
         expect((context.scanPipeline as any).run).not.toHaveBeenCalled();
         expect(context.mailTransport.send).not.toHaveBeenCalled();
+    });
+
+    it("Sends to resolved 'Name <address>' recipients (split on ';' only) and to bare display names matching one contact.", async () => {
+        const contactFind = vi.fn().mockImplementation((query: any) =>
+            Promise.resolve(query.displayName === "Ada Lovelace" ? [{ emails: [{ address: "not valid" }, { address: "ada@example.com" }] }] : []),
+        );
+        const context = makeContext({ contactRepo: { find: contactFind } as any });
+        context.session.handles[5] = {
+            type: "message",
+            entityUid: "",
+            draftProperties: { "3588": '"Doe, Jane" <jane@example.com>; Ada Lovelace', "3587": "Doe, John <john@example.com>" },
+        };
+        const writer = new BufferWriter();
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0);
+        expect(contactFind).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "Ada Lovelace", limit: 2 }, { ignoreACL: true, limit: 2 });
+        const [rawSent, envelope] = (context.scanPipeline as any).run.mock.calls[0];
+        expect(envelope.to).toEqual(["jane@example.com", "ada@example.com", "john@example.com"]);
+        const parsed = await simpleParser(rawSent as Buffer);
+        expect((parsed.to as any).value).toEqual([
+            { address: "jane@example.com", name: "Doe, Jane" },
+            { address: "ada@example.com", name: "Ada Lovelace" },
+        ]);
+        const [savedMessage] = (context.messageRepo as any).create.mock.calls[0];
+        expect(savedMessage.recipients).toEqual([
+            { address: "jane@example.com", displayName: "Doe, Jane", type: "to" },
+            { address: "ada@example.com", displayName: "Ada Lovelace", type: "to" },
+            { address: "john@example.com", displayName: "Doe, John", type: "cc" },
+        ]);
+    });
+
+    it.each([
+        ["no contact", []],
+        ["several contacts", [{ emails: [{ address: "a@example.com" }] }, { emails: [{ address: "b@example.com" }] }]],
+        ["a contact without an email", [{}]],
+    ])("Returns MAPI_E_NOT_FOUND, not access denied, for a display name matching %s.", async (_label, contacts) => {
+        const context = makeContext({ contactRepo: { find: vi.fn().mockResolvedValue(contacts) } as any });
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "ok@example.com; Someone Unknown" } };
+        const writer = new BufferWriter();
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+        const response = new BufferReader(writer.toBuffer());
+        response.readUInt8();
+        response.readUInt8();
+        expect(response.readUInt32LE()).toBe(0x8004010f);
+        expect(context.mailTransport.send).not.toHaveBeenCalled();
+    });
+
+    it("Can't resolve a display name without a contacts repo.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "to@example.com", "3586": "Someone" } };
+        const writer = new BufferWriter();
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(writer.toBuffer().readUInt32LE(2)).toBe(0x8004010f);
     });
 
     it("Ignores a write stream left over from an earlier message that used the same handle index.", async () => {
@@ -253,10 +316,11 @@ describe("RopSubmitMessageHandler Tests", () => {
         context.session.handles[5] = {
             type: "message",
             entityUid: "",
-            generation: 9,
+            generation: "current",
             draftProperties: { "3588": "to@example.com", "4096": "Current inline body." },
         };
-        context.session.handles[6] = { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: 4, writeBufferBase64: staleBytes.toString("base64") };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "stale-stream", writeTargetHandleIndex: 5, writeTargetGeneration: "earlier", writeSize: staleBytes.length };
+        await handleDataStoreOf(context).putChunk(writeStreamKey(context.session.uid, 6, "stale-stream"), 0, staleBytes, 60);
 
         await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
 
@@ -274,12 +338,8 @@ describe("RopSubmitMessageHandler Tests", () => {
             draftFolderUid: "folder:f1",
             draftProperties: { "55": "Subj", "3588": "to@example.com", "4096": "This inline body must be ignored." },
         };
-        context.session.handles[6] = {
-            type: "stream",
-            entityUid: "",
-            writeTargetHandleIndex: 5,
-            writeBufferBase64: streamBytes.toString("base64"),
-        };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "body-stream", writeTargetHandleIndex: 5, writeSize: streamBytes.length };
+        await handleDataStoreOf(context).putChunk(writeStreamKey(context.session.uid, 6, "body-stream"), 0, streamBytes, 60);
         const handler = new RopSubmitMessageHandler();
         const writer = new BufferWriter();
 
@@ -289,6 +349,18 @@ describe("RopSubmitMessageHandler Tests", () => {
         const [rawSent] = scanPipeline.run.mock.calls[0];
         const parsed = await simpleParser(rawSent as Buffer);
         expect(parsed.text?.trim()).toBe(streamText);
+    });
+
+    it("Fails with MAPI_E_CALL_FAILED instead of sending a truncated body when the written stream's chunks are gone.", async () => {
+        const context = makeContext();
+        context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "to@example.com" } };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "expired-stream", writeTargetHandleIndex: 5, writeSize: 10 };
+        const writer = new BufferWriter();
+
+        await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+        expect(writer.toBuffer().readUInt32LE(2)).toBe(0x80004005);
+        expect(context.mailTransport.send).not.toHaveBeenCalled();
     });
 
     it("Attaches a Disposition-Notification-To header and records requestReceipt when PidTagReadReceiptRequested is true.", async () => {
@@ -610,7 +682,7 @@ describe("RopSubmitMessageHandler Tests", () => {
     });
 
     describe("Meeting-response branch (PidTagMessageClass starts with IPM.Schedule.Meeting.Resp.)", () => {
-        it("Dispatches to submitMeetingResponse and reports success, without touching the mail compose/send path.", async () => {
+        it("Dispatches to submitMeetingResponse and reports its ReturnValue, without touching the mail compose/send path.", async () => {
             const calendarEventRepo = { find: vi.fn().mockResolvedValue([]) };
             const context = makeContext({ calendarEventRepo: calendarEventRepo as any });
             context.session.handles[5] = {
@@ -626,11 +698,9 @@ describe("RopSubmitMessageHandler Tests", () => {
             const response = new BufferReader(writer.toBuffer());
             expect(response.readUInt8()).toBe(0x32);
             expect(response.readUInt8()).toBe(5);
-            expect(response.readUInt32LE()).toBe(0); // ReturnValue - success
+            expect(response.readUInt32LE()).toBe(0x80070057); // no PidLidGlobalObjectId: MAPI_E_INVALID_PARAMETER
             expect(response.hasMore()).toBe(false);
 
-            // No PidLidGlobalObjectId was ever set on this draft, so submitMeetingResponse should have no-op'd
-            // before even querying the calendar event repo - confirming real dispatch happened either way.
             expect(context.mailTransport.send).not.toHaveBeenCalled();
             expect((context.messageRepo as any).create).not.toHaveBeenCalled();
         });

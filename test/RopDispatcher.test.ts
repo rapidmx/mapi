@@ -2,9 +2,17 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
+import { DecodeError } from "../src/codec/BufferCursor.js";
 import { dispatchRops } from "../src/RopDispatcher.js";
+import { WorkBudgetExceededError } from "../src/rop/ExecuteBudget.js";
 import { RopReleaseHandler } from "../src/rop/RopReleaseHandler.js";
-import type { RopContext } from "../src/rop/RopHandler.js";
+import type { RopContext, RopHandler } from "../src/rop/RopHandler.js";
+
+function u32(value: number): Buffer {
+    const buffer = Buffer.alloc(4);
+    buffer.writeUInt32LE(value);
+    return buffer;
+}
 import { MapiSessionContext } from "../src/MapiSessionManager.js";
 
 describe("RopDispatcher Tests", () => {
@@ -40,16 +48,62 @@ describe("RopDispatcher Tests", () => {
         expect(context.session.handles[1]).toBeUndefined();
     });
 
-    it("Stops processing at the first unrecognized RopId, since its byte layout can't be skipped safely.", async () => {
+    it("Throws a DecodeError (a 400) at an unrecognized RopId, since its byte layout can't be skipped safely.", async () => {
         const ropsList = Buffer.from([0x99, 0xaa, 0xbb, 0x01, 0x00, 0x00]); // unknown RopId 0x99, then a real RopRelease
         const handlers = new Map([[0x01, new RopReleaseHandler()]]);
         const context = makeContext();
         context.session.handles[0] = { type: "logon", entityUid: "mailbox-1" };
 
-        await dispatchRops(ropsList, handlers, context);
+        await expect(dispatchRops(ropsList, handlers, context)).rejects.toBeInstanceOf(DecodeError);
 
         // The trailing RopRelease is never reached - the unknown ROP's bytes couldn't be skipped past.
         expect(context.session.handles[0]).toEqual({ type: "logon", entityUid: "mailbox-1" });
+    });
+
+    it("Throws a DecodeError for a truncated ROP.", async () => {
+        const handlers = new Map([[0x01, new RopReleaseHandler()]]);
+        await expect(dispatchRops(Buffer.from([0x01, 0x00]), handlers, makeContext())).rejects.toBeInstanceOf(DecodeError);
+    });
+
+    it("Fails only the ROP whose handler throws, with its handle index and MAPI_E_CALL_FAILED, and keeps running later ROPs.", async () => {
+        const handlers = new Map<number, RopHandler>([
+            [0x30, { ropId: 0x30, handle: (reader) => { reader.readUInt8(); reader.readUInt8(); throw new Error("database down"); } }],
+            [0x31, { ropId: 0x31, responseHandleIndexOffset: 3, failureTailBytes: 2, handle: (reader, writer) => { reader.readBytes(3); writer.writeUInt8(0xee); throw new RangeError("bad stored blob"); } }],
+            [0x32, { ropId: 0x32, handle: (reader, writer) => { reader.readUInt8(); reader.readUInt8(); writer.writeUInt8(0x32).writeUInt8(9).writeUInt32LE(0); } }],
+            [0x33, { ropId: 0x33, hasNoResponse: true, handle: () => { throw new Error("no response either way"); } }],
+            [0x34, { ropId: 0x34, handle: () => { throw new WorkBudgetExceededError("row"); } }],
+        ]);
+
+        const response = await dispatchRops(Buffer.from([0x30, 0x00, 0x04, 0x31, 0x00, 0x01, 0x07, 0x33, 0x32, 0x00, 0x09, 0x34]), handlers, makeContext());
+
+        expect(response).toEqual(
+            Buffer.concat([
+                Buffer.from([0x30, 0x04]), u32(0x80004005),
+                Buffer.from([0x31, 0x07]), u32(0x80004005), Buffer.alloc(2), // partial output dropped, tail zeroed
+                Buffer.from([0x32, 0x09]), u32(0),
+                Buffer.from([0x34, 0x00]), u32(0x80040117), // index byte past the end of the request reads as 0
+            ]),
+        );
+    });
+
+    it("Tells each handler the room left and answers RopBufferTooSmall, with the unprocessed request, when a response doesn't fit.", async () => {
+        const seen: number[] = [];
+        const handlers = new Map<number, RopHandler>([
+            [0x40, { ropId: 0x40, handle: (reader, writer, context) => { seen.push(context.ropOutputRemaining!); writer.writeBytes(Buffer.alloc(reader.readUInt8())); } }],
+        ]);
+        const context = makeContext();
+
+        const response = await dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, context, { maxOutputBytes: 13 });
+
+        expect(seen).toEqual([13, 7]);
+        expect(response).toEqual(Buffer.concat([Buffer.alloc(6), Buffer.from([0xff, 8, 0, 0x40, 8, 0x40, 1])]));
+        expect(context.ropOutputRemaining).toBeUndefined();
+
+        // No room even for RopBufferTooSmall: processing just stops.
+        expect(await dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, makeContext(), { maxOutputBytes: 8 })).toEqual(Buffer.alloc(6));
+        // Never more than a 16-bit RopSize can describe.
+        const huge = new Map<number, RopHandler>([[0x41, { ropId: 0x41, handle: (_reader, writer) => void writer.writeBytes(Buffer.alloc(70000)) }]]);
+        expect(await dispatchRops(Buffer.from([0x41]), huge, makeContext(), { maxOutputBytes: 1 << 20 })).toEqual(Buffer.from([0xff, 0xff, 0xff, 0x41]));
     });
 
     it("Returns an empty buffer for an empty ropsList.", async () => {

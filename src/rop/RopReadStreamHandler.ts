@@ -23,12 +23,16 @@ const BYTE_COUNT_USE_MAXIMUM = 0xbabe;
  * stream is meant to work) - `writeUInt16LE` throwing `RangeError` for an out-of-range value is not. */
 const MAX_DATA_SIZE = 0xffff;
 
+/** RopId, InputHandleIndex, ReturnValue and DataSize. */
+const RESPONSE_HEADER_BYTES = 8;
+
 /**
  * `RopReadStream` (`[MS-OXCPRPT]`/`[MS-OXCROPS]`): reads up to `ByteCount` (or `MaximumByteCount`, if
  * `ByteCount` is the `0xBABE` sentinel) bytes from an already-opened stream (`RopOpenStream`), advancing the
  * stream's read position - clamped to `MAX_DATA_SIZE` (`0xFFFF`) regardless of what the client asked for, since
  * the response's own `DataSize` field can't carry more than that; a client wanting more of a large body simply
- * calls `RopReadStream` again from the advanced `streamPosition`, the same paging behavior real Exchange uses.
+ * calls `RopReadStream` again from the advanced `streamPosition`, the same paging behavior real Exchange uses. It is
+ * likewise held to the room left in the request's ROP output buffer (`context.ropOutputRemaining`).
  * Unlike most other ROPs in this pragmatic subset, `[MS-OXCROPS]` documents only one combined response-buffer
  * shape for this ROP (no separate Success/Failure pages) - `DataSize`/`Data` are always present, `DataSize = 0`
  * (empty `Data`) standing in for the failure case rather than the fields being omitted entirely.
@@ -37,6 +41,7 @@ const MAX_DATA_SIZE = 0xffff;
  */
 export class RopReadStreamHandler implements RopHandler {
     public readonly ropId = ROP_ID_READ_STREAM;
+    public readonly failureTailBytes = 2; // DataSize/WrittenSize
 
     public async handle(reader: BufferReader, writer: BufferWriter, context: RopContext): Promise<void> {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session
@@ -55,7 +60,9 @@ export class RopReadStreamHandler implements RopHandler {
 
         const bytes = await loadStreamBody(context, inputHandleIndex, handle);
         const position = handle.streamPosition ?? 0;
-        const slice = bytes.subarray(position, position + Math.min(requestedCount, MAX_DATA_SIZE));
+        // Also held to the room left in this request's ROP output buffer, after this response's 8 fixed bytes.
+        const room = Math.max(0, (context.ropOutputRemaining ?? Infinity) - RESPONSE_HEADER_BYTES);
+        const slice = bytes.subarray(position, position + Math.min(requestedCount, MAX_DATA_SIZE, room));
         handle.streamPosition = position + slice.length;
 
         writer.writeUInt8(ROP_ID_READ_STREAM);

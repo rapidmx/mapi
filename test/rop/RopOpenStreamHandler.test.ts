@@ -72,7 +72,7 @@ describe("RopOpenStreamHandler Tests", () => {
             propertyId: 0x1000,
             propertyType: PropertyType.PtypString,
             streamPosition: 0,
-            generation: 1,
+            generation: expect.any(String),
         });
     });
 
@@ -113,9 +113,8 @@ describe("RopOpenStreamHandler Tests", () => {
             propertyType: PropertyType.PtypString,
             writeTargetHandleIndex: 5,
             writeTargetGeneration: undefined,
-            writeBufferBase64: "",
             writeSize: 0,
-            generation: 1,
+            generation: expect.any(String),
         });
     });
 

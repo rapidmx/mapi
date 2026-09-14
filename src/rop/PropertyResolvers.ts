@@ -352,9 +352,12 @@ export async function resolvePropertyValues(
         | "contactRepo"
         | "taskRepo"
         | "labelRepo"
+        | "budget"
     >,
     cache?: ResolutionCache,
 ): Promise<PropertyValueData[]> {
+    // Every row resolved counts against the request's work budget - see ExecuteBudget.
+    context.budget?.chargeRows();
     const isMessage = target.startsWith("message:");
     const isCalendarEvent = target.startsWith("calendarEvent:");
     const isContact = target.startsWith("contact:");

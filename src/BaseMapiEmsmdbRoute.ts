@@ -12,20 +12,27 @@ import {
     RepoUtils,
     RouteDecorators,
 } from "@rapidrest/service-core";
-import { BufferReader, BufferWriter } from "./codec/BufferCursor.js";
+import { BufferReader, BufferWriter, DecodeError } from "./codec/BufferCursor.js";
 import { decodeRopBuffer, encodeRopBuffer, type RopBuffer } from "./codec/RopBuffer.js";
 import { MapiSessionContext, MapiSessionManager } from "./MapiSessionManager.js";
-import { dispatchRops } from "./RopDispatcher.js";
+import { dispatchRops, MAX_ROPS_LIST_BYTES } from "./RopDispatcher.js";
 import type { RopContext, RopHandler } from "./rop/RopHandler.js";
 import { ScanPipeline } from "@rapidmx/restapi/scan";
 import { Folder, Mailbox, RecoverableRepoUtils, recordAuditLog, resolveCallerMailboxUid, type BlobStore } from "@rapidmx/restapi";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
 const { Auth, Post, Request, Response, User: AuthUser } = RouteDecorators;
 
-/** The well-known MAPI HRESULT `MAPI_E_LOGON_FAILED`, reused here to signal "no such session - reconnect"
- * via `X-ResponseCode`/`ErrorCode`. Not a claim of exact `[MS-OXCRPC]` return-value-table parity for this
- * specific condition - a real client only needs a non-zero code to know to re-`Connect`, not a precise one. */
+/** `[MS-OXCMAPIHTTP]` `X-ResponseCode` 10, "Context Not Found": the session context named by the `MapiContext`
+ * cookie doesn't exist (expired, ended, or not the caller's). The client `Connect`s again. `X-ResponseCode` only takes
+ * the spec's small status values; the MAPI HRESULT goes in the body's `ErrorCode` (`ERROR_SESSION_NOT_FOUND`). */
+const RESPONSE_CODE_CONTEXT_NOT_FOUND = 10;
+
+/** The well-known MAPI HRESULT `MAPI_E_LOGON_FAILED`, reused as the body `ErrorCode` for "no such session -
+ * reconnect". Not a claim of exact `[MS-OXCRPC]` return-value-table parity for this specific condition. */
 const ERROR_SESSION_NOT_FOUND = 0x80040111;
+
+/** `MAPI_E_TOO_BIG`, the body `ErrorCode` when a request would grow the session past `MAX_SESSION_BYTES`. */
+const ERROR_SESSION_TOO_BIG = 0x80040305;
 
 /** `[MS-OXCMAPIHTTP]` `X-ResponseCode` 15, "Invalid Sequence": the request overlapped another one on the same
  * session context. Sent when the session changed underneath this request (see `MapiSessionManager.save()`). */
@@ -34,14 +41,20 @@ const RESPONSE_CODE_INVALID_SEQUENCE = 15;
 /** The largest `RopBufferSize` accepted - the `[MS-OXCRPC]` ROP input buffer limit. */
 export const MAX_ROP_BUFFER_SIZE = 32767;
 
+/** A decoded `Execute` request: the ROP buffer framing plus the client's `MaxRopOut`. */
+export interface ExecuteRequest extends RopBuffer {
+    /** The most bytes the client accepts in the response's `RopBuffer`. */
+    maxRopOut: number;
+}
+
 /**
- * Decodes an `Execute` request body's `Flags`/`RopBufferSize`/`RopBuffer` and the ROP buffer framing inside it.
- * Throws a 400 `ApiError` for a malformed body - a `RopBufferSize` over `MAX_ROP_BUFFER_SIZE` or past the end of the
- * body, or a ROP buffer `decodeRopBuffer` rejects - instead of letting a bare `RangeError` surface as a 500.
- * `MaxRopOut`/`AuxiliaryBufferSize`/`AuxiliaryBuffer` are left unread - no output-size capping or auxiliary-payload
- * support in this pragmatic subset.
+ * Decodes an `Execute` request body's `Flags`/`RopBufferSize`/`RopBuffer`/`MaxRopOut` and the ROP buffer framing
+ * inside it. Throws a 400 `ApiError` for a malformed body - a `RopBufferSize` over `MAX_ROP_BUFFER_SIZE` or past the
+ * end of the body, or a ROP buffer `decodeRopBuffer` rejects - instead of letting a bare `RangeError` surface as a
+ * 500. A body that ends before `MaxRopOut` gets the largest response a `RopBuffer` can carry.
+ * `AuxiliaryBufferSize`/`AuxiliaryBuffer` are left unread - no auxiliary-payload support in this pragmatic subset.
  */
-export function decodeExecuteRequest(rawBody: Buffer): RopBuffer {
+export function decodeExecuteRequest(rawBody: Buffer): ExecuteRequest {
     try {
         const reader = new BufferReader(rawBody);
         reader.readUInt32LE(); // Flags - unused by this pragmatic subset (no client ROP-response hints honored)
@@ -49,7 +62,9 @@ export function decodeExecuteRequest(rawBody: Buffer): RopBuffer {
         if (ropBufferSize > MAX_ROP_BUFFER_SIZE || ropBufferSize > reader.remaining) {
             throw new RangeError(`Execute: invalid RopBufferSize ${ropBufferSize}.`);
         }
-        return decodeRopBuffer(reader.readBytes(ropBufferSize));
+        const ropBuffer = decodeRopBuffer(reader.readBytes(ropBufferSize));
+        const maxRopOut = reader.remaining >= 4 ? reader.readUInt32LE() : MAX_ROPS_LIST_BYTES + 2;
+        return { ...ropBuffer, maxRopOut };
     } catch {
         throw new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST);
     }
@@ -269,21 +284,56 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
     }
 
     /**
-     * `Execute` decodes the outer envelope (`Flags`/`RopBufferSize`/`RopBuffer`/...) and the inner ROP buffer
-     * framing (`RopBuffer.ts`), dispatches every contained ROP via `RopDispatcher`, and re-encodes the
+     * `Execute` decodes the outer envelope (`Flags`/`RopBufferSize`/`RopBuffer`/`MaxRopOut`/...) and the inner ROP
+     * buffer framing (`RopBuffer.ts`), dispatches every contained ROP via `RopDispatcher`, and re-encodes the
      * collected responses - preserving the incoming `handleTable` unchanged (this pragmatic subset never
      * allocates/frees table-wide handle slots at the framing level; individual `RopHandler`s manage their own
      * entries within `session.handles` instead).
+     *
+     * - **One request at a time per session.** The session's lock is taken before anything runs; an overlapping
+     * request gets `X-ResponseCode` 15 (Invalid Sequence) without any side effects. The save stays compare-and-set.
+     * - **Retries.** The response is remembered with the request's `X-RequestId`; a request repeating the last id (a
+     * client retrying after a lost response) gets that response again instead of running its ROPs twice.
+     * `MapiSequence` isn't validated - the lock and the replay cache cover what it guards against here.
+     * - **Output size.** ROP responses are held to the client's `MaxRopOut`, less the `RopSize` field and handle
+     * table, and to what a 16-bit `RopSize` can describe (see `dispatchRops`).
+     * - **Malformed ROPs.** A ROP that can't be decoded answers 400; the ROPs before it already ran, so the session is
+     * still saved first.
      */
     private async handleExecute(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
+        const sessionId: string | undefined = req.cookies["MapiContext"];
+        if (!sessionId) {
+            this.sendExecuteFailure(res, RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
+            return;
+        }
+        const lockToken: string | undefined = await this.sessionManager!.acquireLock(sessionId);
+        if (!lockToken) {
+            this.sendExecuteFailure(res, RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE);
+            return;
+        }
+        try {
+            await this.executeLocked(req, res, user);
+        } finally {
+            await this.sessionManager!.releaseLock(sessionId, lockToken);
+        }
+    }
+
+    private async executeLocked(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
         const session: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
         // The caller must still own the session's mailbox: a mailbox reassigned since Connect ends the session.
         if (!session || (await resolveCallerMailboxUid(this.mailboxRepo!, user)) !== session.mailboxUid) {
-            this.sendExecuteFailure(res, ERROR_SESSION_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
+            this.sendExecuteFailure(res, RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
             return;
         }
 
-        const { ropsList, handleTable } = decodeExecuteRequest(req.rawBody ?? Buffer.alloc(0));
+        const requestId: string = firstHeader(req, "x-requestid") ?? "";
+        const replay: Buffer | undefined = requestId ? await this.sessionManager!.storedResponse(session.uid, requestId) : undefined;
+        if (replay) {
+            res.status(200).send(replay);
+            return;
+        }
+
+        const { ropsList, handleTable, maxRopOut } = decodeExecuteRequest(req.rawBody ?? Buffer.alloc(0));
         const context: RopContext = {
             mailboxUid: session.mailboxUid,
             userUid: session.userUid,
@@ -304,26 +354,38 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             blobStore: this.blobStore!,
             scanPipeline: this.scanPipeline!,
             mailTransport: this.mailTransport!,
+            handleData: this.sessionManager!.handleDataStore,
             audit: this.auditLogClass
                 ? (params) =>
                       recordAuditLog(this._objectFactory!, this.auditLogClass, { config: this.config, req, user, logger: this.logger }, params)
                 : undefined,
         };
-        const responseRopsList: Buffer = await dispatchRops(ropsList, this.ropHandlers, context);
-        const responseRopBuffer: Buffer = encodeRopBuffer({ ropsList: responseRopsList, handleTable });
+        // RopSize (2 bytes) and the echoed handle table share MaxRopOut with the ROP responses. dispatchRops only throws
+        // for a request it can't decode (a failing ROP gets a failure response instead).
+        const dispatched: Buffer | { error: unknown } = await dispatchRops(ropsList, this.ropHandlers, context, {
+            maxOutputBytes: maxRopOut - 2 - handleTable.length * 4,
+        }).catch((error: unknown) => ({ error }));
 
         const saved = await this.sessionManager!.save(session);
-        if (saved === "conflict") {
-            // Another request on this session saved first. This request's handle changes can't be kept, so fail it
-            // the way real Exchange reports overlapping requests on one session context; the client retries.
-            this.sendExecuteFailure(res, RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE);
-            return;
+        if (!Buffer.isBuffer(dispatched)) {
+            throw dispatched.error instanceof DecodeError ? new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST) : dispatched.error;
         }
-        if (saved === "missing") {
-            this.sendExecuteFailure(res, ERROR_SESSION_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
+        const responseRopsList: Buffer = dispatched;
+        if (saved !== "saved") {
+            // conflict: another request saved first (possible once a lock has expired), so this request's handle
+            // changes can't be kept and the client retries. missing: the session ended meanwhile. tooBig: see
+            // MAX_SESSION_BYTES.
+            const [responseCode, errorCode] =
+                saved === "conflict"
+                    ? [RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE]
+                    : saved === "missing"
+                      ? [RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND]
+                      : [0, ERROR_SESSION_TOO_BIG];
+            this.sendExecuteFailure(res, responseCode, errorCode);
             return;
         }
 
+        const responseRopBuffer: Buffer = encodeRopBuffer({ ropsList: responseRopsList, handleTable });
         const body = new BufferWriter();
         body.writeUInt32LE(0); // StatusCode
         body.writeUInt32LE(0); // ErrorCode
@@ -331,7 +393,11 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         body.writeUInt32LE(responseRopBuffer.length);
         body.writeBytes(responseRopBuffer);
         body.writeUInt32LE(0); // AuxiliaryBufferSize
-        res.status(200).send(body.toBuffer());
+        const responseBody: Buffer = body.toBuffer();
+        if (requestId) {
+            await this.sessionManager!.storeResponse(session.uid, requestId, responseBody);
+        }
+        res.status(200).send(responseBody);
     }
 
     /** Writes an `Execute` failure body (no ROP buffer) with the given `X-ResponseCode` and `ErrorCode`. */

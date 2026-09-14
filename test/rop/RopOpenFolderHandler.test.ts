@@ -43,7 +43,7 @@ describe("RopOpenFolderHandler Tests", () => {
         expect(response.readUInt8()).toBe(0); // IsGhosted
         expect(response.hasMore()).toBe(false);
 
-        expect(context.session.handles[5]).toEqual({ type: "folder", entityUid: "folder:inbox-uid", generation: 1 });
+        expect(context.session.handles[5]).toEqual({ type: "folder", entityUid: "folder:inbox-uid", generation: expect.any(String) });
     });
 
     it("Returns MAPI_E_NOT_FOUND for an unrecognized FID, without creating a handle.", () => {

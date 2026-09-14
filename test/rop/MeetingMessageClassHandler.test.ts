@@ -38,15 +38,17 @@ function globalObjectIdProperty(session: MapiSessionContext, icalUid: string): R
 }
 
 describe("submitMeetingResponse Tests", () => {
-    it("Does nothing for an unrecognized message-class suffix.", async () => {
+    it("Returns MAPI_E_INVALID_PARAMETER for an unrecognized message-class suffix.", async () => {
         const context = makeContext({ calendarEventRepo: { find: vi.fn() } as any });
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Bogus", {}, context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Bogus", globalObjectIdProperty(context.session, "x"), context)).toBe(0x80070057);
         expect((context.calendarEventRepo as any).find).not.toHaveBeenCalled();
     });
 
-    it("Does nothing when the draft never set PidLidGlobalObjectId.", async () => {
+    it("Returns MAPI_E_INVALID_PARAMETER when the draft never set PidLidGlobalObjectId, or set a malformed one.", async () => {
         const context = makeContext({ calendarEventRepo: { find: vi.fn() } as any });
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", {}, context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", {}, context)).toBe(0x80070057);
+        const id = assignOrGetNamedPropertyId(context.session, { guid: PSETID_MEETING, kind: "lid", lid: LID_GLOBAL_OBJECT_ID });
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", { [String(id)]: Buffer.alloc(40).toString("base64") }, context)).toBe(0x80070057);
         expect((context.calendarEventRepo as any).find).not.toHaveBeenCalled();
     });
 
@@ -71,11 +73,11 @@ describe("submitMeetingResponse Tests", () => {
         );
     });
 
-    it("Does nothing when no CalendarEvent matches the decoded icalUid.", async () => {
+    it("Returns MAPI_E_NOT_FOUND when no CalendarEvent matches the decoded icalUid.", async () => {
         const context = makeContext({ calendarEventRepo: { find: vi.fn().mockResolvedValue([]) } as any });
         const properties = globalObjectIdProperty(context.session, "unknown@example.com");
 
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith(
             { icalUid: "unknown@example.com", mailboxUid: "mailbox-1", limit: 100 },
@@ -83,7 +85,7 @@ describe("submitMeetingResponse Tests", () => {
         );
     });
 
-    it("Does nothing when the caller's mailbox can't be resolved.", async () => {
+    it("Returns MAPI_E_NOT_FOUND when the caller's mailbox can't be resolved.", async () => {
         const event = { uid: "evt1", version: 1, attendees: [{ address: "caller@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update: vi.fn() } as any,
@@ -91,12 +93,12 @@ describe("submitMeetingResponse Tests", () => {
         });
         const properties = globalObjectIdProperty(context.session, "evt-uid@example.com");
 
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).update).not.toHaveBeenCalled();
     });
 
-    it("Does nothing when the caller isn't actually an attendee of the event.", async () => {
+    it("Returns MAPI_E_NOT_FOUND when the caller isn't actually an attendee of the event.", async () => {
         const event = { uid: "evt1", version: 1, attendees: [{ address: "someone-else@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update: vi.fn() } as any,
@@ -104,7 +106,7 @@ describe("submitMeetingResponse Tests", () => {
         });
         const properties = globalObjectIdProperty(context.session, "evt-uid@example.com");
 
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).update).not.toHaveBeenCalled();
     });
@@ -195,14 +197,14 @@ describe("submitMeetingResponse Tests", () => {
                 { address: "other@example.com", responseStatus: AttendeeResponseStatus.NEEDS_ACTION },
             ],
         };
-        const send = vi.fn().mockResolvedValue({ accepted: [] });
+        const send = vi.fn().mockResolvedValue({ accepted: ["boss@example.com"], rejected: [] });
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update: vi.fn().mockResolvedValue(undefined) } as any,
             mailboxRepo: { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [], displayName: "Caller" }) } as any,
             mailTransport: { send } as any,
         });
 
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Tent", globalObjectIdProperty(context.session, "evt-uid@example.com"), context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Tent", globalObjectIdProperty(context.session, "evt-uid@example.com"), context)).toBe(0);
 
         expect(send).toHaveBeenCalledTimes(1);
         const { raw, envelopeFrom, envelopeTo } = send.mock.calls[0][0];
@@ -214,7 +216,7 @@ describe("submitMeetingResponse Tests", () => {
         expect(mime).not.toContain("other@example.com");
     });
 
-    it("Still records the response when sending the REPLY fails, and skips sending to a malformed organizer address.", async () => {
+    it("Records the response but reports MAPI_E_CALL_FAILED when the REPLY is rejected or fails, and skips a malformed organizer address.", async () => {
         const makeEvent = (organizer: string) => ({
             uid: "evt1",
             version: 1,
@@ -235,9 +237,19 @@ describe("submitMeetingResponse Tests", () => {
             mailboxRepo: mailboxRepo as any,
             mailTransport: { send: failingSend } as any,
         });
-        await expect(submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(failing.session, "evt-uid@example.com"), failing)).resolves.toBeUndefined();
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(failing.session, "evt-uid@example.com"), failing)).toBe(0x80004005);
         expect((failing.calendarEventRepo as any).update).toHaveBeenCalledTimes(1);
         expect(failingSend).toHaveBeenCalledTimes(1);
+
+        // A transport reporting a rejected recipient, instead of throwing, is a failure too (sendOrThrow).
+        for (const result of [{ accepted: [], rejected: ["boss@example.com"] }, { accepted: ["boss@example.com"], rejected: ["x@example.com"] }, {}, undefined]) {
+            const rejecting = makeContext({
+                calendarEventRepo: { find: vi.fn().mockResolvedValue([makeEvent("boss@example.com")]), update: vi.fn().mockResolvedValue(undefined) } as any,
+                mailboxRepo: mailboxRepo as any,
+                mailTransport: { send: vi.fn().mockResolvedValue(result) } as any,
+            });
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(rejecting.session, "evt-uid@example.com"), rejecting)).toBe(0x80004005);
+        }
 
         const injectedSend = vi.fn();
         const injected = makeContext({
@@ -245,7 +257,7 @@ describe("submitMeetingResponse Tests", () => {
             mailboxRepo: mailboxRepo as any,
             mailTransport: { send: injectedSend } as any,
         });
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(injected.session, "evt-uid@example.com"), injected);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(injected.session, "evt-uid@example.com"), injected)).toBe(0);
         expect(injectedSend).not.toHaveBeenCalled();
     });
 
@@ -285,17 +297,142 @@ describe("submitMeetingResponse Tests", () => {
         expect((seriesResponse.calendarEventRepo as any).update.mock.calls[0][0].uid).toBe("series");
     });
 
-    it("Does nothing when the caller holds only exception copies and none matches.", async () => {
+    it("Returns MAPI_E_NOT_FOUND when the caller holds only exception copies and none matches.", async () => {
         const exception = { uid: "exception", version: 1, recurrenceId: new Date("2026-10-08T10:00:00.000Z"), attendees: [{ address: "caller@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([exception]), update: vi.fn() } as any,
             mailboxRepo: { findOne: vi.fn() } as any,
         });
 
-        await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(context.session, "evt-uid@example.com"), context);
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(context.session, "evt-uid@example.com"), context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).update).not.toHaveBeenCalled();
         expect((context.mailboxRepo as any).findOne).not.toHaveBeenCalled();
+    });
+
+
+    describe("One occurrence of a recurring series", () => {
+        const mailboxRepo = () => ({ findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [], displayName: "Caller" }) });
+        const makeSeries = (overrides: Record<string, unknown> = {}) => ({
+            uid: "series",
+            version: 4,
+            icalUid: "evt-uid@example.com",
+            sequence: 1,
+            status: "confirmed",
+            title: "Weekly",
+            timezone: "America/Los_Angeles",
+            // 09:00 Pacific daylight time on Thursday 2026-10-01.
+            startDate: new Date("2026-10-01T16:00:00.000Z"),
+            endDate: new Date("2026-10-01T16:30:00.000Z"),
+            recurrenceRule: { freq: "weekly", interval: 1, byDay: ["TH"], exceptions: [new Date("2026-10-08T16:00:00.000Z")] },
+            organizer: { address: "boss@example.com" },
+            attendees: [{ address: "caller@example.com", responseStatus: AttendeeResponseStatus.ACCEPTED }],
+            ...overrides,
+        });
+        const instanceProperty = (session: MapiSessionContext, year: number, month: number, day: number): Record<string, string> => {
+            const id = assignOrGetNamedPropertyId(session, { guid: PSETID_MEETING, kind: "lid", lid: LID_GLOBAL_OBJECT_ID });
+            const bytes = encodeGlobalObjectId("evt-uid@example.com", new Date());
+            bytes[16] = year >> 8;
+            bytes[17] = year & 0xff;
+            bytes[18] = month;
+            bytes[19] = day;
+            return { [String(id)]: bytes.toString("base64") };
+        };
+
+        it("Declining one occurrence adds it to the caller's series exceptions instead of deleting the series, and replies with RECURRENCE-ID.", async () => {
+            const series = makeSeries();
+            const send = vi.fn().mockResolvedValue({ accepted: ["boss@example.com"], rejected: [] });
+            const calendarEventRepo = { find: vi.fn().mockResolvedValue([series]), update: vi.fn().mockResolvedValue(undefined), delete: vi.fn() };
+            const context = makeContext({ calendarEventRepo: calendarEventRepo as any, mailboxRepo: mailboxRepo() as any, mailTransport: { send } as any });
+
+            // 2026-11-05 is after the switch back to standard time: the occurrence is still 09:00 local, now 17:00 UTC.
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", instanceProperty(context.session, 2026, 11, 5), context)).toBe(0);
+
+            expect(calendarEventRepo.delete).not.toHaveBeenCalled();
+            expect(calendarEventRepo.update).toHaveBeenCalledTimes(1);
+            const [delta, existing] = calendarEventRepo.update.mock.calls[0];
+            expect(delta.uid).toBe("series");
+            expect(delta.version).toBe(4);
+            expect(delta.attendees).toBeUndefined(); // the series' own response is untouched
+            expect(delta.recurrenceRule.exceptions).toEqual([new Date("2026-10-08T16:00:00.000Z"), new Date("2026-11-05T17:00:00.000Z")]);
+            expect(delta.recurrenceRule.byDay).toEqual(["TH"]);
+            expect(existing).toBe(series);
+
+            const ics = send.mock.calls[0][0].raw.toString();
+            expect(ics).toContain("RECURRENCE-ID:20261105T170000Z");
+            expect(ics).not.toContain("RRULE");
+            expect(ics).toContain("Subject: Declined: Weekly");
+        });
+
+        it("Declining an occurrence that is already an exception changes nothing, and accepting one never touches the series.", async () => {
+            const series = makeSeries();
+            const calendarEventRepo = { find: vi.fn().mockResolvedValue([series]), update: vi.fn(), delete: vi.fn() };
+            const send = vi.fn().mockResolvedValue({ accepted: ["boss@example.com"], rejected: [] });
+            const context = makeContext({ calendarEventRepo: calendarEventRepo as any, mailboxRepo: mailboxRepo() as any, mailTransport: { send } as any });
+
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", instanceProperty(context.session, 2026, 10, 8), context)).toBe(0);
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Tent", instanceProperty(context.session, 2026, 10, 15), context)).toBe(0);
+
+            expect(calendarEventRepo.update).not.toHaveBeenCalled();
+            expect(calendarEventRepo.delete).not.toHaveBeenCalled();
+            expect(send.mock.calls[1][0].raw.toString()).toContain("RECURRENCE-ID:20261015T160000Z");
+        });
+
+        it("Handles a series stored with no exceptions list and no usable time zone (UTC).", async () => {
+            const series = makeSeries({ timezone: "Not/AZone", recurrenceRule: { freq: "daily", interval: 1 } });
+            const calendarEventRepo = { find: vi.fn().mockResolvedValue([series]), update: vi.fn().mockResolvedValue(undefined) };
+            const context = makeContext({
+                calendarEventRepo: calendarEventRepo as any,
+                mailboxRepo: mailboxRepo() as any,
+                mailTransport: { send: vi.fn().mockResolvedValue({ accepted: ["boss@example.com"], rejected: [] }) } as any,
+            });
+
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", instanceProperty(context.session, 2026, 10, 3), context)).toBe(0);
+
+            expect(calendarEventRepo.update.mock.calls[0][0].recurrenceRule.exceptions).toEqual([new Date("2026-10-03T16:00:00.000Z")]);
+        });
+
+        it("Matches an exception copy by its date in the event's time zone, not in UTC.", async () => {
+            // 20:00 Pacific on 2026-10-08 is already 2026-10-09 in UTC.
+            const exception = makeSeries({ uid: "exception", recurrenceRule: undefined, recurrenceId: new Date("2026-10-09T03:00:00.000Z") });
+            const calendarEventRepo = { find: vi.fn().mockResolvedValue([makeSeries(), exception]), update: vi.fn().mockResolvedValue(undefined) };
+            const context = makeContext({
+                calendarEventRepo: calendarEventRepo as any,
+                mailboxRepo: mailboxRepo() as any,
+                mailTransport: { send: vi.fn().mockResolvedValue({ accepted: ["boss@example.com"], rejected: [] }) } as any,
+            });
+
+            await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", instanceProperty(context.session, 2026, 10, 8), context);
+
+            expect(calendarEventRepo.update.mock.calls[0][0].uid).toBe("exception");
+        });
+    });
+
+    it("Matches a native Outlook GlobalObjectId by the uppercase hex of the whole id (instance date zeroed), in either case.", async () => {
+        const blob = Buffer.concat([
+            encodeGlobalObjectId("x", new Date("2026-01-01T00:00:00.000Z")).subarray(0, 36),
+            Buffer.from([4, 0, 0, 0]),
+            Buffer.from([0xde, 0xad, 0xbe, 0xef]),
+        ]);
+        blob[16] = 0x07;
+        blob[17] = 0xea;
+        blob[18] = 10;
+        blob[19] = 8;
+        const zeroed = Buffer.from(blob);
+        zeroed.fill(0, 16, 20);
+        const hexUid = zeroed.toString("hex").toUpperCase();
+        const event = { uid: "evt1", version: 1, icalUid: hexUid.toLowerCase(), attendees: [{ address: "caller@example.com" }] };
+        const find = vi.fn().mockImplementation((query: any) => Promise.resolve(query.icalUid === hexUid.toLowerCase() ? [event] : []));
+        const context = makeContext({
+            calendarEventRepo: { find, update: vi.fn().mockResolvedValue(undefined) } as any,
+            mailboxRepo: { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) } as any,
+        });
+        const id = assignOrGetNamedPropertyId(context.session, { guid: PSETID_MEETING, kind: "lid", lid: LID_GLOBAL_OBJECT_ID });
+
+        expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", { [String(id)]: blob.toString("base64") }, context)).toBe(0);
+
+        expect(find.mock.calls.map((call) => call[0].icalUid)).toEqual([hexUid, hexUid.toLowerCase()]);
+        expect((context.calendarEventRepo as any).update).toHaveBeenCalledTimes(1);
     });
 
     it("Matches the caller via an alias address, not just primarySmtpAddress.", async () => {

@@ -17,7 +17,7 @@ import { RopGetPropertiesSpecificHandler } from "../src/rop/RopGetPropertiesSpec
 import { MAX_ROWS_PER_QUERY, RopQueryRowsHandler } from "../src/rop/RopQueryRowsHandler.js";
 import { RopReleaseHandler } from "../src/rop/RopReleaseHandler.js";
 import { RopSetColumnsHandler } from "../src/rop/RopSetColumnsHandler.js";
-import { appendBase64, MAX_WRITE_STREAM_BYTES, RopWriteStreamHandler } from "../src/rop/RopWriteStreamHandler.js";
+import { MAX_WRITE_STREAM_BYTES, readWriteStream, RopWriteStreamHandler } from "../src/rop/RopWriteStreamHandler.js";
 
 function makeContext(overrides: Partial<RopContext> = {}): RopContext {
     return {
@@ -155,24 +155,14 @@ describe("Property tag arrays", () => {
 });
 
 describe("Write stream growth", () => {
-    it("appendBase64 matches encoding the concatenated bytes, for every padding case.", () => {
-        for (const first of [0, 1, 2, 3, 4, 5]) {
-            for (const second of [0, 1, 2, 3, 7]) {
-                const a = Buffer.alloc(first, 0x61);
-                const b = Buffer.from(Array.from({ length: second }, (_, i) => i + 1));
-                expect(appendBase64(a.toString("base64"), b)).toBe(Buffer.concat([a, b]).toString("base64"));
-            }
-        }
-    });
-
-    it("Tracks writeSize and refuses a write past MAX_WRITE_STREAM_BYTES with MAPI_E_TOO_BIG, appending nothing.", () => {
+    it("Tracks writeSize and refuses a write past MAX_WRITE_STREAM_BYTES with MAPI_E_TOO_BIG, storing nothing.", async () => {
         const context = makeContext();
-        context.session.handles[6] = { type: "stream", entityUid: "", writeTargetHandleIndex: 3, writeBufferBase64: "", writeSize: MAX_WRITE_STREAM_BYTES - 2 };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "g6", writeTargetHandleIndex: 3, writeSize: MAX_WRITE_STREAM_BYTES - 2 };
         const handler = new RopWriteStreamHandler();
         const request = (data: Buffer) => new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(data.length).writeBytes(data).toBuffer();
 
         const ok = new BufferWriter();
-        handler.handle(new BufferReader(request(Buffer.from("ab"))), ok, context);
+        await handler.handle(new BufferReader(request(Buffer.from("ab"))), ok, context);
         const okResponse = new BufferReader(ok.toBuffer());
         okResponse.readUInt8();
         okResponse.readUInt8();
@@ -180,23 +170,31 @@ describe("Write stream growth", () => {
         expect(context.session.handles[6].writeSize).toBe(MAX_WRITE_STREAM_BYTES);
 
         const refused = new BufferWriter();
-        handler.handle(new BufferReader(request(Buffer.from("c"))), refused, context);
+        await handler.handle(new BufferReader(request(Buffer.from("c"))), refused, context);
         const refusedResponse = new BufferReader(refused.toBuffer());
         refusedResponse.readUInt8();
         refusedResponse.readUInt8();
         expect(refusedResponse.readUInt32LE()).toBe(0x80040305);
         expect(refusedResponse.readUInt16LE()).toBe(0);
-        expect(context.session.handles[6].writeBufferBase64).toBe(Buffer.from("ab").toString("base64"));
+        expect(context.session.handles[6].writeSize).toBe(MAX_WRITE_STREAM_BYTES);
     });
 
-    it("Derives the size of a stream saved before writeSize existed from its base64.", () => {
+    it("Keeps written bytes out of the session, and a retried write at the same offset replaces its chunk.", async () => {
         const context = makeContext();
-        context.session.handles[6] = { type: "stream", entityUid: "", writeTargetHandleIndex: 3, writeBufferBase64: Buffer.from("hello").toString("base64") };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "g-retry", writeTargetHandleIndex: 3, writeSize: 0 };
+        const handler = new RopWriteStreamHandler();
+        const write = (text: string) =>
+            handler.handle(new BufferReader(new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(text.length).writeBytes(Buffer.from(text)).toBuffer()), new BufferWriter(), context);
 
-        new RopWriteStreamHandler().handle(new BufferReader(new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(1).writeBytes(Buffer.from("!")).toBuffer()), new BufferWriter(), context);
+        await write("hello ");
+        const savedBeforeFailedRequest = JSON.stringify(context.session);
+        await write("wrong"); // this request's session save is lost...
+        context.session.handles[6].writeSize = 6; // ...so the stored session still says 6 bytes
+        await write("world");
+        await write(""); // an empty write stores nothing
 
-        expect(context.session.handles[6].writeSize).toBe(6);
-        expect(Buffer.from(context.session.handles[6].writeBufferBase64!, "base64").toString()).toBe("hello!");
+        expect(savedBeforeFailedRequest).not.toContain(Buffer.from("hello ").toString("base64"));
+        expect((await readWriteStream(context, 6, context.session.handles[6]))!.toString()).toBe("hello world");
     });
 });
 
@@ -242,15 +240,16 @@ describe("Handle generations and release", () => {
         const session = new MapiSessionContext({ mailboxUid: "mailbox-1", userUid: "user-1" });
         const first = assignHandle(session, 5, { type: "message", entityUid: "" });
         const second = assignHandle(session, 5, { type: "message", entityUid: "" });
-        expect(second.generation).toBeGreaterThan(first.generation!);
+        expect(second.generation).toEqual(expect.any(String));
+        expect(second.generation).not.toBe(first.generation);
         expect(session.handles[5]).toBe(second);
     });
 
     it("RopRelease releases write streams opened against the released message and drops cached handle data.", () => {
         const context = makeContext();
         const message = assignHandle(context.session, 5, { type: "message", entityUid: "" });
-        const stream = assignHandle(context.session, 6, { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: message.generation, writeBufferBase64: "YQ==" });
-        const unrelated = assignHandle(context.session, 7, { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: 12345 });
+        const stream = assignHandle(context.session, 6, { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: message.generation });
+        const unrelated = assignHandle(context.session, 7, { type: "stream", entityUid: "", writeTargetHandleIndex: 5, writeTargetGeneration: "another-generation" });
         handleDataCache.set(handleDataKey(context.session.uid, 6, stream.generation), Buffer.from("cached"));
 
         new RopReleaseHandler().handle(new BufferReader(Buffer.from([0x00, 0x05])), new BufferWriter(), context);

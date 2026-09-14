@@ -7,10 +7,10 @@ import { BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyType, writeTaggedPropertyValue } from "../codec/PropertyValue.js";
 import { assignHandle, type MapiObjectHandle } from "../MapiSessionManager.js";
 import { resolveFolderCalendarEvents } from "./CalendarEventTarget.js";
-import { handleDataCache, handleDataKey } from "./HandleDataCache.js";
+import { handleDataKey } from "./HandleDataCache.js";
 import { resolveFolderMessages } from "./MessageTarget.js";
 import { resolvePropertyValues } from "./PropertyResolvers.js";
-import type { RopContext } from "./RopHandler.js";
+import { handleDataStoreOf, type RopContext } from "./RopHandler.js";
 
 /**
  * Builds the `FastTransfer` binary stream (`[MS-OXCFXICS]` §2.2.4) `RopFastTransferSourceCopyTo`/
@@ -68,7 +68,7 @@ async function writePropList(
     writer: BufferWriter,
     target: string,
     columns: PropertyColumn[],
-    context: Pick<RopContext, "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo">,
+    context: Pick<RopContext, "mailboxUid" | "session" | "folderRepo" | "messageRepo" | "calendarEventRepo" | "mailboxRepo" | "budget">,
 ): Promise<void> {
     const values = await resolvePropertyValues(target, columns, context);
     columns.forEach((column, index) =>
@@ -80,19 +80,44 @@ function filterExcluded(columns: PropertyColumn[], excludePropertyIds: ReadonlyS
     return columns.filter((column) => !excludePropertyIds.has(column.propertyId));
 }
 
+/** The largest FastTransfer stream built for one handle; a larger source fails with `MAPI_E_TOO_BIG`. */
+export const MAX_FAST_TRANSFER_BYTES = 32 * 1024 * 1024;
+
+/** How long a built stream is kept for paging out. A client pages a stream out right after opening it; one that
+ * leaves it longer than this has to open the transfer again. */
+export const FAST_TRANSFER_TTL_SECONDS = 10 * 60;
+
+/** Thrown while building a stream that has grown past its byte limit. */
+export class FastTransferTooBigError extends Error {
+    public constructor() {
+        super("FastTransfer: the stream is larger than MAX_FAST_TRANSFER_BYTES.");
+        this.name = "FastTransferTooBigError";
+    }
+}
+
 /**
  * Builds the complete FastTransfer stream for `handle` (a `"folder"` or `"message"` Server object). `columns`,
  * when given (a `RopFastTransferSourceCopyProperties` explicit include list), replaces every default column set
  * uniformly at both folder- and message-level; `excludePropertyIds` (a `RopFastTransferSourceCopyTo` exclude
  * list) is only ever applied to this pragmatic subset's own default columns, per the same reasoning.
+ *
+ * The size is checked after every item, so a huge folder stops being built as soon as it passes `maxBytes`
+ * (`FastTransferTooBigError`) instead of being fully built first. Every item resolved and the finished stream's bytes
+ * count against the request's `ExecuteBudget` when there is one.
  */
 export async function buildFastTransferStream(
     handle: MapiObjectHandle,
     context: RopContext,
-    options: { columns?: PropertyColumn[]; excludePropertyIds?: ReadonlySet<number> } = {},
+    options: { columns?: PropertyColumn[]; excludePropertyIds?: ReadonlySet<number>; maxBytes?: number } = {},
 ): Promise<Buffer> {
     const writer = new BufferWriter();
     const exclude = options.excludePropertyIds ?? new Set<number>();
+    const maxBytes = options.maxBytes ?? MAX_FAST_TRANSFER_BYTES;
+    const checkSize = (): void => {
+        if (writer.length > maxBytes) {
+            throw new FastTransferTooBigError();
+        }
+    };
 
     if (handle.type === "folder") {
         const folderColumns = options.columns ?? filterExcluded(DEFAULT_FOLDER_COLUMNS, exclude);
@@ -112,6 +137,7 @@ export async function buildFastTransferStream(
                 writer.writeUInt32LE(MARKER_START_MESSAGE);
                 await writePropList(writer, row, messageColumns, context);
                 writer.writeUInt32LE(MARKER_END_MESSAGE);
+                checkSize();
             }
         }
 
@@ -121,41 +147,68 @@ export async function buildFastTransferStream(
         const columns = options.columns ?? filterExcluded(isCalendar ? DEFAULT_CALENDAR_COLUMNS : DEFAULT_MESSAGE_COLUMNS, exclude);
         await writePropList(writer, handle.entityUid, columns, context);
     }
+    checkSize();
+    context.budget?.chargeBytes(writer.length);
 
     return writer.toBuffer();
 }
 
-/** The largest FastTransfer stream built for one handle; a larger source fails with `MAPI_E_TOO_BIG`. */
-export const MAX_FAST_TRANSFER_BYTES = 32 * 1024 * 1024;
-
-/** Rebuilds a `"fastTransfer"` handle's stream from what the handle records about its source. */
-function rebuildFastTransferStream(transfer: MapiObjectHandle, context: RopContext): Promise<Buffer> {
-    return buildFastTransferStream({ type: transfer.transferSourceType!, entityUid: transfer.entityUid }, context, {
-        columns: transfer.transferColumns,
-        excludePropertyIds: new Set(transfer.transferExcludeIds ?? []),
-    });
+/** Builds a `"fastTransfer"` handle's stream from what the handle records about its source, or `undefined` when it
+ * is larger than `MAX_FAST_TRANSFER_BYTES`. */
+async function rebuildFastTransferStream(transfer: MapiObjectHandle, context: RopContext): Promise<Buffer | undefined> {
+    try {
+        return await buildFastTransferStream({ type: transfer.transferSourceType!, entityUid: transfer.entityUid }, context, {
+            columns: transfer.transferColumns,
+            excludePropertyIds: new Set(transfer.transferExcludeIds ?? []),
+        });
+    } catch (err) {
+        if (err instanceof FastTransferTooBigError) {
+            return undefined;
+        }
+        throw err;
+    }
 }
 
+/** Why `loadFastTransferBuffer` has no stream: `"tooBig"` when a rebuild passed `MAX_FAST_TRANSFER_BYTES`, `"lost"`
+ * when the stored stream is gone part-way through paging. */
+export type FastTransferLoadFailure = "tooBig" | "lost";
+
 /**
- * The built stream for the `"fastTransfer"` handle at `handleIndex`. Kept in `HandleDataCache` rather than the
- * session JSON, so paging a large stream out doesn't re-save it to the session store on every `Execute`. A cache
- * miss rebuilds it from the source.
+ * The built stream for the `"fastTransfer"` handle at `handleIndex`, from the shared `HandleDataStore` (Redis when
+ * configured, so any replica can page it out).
+ *
+ * When the stream is gone (expired, evicted, or built by a replica without shared storage), it is rebuilt only if
+ * nothing has been paged out yet. Part-way through, a rebuild could differ from what the client already has (items
+ * added or changed since), and continuing at the old offset would hand it bytes from a different stream, so that
+ * case reports `"lost"` and the client restarts the transfer. A rebuild is held to `MAX_FAST_TRANSFER_BYTES` like
+ * the original build.
  */
-export async function loadFastTransferBuffer(context: RopContext, handleIndex: number, transfer: MapiObjectHandle): Promise<Buffer> {
+export async function loadFastTransferBuffer(
+    context: RopContext,
+    handleIndex: number,
+    transfer: MapiObjectHandle,
+): Promise<Buffer | FastTransferLoadFailure> {
+    const store = handleDataStoreOf(context);
     const key = handleDataKey(context.session.uid, handleIndex, transfer.generation);
-    const cached = handleDataCache.get(key);
-    if (cached) {
-        return cached;
+    const stored = await store.get(key);
+    if (stored) {
+        return stored;
+    }
+    if ((transfer.transferPosition ?? 0) > 0) {
+        return "lost";
     }
     const buffer = await rebuildFastTransferStream(transfer, context);
-    handleDataCache.set(key, buffer);
+    if (!buffer) {
+        return "tooBig";
+    }
+    await store.set(key, buffer, FAST_TRANSFER_TTL_SECONDS);
     return buffer;
 }
 
 /**
  * Shared by `RopFastTransferSourceCopyTo`/`CopyProperties`: builds the stream for `source`, and on success stores a
- * `"fastTransfer"` handle at `outputHandleIndex` with the stream cached. Returns `false`, storing nothing, when the
- * stream exceeds `MAX_FAST_TRANSFER_BYTES`.
+ * `"fastTransfer"` handle at `outputHandleIndex` with the stream in the `HandleDataStore`. Returns `false`, storing
+ * nothing, when the stream exceeds `MAX_FAST_TRANSFER_BYTES`.
  */
 export async function openFastTransferHandle(
     context: RopContext,
@@ -172,10 +225,10 @@ export async function openFastTransferHandle(
         transferPosition: 0,
     };
     const buffer = await rebuildFastTransferStream(transfer, context);
-    if (buffer.length > MAX_FAST_TRANSFER_BYTES) {
+    if (!buffer) {
         return false;
     }
     assignHandle(context.session, outputHandleIndex, transfer);
-    handleDataCache.set(handleDataKey(context.session.uid, outputHandleIndex, transfer.generation), buffer);
+    await handleDataStoreOf(context).set(handleDataKey(context.session.uid, outputHandleIndex, transfer.generation), buffer, FAST_TRANSFER_TTL_SECONDS);
     return true;
 }

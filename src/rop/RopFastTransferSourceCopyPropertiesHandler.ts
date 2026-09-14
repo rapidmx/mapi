@@ -37,6 +37,7 @@ const ERROR_TOO_BIG = 0x80040305;
  */
 export class RopFastTransferSourceCopyPropertiesHandler implements RopHandler {
     public readonly ropId = ROP_ID_COPY_PROPERTIES;
+    public readonly responseHandleIndexOffset = 3; // OutputHandleIndex
 
     public async handle(reader: BufferReader, writer: BufferWriter, context: RopContext): Promise<void> {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session

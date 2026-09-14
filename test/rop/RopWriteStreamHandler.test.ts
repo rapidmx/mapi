@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
-import { RopWriteStreamHandler } from "../../src/rop/RopWriteStreamHandler.js";
+import { readWriteStream, RopWriteStreamHandler } from "../../src/rop/RopWriteStreamHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 
@@ -37,13 +37,13 @@ describe("RopWriteStreamHandler Tests", () => {
         expect(new RopWriteStreamHandler().ropId).toBe(0x2d);
     });
 
-    it("Returns MAPI_E_INVALID_OBJECT (with WrittenSize 0) when InputHandleIndex isn't a write-mode stream.", () => {
+    it("Returns MAPI_E_INVALID_OBJECT (with WrittenSize 0) when InputHandleIndex isn't a write-mode stream.", async () => {
         const context = makeContext();
         context.session.handles[6] = { type: "stream", entityUid: "message:m1", streamPosition: 0 };
         const handler = new RopWriteStreamHandler();
         const writer = new BufferWriter();
 
-        handler.handle(new BufferReader(buildRequest({ data: Buffer.from("hi") })), writer, context);
+        await handler.handle(new BufferReader(buildRequest({ data: Buffer.from("hi") })), writer, context);
 
         const response = new BufferReader(writer.toBuffer());
         response.readUInt8();
@@ -53,9 +53,9 @@ describe("RopWriteStreamHandler Tests", () => {
         expect(response.hasMore()).toBe(false);
     });
 
-    it("Accumulates bytes across multiple calls, correctly reassembling regardless of chunk boundaries.", () => {
+    it("Accumulates bytes across multiple calls, correctly reassembling regardless of chunk boundaries.", async () => {
         const context = makeContext();
-        context.session.handles[6] = { type: "stream", entityUid: "", writeTargetHandleIndex: 3, writeBufferBase64: "" };
+        context.session.handles[6] = { type: "stream", entityUid: "", generation: "accumulate", writeTargetHandleIndex: 3 };
         const handler = new RopWriteStreamHandler();
 
         const fullText = "Hello, world! This is a body written in two chunks.";
@@ -64,7 +64,7 @@ describe("RopWriteStreamHandler Tests", () => {
         const chunk2 = fullBytes.subarray(7);
 
         const writer1 = new BufferWriter();
-        handler.handle(new BufferReader(buildRequest({ data: chunk1 })), writer1, context);
+        await handler.handle(new BufferReader(buildRequest({ data: chunk1 })), writer1, context);
         const response1 = new BufferReader(writer1.toBuffer());
         response1.readUInt8();
         response1.readUInt8();
@@ -72,14 +72,15 @@ describe("RopWriteStreamHandler Tests", () => {
         expect(response1.readUInt16LE()).toBe(chunk1.length);
 
         const writer2 = new BufferWriter();
-        handler.handle(new BufferReader(buildRequest({ data: chunk2 })), writer2, context);
+        await handler.handle(new BufferReader(buildRequest({ data: chunk2 })), writer2, context);
         const response2 = new BufferReader(writer2.toBuffer());
         response2.readUInt8();
         response2.readUInt8();
         expect(response2.readUInt32LE()).toBe(0);
         expect(response2.readUInt16LE()).toBe(chunk2.length);
 
-        const accumulated = Buffer.from(context.session.handles[6]?.writeBufferBase64 ?? "", "base64");
+        const accumulated = (await readWriteStream(context, 6, context.session.handles[6]))!;
+        expect(context.session.handles[6].writeSize).toBe(fullBytes.length);
         expect(accumulated).toEqual(fullBytes);
         expect(accumulated.toString("utf16le").replace(/\0+$/, "")).toBe(fullText);
     });

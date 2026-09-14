@@ -16,8 +16,9 @@ import { RecurrenceFrequency, type RecurrenceRule } from "@rapidmx/restapi";
  * accepted - `MonthNth`/`MonthEnd`/Hijri patterns have no representation in `RecurrenceRule` (no ordinal-
  * weekday field) and decoding one throws a clear, documented error rather than silently guessing.
  * - `DeletedInstanceCount`/`ModifiedInstanceCount` (recurrence exceptions) and the outer structure's
- * `ExceptionCount` are always written as `0`; decoding a nonzero value throws, since `RecurrenceRule` has no
- * field to hold per-instance exceptions.
+ * `ExceptionCount` are always written as `0`. Decoding reads the deleted occurrences into `RecurrenceRule.exceptions`
+ * and ignores the details of modified ones (`ExceptionInfo`), which `RecurrenceRule` can't hold, instead of failing
+ * the whole save.
  * - A `YEARLY` rule with `interval > 1` ("every N years", N>1) is encoded as `RecurFrequency=Monthly` with
  * `Period=12*N`, per the spec's own stated rule that "a yearly recurrence pattern is just a monthly pattern
  * that occurs every 12 months" (a plain `RecurFrequency=Yearly` value's `Period` MUST be exactly 12).
@@ -223,6 +224,15 @@ export function encodeAppointmentRecurrence(rule: RecurrenceRule, startDate: Dat
     return writer.toBuffer();
 }
 
+/** Reads a `DeletedInstanceCount`/`ModifiedInstanceCount`-style count followed by that many 4-byte dates. */
+function readDateList(reader: BufferReader): number[] {
+    const count = reader.readUInt32LE();
+    if (count * 4 > reader.remaining) {
+        throw new RangeError(`AppointmentRecurrence: an instance date count of ${count} is larger than the pattern.`);
+    }
+    return Array.from({ length: count }, () => reader.readUInt32LE());
+}
+
 /**
  * Decodes an `AppointmentRecurrencePattern` blob (read from `reader`'s current position) back into a
  * `RecurrenceRule`. Throws a clear error for any pattern this pragmatic subset can't represent (see this
@@ -290,14 +300,10 @@ export function decodeAppointmentRecurrence(reader: BufferReader): RecurrenceRul
     const endType: EndTypeWire = reader.readUInt32LE();
     const occurrenceCount = reader.readUInt32LE();
     reader.readUInt32LE(); // FirstDOW
-    const deletedInstanceCount = reader.readUInt32LE();
-    if (deletedInstanceCount > 0) {
-        throw new Error("AppointmentRecurrence: recurrence exceptions (DeletedInstanceCount > 0) are not supported");
-    }
-    const modifiedInstanceCount = reader.readUInt32LE();
-    if (modifiedInstanceCount > 0) {
-        throw new Error("AppointmentRecurrence: recurrence exceptions (ModifiedInstanceCount > 0) are not supported");
-    }
+    // DeletedInstanceDates holds the original dates of every deleted *or* modified occurrence; ModifiedInstanceDates
+    // the (new) dates of the modified ones. An occurrence deleted outright is in the first list only.
+    const deletedDates = readDateList(reader);
+    const modifiedDates = new Set(readDateList(reader));
     reader.readUInt32LE(); // StartDate
     const endDateMinutes = reader.readUInt32LE();
 
@@ -311,16 +317,11 @@ export function decodeAppointmentRecurrence(reader: BufferReader): RecurrenceRul
 
     reader.readUInt32LE(); // ReaderVersion2
     reader.readUInt32LE(); // WriterVersion2
-    reader.readUInt32LE(); // StartTimeOffset
-    reader.readUInt32LE(); // EndTimeOffset
-    const exceptionCount = reader.readUInt16LE();
-    if (exceptionCount > 0) {
-        throw new Error("AppointmentRecurrence: exceptions (ExceptionCount > 0) are not supported");
-    }
-    const reservedBlock1Size = reader.readUInt32LE();
-    reader.readBytes(reservedBlock1Size);
-    const reservedBlock2Size = reader.readUInt32LE();
-    reader.readBytes(reservedBlock2Size);
+    const startTimeOffset = reader.readUInt32LE();
+    // Everything after this (ExceptionCount, the variable-length ExceptionInfo/ExtendedException blocks for modified
+    // occurrences, and the reserved blocks) describes per-occurrence changes RecurrenceRule has no field for, so it is
+    // not read. A modified occurrence that stayed on its day remains an ordinary occurrence; one moved to another day
+    // only drops out of its original day, since its new time has nowhere to go.
 
     return {
         freq,
@@ -330,6 +331,7 @@ export function decodeAppointmentRecurrence(reader: BufferReader): RecurrenceRul
         ...(byMonth ? { byMonth } : {}),
         ...(until ? { until } : {}),
         ...(count != null ? { count } : {}),
-        exceptions: [],
+        // A deleted occurrence's date is midnight (minutes since 1601); its start is that plus the series' start time.
+        exceptions: deletedDates.filter((minutes) => !modifiedDates.has(minutes)).map((minutes) => minutesSince1601ToDate(minutes + startTimeOffset)),
     };
 }

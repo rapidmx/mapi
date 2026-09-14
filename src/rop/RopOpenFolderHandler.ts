@@ -28,6 +28,7 @@ const ERROR_NOT_FOUND = 0x8004010f;
  */
 export class RopOpenFolderHandler implements RopHandler {
     public readonly ropId = ROP_ID_OPEN_FOLDER;
+    public readonly responseHandleIndexOffset = 3; // OutputHandleIndex
 
     public handle(reader: BufferReader, writer: BufferWriter, context: RopContext): void {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session

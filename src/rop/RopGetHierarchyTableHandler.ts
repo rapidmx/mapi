@@ -26,6 +26,7 @@ const ERROR_INVALID_OBJECT = 0x80070005;
  */
 export class RopGetHierarchyTableHandler implements RopHandler {
     public readonly ropId = ROP_ID_GET_HIERARCHY_TABLE;
+    public readonly responseHandleIndexOffset = 3; // OutputHandleIndex
 
     public async handle(reader: BufferReader, writer: BufferWriter, context: RopContext): Promise<void> {
         reader.readUInt8(); // LogonId - this pragmatic subset doesn't track multiple concurrent logons per session

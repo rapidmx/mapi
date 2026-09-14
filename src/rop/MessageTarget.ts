@@ -69,5 +69,16 @@ export function assignOrGetMid(session: MapiSessionContext, target: string): num
     const mid = session.nextMessageId++;
     session.messageIds[String(mid)] = target;
     session.messageTargetIds[target] = mid;
+    // MIDs are handed out consecutively, so the mapped ones are exactly [firstMessageId, nextMessageId). Past the cap
+    // the oldest is forgotten: opening it by that MID fails until a table row assigns the item a new one.
+    while (session.nextMessageId - session.firstMessageId > MAX_MESSAGE_IDS) {
+        const oldest = String(session.firstMessageId++);
+        delete session.messageTargetIds[session.messageIds[oldest]];
+        delete session.messageIds[oldest];
+    }
     return mid;
 }
+
+/** The most MIDs one session keeps mapped. A session paging through a very large mailbox would otherwise grow its
+ * MID maps - saved with the session on every `Execute` - without bound. */
+export const MAX_MESSAGE_IDS = 20000;

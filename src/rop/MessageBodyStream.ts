@@ -46,7 +46,10 @@ export async function resolveMessageBodyBytes(target: string, messageRepo: RepoU
  * The body bytes for the read stream at `handleIndex`. Parsed once and kept in `HandleDataCache` (outside the
  * session JSON) for the life of the handle, so reading a large body in many `RopReadStream` chunks costs one
  * fetch and one MIME parse instead of one per chunk. A cache miss (eviction, or a request served by another
- * replica) just resolves the body again.
+ * replica) just resolves the body again: a stored message's body never changes, so the bytes are the same.
+ *
+ * Within one `Execute`, streams opened on the same message share a single parse (`ExecuteBudget.bodies`), and each
+ * parse's bytes count against the request's byte budget.
  */
 export async function loadStreamBody(context: RopContext, handleIndex: number, stream: MapiObjectHandle): Promise<Buffer> {
     const key = handleDataKey(context.session.uid, handleIndex, stream.generation);
@@ -54,7 +57,14 @@ export async function loadStreamBody(context: RopContext, handleIndex: number, s
     if (cached) {
         return cached;
     }
-    const bytes = await resolveMessageBodyBytes(stream.entityUid, context.messageRepo, context.blobStore);
+    const budget = context.budget;
+    let pending = budget?.bodies.get(stream.entityUid);
+    if (!pending) {
+        pending = resolveMessageBodyBytes(stream.entityUid, context.messageRepo, context.blobStore);
+        budget?.bodies.set(stream.entityUid, pending);
+        budget?.chargeBytes((await pending).length);
+    }
+    const bytes = await pending;
     handleDataCache.set(key, bytes);
     return bytes;
 }

@@ -6,15 +6,16 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { AttendeeResponseStatus, buildEventIcs, type Attendee, type CalendarEvent } from "@rapidmx/restapi";
 import { BufferReader } from "../codec/BufferCursor.js";
 import { isPlainEmailAddress } from "./AddressList.js";
-import { decodeGlobalObjectId } from "../codec/GlobalObjectId.js";
+import { decodeGlobalObjectId, globalObjectIdInstanceDate } from "../codec/GlobalObjectId.js";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
 import { LID_GLOBAL_OBJECT_ID, PSETID_MEETING } from "./CalendarNamedProperties.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
 import type { RopContext } from "./RopHandler.js";
+import { sendOrThrow } from "./TransportSend.js";
 
 /** `PidTagMessageClass` suffix -> the caller's own new `AttendeeResponseStatus`, per `[MS-OXOCAL]`'s meeting
  * response object naming convention. An unrecognized suffix (a message class this pragmatic subset doesn't
- * know how to interpret as a response) is simply not handled - see `submitMeetingResponse`'s own doc comment. */
+ * know how to interpret as a response) is answered with `MAPI_E_INVALID_PARAMETER`. */
 const RESPONSE_STATUS_BY_MESSAGE_CLASS: Record<string, AttendeeResponseStatus> = {
     "IPM.Schedule.Meeting.Resp.Pos": AttendeeResponseStatus.ACCEPTED,
     "IPM.Schedule.Meeting.Resp.Tent": AttendeeResponseStatus.TENTATIVE,
@@ -38,70 +39,94 @@ function findNamedPropertyValue(session: MapiSessionContext, properties: Record<
     return undefined;
 }
 
+/** `MAPI_E_INVALID_PARAMETER`: not a response this server understands (unknown message class, no or malformed
+ * `PidLidGlobalObjectId`). */
+const ERROR_INVALID_PARAMETER = 0x80070057;
+/** `MAPI_E_NOT_FOUND`: no meeting in the caller's mailbox matches, or the caller isn't one of its attendees. */
+const ERROR_NOT_FOUND = 0x8004010f;
+/** `MAPI_E_CALL_FAILED`: the response was recorded but the iTIP `REPLY` couldn't be sent to the organizer. */
+const ERROR_CALL_FAILED = 0x80004005;
+
 /**
  * Handles a submitted `"IPM.Schedule.Meeting.Resp.{Pos,Neg,Tent}"` message - an attendee's own response to a
- * meeting invite this server previously sent (`RopSubmitMessageHandler.submitAppointment`). Delegated to from
- * `RopSubmitMessageHandler` for that message-class prefix, instead of the ordinary mail or Appointment paths.
+ * meeting invite. Delegated to from `RopSubmitMessageHandler` for that message-class prefix, instead of the ordinary
+ * mail or Appointment paths. Returns the ROP's `ReturnValue`.
  *
  * Mirrors restapi's `BaseCalendarEventRoute.respond()`. It correlates the response via `PidLidGlobalObjectId`
  * (echoed by a real client from the invite it's responding to - see `GlobalObjectId.ts`) to **the caller's own
  * copy** of the meeting: the query is scoped to the caller's `mailboxUid`, which is the access check. The
  * organizer's copy (in another mailbox) is never touched here; the organizer's server applies the iTIP `REPLY` sent
- * below, exactly as for a REST response. The earlier version searched every mailbox by `icalUid` and edited
- * whichever event came back first, but an `icalUid` is in every invite each attendee received, so it isn't a secret.
+ * below, exactly as for a REST response. A native Outlook `GlobalObjectId` decodes to the uppercase hex form of its
+ * iCalendar UID, which is matched in either case.
  *
- * For a response to one occurrence of a recurring meeting (the `GlobalObjectId`'s instance date is set), the
- * caller's exception copy for that date is preferred, falling back to the series. The caller's
- * `Attendee.responseStatus` is recorded; declining soft-deletes the caller's copy instead. Then an iTIP `REPLY`
- * (restapi's own `buildEventIcs`) goes to the organizer. A send failure is swallowed, like REST: the response is
- * already recorded.
+ * **One occurrence of a recurring meeting** (the `GlobalObjectId`'s instance date is set): the caller's exception
+ * copy for that date is used when there is one, comparing dates in the event's own time zone. Without one, the
+ * series is left alone - responding to one occurrence must not change or delete every other occurrence. Declining
+ * adds the occurrence to the caller's series `recurrenceRule.exceptions` (so it leaves their calendar); accepting or
+ * tentatively accepting changes nothing locally. Either way the `REPLY` names just that occurrence (`RECURRENCE-ID`).
  *
- * Every failure mode here (no `PidLidGlobalObjectId` set, no matching `CalendarEvent`, no resolvable mailbox,
- * caller isn't actually an attendee, unrecognized message-class suffix) is a silent no-op rather than an error
- * response - the same "don't fail the whole ROP over a stale/unresolvable reference" principle this pragmatic
- * subset applies throughout. A response that can't be correlated or applied is simply dropped.
+ * **The whole meeting** (no instance date, or a copy that doesn't recur): the caller's `Attendee.responseStatus` is
+ * recorded; declining soft-deletes the caller's copy instead.
+ *
+ * The `REPLY` (restapi's own `buildEventIcs`) goes out through `sendOrThrow`, so a transport that rejects it is
+ * reported as `MAPI_E_CALL_FAILED` instead of success; the response itself stays recorded. An organizer or attendee
+ * address that isn't a plain SMTP address is not mailed at all. A response that can't be matched to a meeting the
+ * caller attends is an error (`MAPI_E_NOT_FOUND`/`MAPI_E_INVALID_PARAMETER`), not a silent success.
  */
-export async function submitMeetingResponse(messageClass: string, draftProperties: Record<string, string>, context: RopContext): Promise<void> {
+export async function submitMeetingResponse(messageClass: string, draftProperties: Record<string, string>, context: RopContext): Promise<number> {
     const responseStatus = RESPONSE_STATUS_BY_MESSAGE_CLASS[messageClass];
-    if (!responseStatus) {
-        return;
-    }
-
-    const globalObjectIdBase64 = findNamedPropertyValue(context.session, draftProperties, PSETID_MEETING, LID_GLOBAL_OBJECT_ID);
+    const globalObjectIdBase64 = responseStatus
+        ? findNamedPropertyValue(context.session, draftProperties, PSETID_MEETING, LID_GLOBAL_OBJECT_ID)
+        : undefined;
     if (!globalObjectIdBase64) {
-        return;
+        return ERROR_INVALID_PARAMETER;
     }
     const globalObjectId = Buffer.from(globalObjectIdBase64, "base64");
-    const icalUid = decodeGlobalObjectId(new BufferReader(globalObjectId));
-
-    const events: CalendarEventRow[] = await context.calendarEventRepo.find(
-        { icalUid, mailboxUid: context.mailboxUid, limit: MAX_EVENT_COPIES },
-        { ignoreACL: true, limit: MAX_EVENT_COPIES },
-    );
-    const event = pickOccurrence(events, instanceDateOf(globalObjectId));
-    if (!event) {
-        return;
+    let icalUid: string;
+    try {
+        icalUid = decodeGlobalObjectId(new BufferReader(globalObjectId));
+    } catch {
+        return ERROR_INVALID_PARAMETER;
     }
 
-    const mailbox = await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true });
-    if (!mailbox) {
-        return;
+    const picked = pickOccurrence(await findCallerCopies(context, icalUid), globalObjectIdInstanceDate(globalObjectId));
+    const mailbox = picked ? await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true }) : undefined;
+    if (!picked || !mailbox) {
+        return ERROR_NOT_FOUND;
     }
+    const { event, occurrence } = picked;
     const callerAddresses = new Set([mailbox.primarySmtpAddress.toLowerCase(), ...mailbox.aliasAddresses.map((a: string) => a.toLowerCase())]);
     const respondingAttendee = event.attendees.find((attendee) => callerAddresses.has(attendee.address.toLowerCase()));
     if (!respondingAttendee) {
-        return;
+        return ERROR_NOT_FOUND;
     }
 
     const updatedAttendee: Attendee = { ...respondingAttendee, responseStatus };
-    if (responseStatus === AttendeeResponseStatus.DECLINED) {
+    let replyEvent: CalendarEventRow = event;
+    if (occurrence) {
+        if (responseStatus === AttendeeResponseStatus.DECLINED) {
+            const rule = event.recurrenceRule!;
+            const exceptions = (rule.exceptions ?? []).map((date) => new Date(date));
+            if (!exceptions.some((date) => date.getTime() === occurrence.getTime())) {
+                const recurrenceRule = { ...rule, exceptions: [...exceptions, occurrence] };
+                await context.calendarEventRepo.update({ uid: event.uid, version: event.version, recurrenceRule }, event, { ignoreACL: true });
+            }
+        }
+        const duration = new Date(event.endDate).getTime() - new Date(event.startDate).getTime();
+        replyEvent = { ...event, recurrenceRule: undefined, recurrenceId: occurrence, startDate: occurrence, endDate: new Date(occurrence.getTime() + duration) };
+    } else if (responseStatus === AttendeeResponseStatus.DECLINED) {
         await context.calendarEventRepo.delete(event.uid, { ignoreACL: true });
     } else {
         const attendees: Attendee[] = event.attendees.map((attendee) => (attendee === respondingAttendee ? updatedAttendee : attendee));
         await context.calendarEventRepo.update({ uid: event.uid, version: event.version, attendees }, event, { ignoreACL: true });
     }
 
-    await sendReply(context, event, updatedAttendee, mailbox.displayName);
+    try {
+        await sendReply(context, replyEvent, updatedAttendee, mailbox.displayName);
+    } catch {
+        return ERROR_CALL_FAILED;
+    }
+    return 0;
 }
 
 /** The most copies of one meeting (series plus exceptions) considered in the caller's mailbox. */
@@ -115,44 +140,82 @@ const REPLY_SUBJECT_PREFIX: Record<string, string> = {
     [AttendeeResponseStatus.DECLINED]: "Declined",
 };
 
-/** The `YYYY-MM-DD` (UTC) occurrence a `GlobalObjectId` names (`[MS-OXOCAL]` `YH`/`YL`/`M`/`D` bytes), or
- * `undefined` for the whole series (all zero). */
-function instanceDateOf(globalObjectId: Buffer): string | undefined {
-    const year = (globalObjectId[16] << 8) | globalObjectId[17];
-    if (year === 0) {
-        return undefined;
-    }
-    return `${String(year).padStart(4, "0")}-${String(globalObjectId[18]).padStart(2, "0")}-${String(globalObjectId[19]).padStart(2, "0")}`;
+/** The caller's copies of the meeting `icalUid` names. An `OutlookID`'s hex UID may have been stored in either case,
+ * so a miss is retried in lower case. */
+async function findCallerCopies(context: RopContext, icalUid: string): Promise<CalendarEventRow[]> {
+    const find = (uid: string): Promise<CalendarEventRow[]> =>
+        context.calendarEventRepo.find({ icalUid: uid, mailboxUid: context.mailboxUid, limit: MAX_EVENT_COPIES }, { ignoreACL: true, limit: MAX_EVENT_COPIES });
+    const events = await find(icalUid);
+    return events.length > 0 || icalUid.toLowerCase() === icalUid ? events : find(icalUid.toLowerCase());
 }
 
-/** The caller's copy for `instanceDate` when one exists, otherwise the series itself (no `recurrenceId`). */
-function pickOccurrence(events: CalendarEventRow[], instanceDate: string | undefined): CalendarEventRow | undefined {
+/** `timeZone` when `Intl` accepts it, otherwise `"UTC"`. */
+function usableTimeZone(timeZone: string | undefined): string {
+    try {
+        return new Intl.DateTimeFormat("en-US", { timeZone: timeZone || "UTC" }).resolvedOptions().timeZone;
+    } catch {
+        return "UTC";
+    }
+}
+
+/** `date`'s calendar date (`YYYY-MM-DD`) in `timeZone`. */
+function dateInZone(date: Date, timeZone: string): string {
+    return new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+/** How far `timeZone`'s wall clock is ahead of UTC at `date`, in milliseconds (minute precision). */
+function zoneOffsetMs(date: Date, timeZone: string): number {
+    const parts: Record<string, string> = {};
+    const format = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric" });
+    for (const part of format.formatToParts(date)) {
+        parts[part.type] = part.value;
+    }
+    const wallClock = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), Number(parts.hour), Number(parts.minute));
+    return wallClock - Math.floor(date.getTime() / 60000) * 60000;
+}
+
+/** The start of `series`' occurrence on `instanceDate`: the series' local start time on that date in the series'
+ * own time zone, so a daylight-saving change in between keeps the same wall-clock time. */
+function occurrenceStart(series: CalendarEventRow, instanceDate: string): Date {
+    const timeZone = usableTimeZone(series.timezone);
+    const start = new Date(series.startDate);
+    const days = Math.round((Date.parse(instanceDate) - Date.parse(dateInZone(start, timeZone))) / 86400000);
+    const shifted = new Date(start.getTime() + days * 86400000);
+    return new Date(shifted.getTime() - (zoneOffsetMs(shifted, timeZone) - zoneOffsetMs(start, timeZone)));
+}
+
+/**
+ * The copy a response applies to. For an `instanceDate`, the caller's exception copy for that date (its
+ * `recurrenceId`'s date in the event's time zone) when one exists; otherwise the series (no `recurrenceId`), with
+ * `occurrence` set to the named occurrence's start when the series recurs.
+ */
+function pickOccurrence(events: CalendarEventRow[], instanceDate: string | undefined): { event: CalendarEventRow; occurrence?: Date } | undefined {
     const exception = instanceDate
-        ? events.find((event) => event.recurrenceId != null && new Date(event.recurrenceId).toISOString().slice(0, 10) === instanceDate)
+        ? events.find((event) => event.recurrenceId != null && dateInZone(new Date(event.recurrenceId), usableTimeZone(event.timezone)) === instanceDate)
         : undefined;
-    return exception ?? events.find((event) => event.recurrenceId == null);
+    const series = events.find((event) => event.recurrenceId == null);
+    if (exception || !series) {
+        return exception ? { event: exception } : undefined;
+    }
+    return { event: series, occurrence: instanceDate && series.recurrenceRule ? occurrenceStart(series, instanceDate) : undefined };
 }
 
 /** Sends the iTIP `REPLY` for `attendee`'s response to the organizer, the same message `BaseCalendarEventRoute.respond()`
- * sends. Best-effort: a failure is swallowed, since the response itself is already saved. */
+ * sends. Throws when the transport doesn't accept it. */
 async function sendReply(context: RopContext, event: CalendarEventRow, attendee: Attendee, displayName: string | undefined): Promise<void> {
     const organizerAddress = event.organizer?.address ?? "";
     if (!isPlainEmailAddress(organizerAddress) || !isPlainEmailAddress(attendee.address)) {
         return;
     }
-    try {
-        const ics = buildEventIcs({ ...event, attendees: [attendee] }, "REPLY", { onlyAttendee: attendee });
-        const raw: Buffer = await new MailComposer({
-            from: { name: displayName ?? "", address: attendee.address },
-            to: organizerAddress,
-            subject: `${REPLY_SUBJECT_PREFIX[attendee.responseStatus]}: ${event.title}`,
-            text: `${attendee.displayName ?? attendee.address} has responded ${attendee.responseStatus} to: ${event.title}`,
-            icalEvent: { method: "reply", content: ics },
-        })
-            .compile()
-            .build();
-        await context.mailTransport.send({ raw, envelopeFrom: attendee.address, envelopeTo: [organizerAddress] });
-    } catch {
-        // Same as REST: the response is already recorded, so a failed notification doesn't fail the request.
-    }
+    const ics = buildEventIcs({ ...event, attendees: [attendee] }, "REPLY", { onlyAttendee: attendee });
+    const raw: Buffer = await new MailComposer({
+        from: { name: displayName ?? "", address: attendee.address },
+        to: organizerAddress,
+        subject: `${REPLY_SUBJECT_PREFIX[attendee.responseStatus]}: ${event.title}`,
+        text: `${attendee.displayName ?? attendee.address} has responded ${attendee.responseStatus} to: ${event.title}`,
+        icalEvent: { method: "reply", content: ics },
+    })
+        .compile()
+        .build();
+    await sendOrThrow(context.mailTransport, { raw, envelopeFrom: attendee.address, envelopeTo: [organizerAddress] });
 }

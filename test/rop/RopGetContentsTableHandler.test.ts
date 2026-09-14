@@ -69,7 +69,7 @@ describe("RopGetContentsTableHandler Tests", () => {
         expect(response.readUInt32LE()).toBe(0);
         expect(response.hasMore()).toBe(false);
 
-        expect(context.session.handles[6]).toEqual({ type: "table", entityUid: "folder:top1", contentsKind: "message", cursor: 0, generation: 1 });
+        expect(context.session.handles[6]).toEqual({ type: "table", entityUid: "folder:top1", contentsKind: "message", cursor: 0, generation: expect.any(String) });
         expect(folderRepo.findOne).toHaveBeenCalledWith("top1", { ignoreACL: true });
         expect(messageRepo.find).not.toHaveBeenCalled();
     });
