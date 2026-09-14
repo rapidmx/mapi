@@ -92,5 +92,13 @@
     "typings": "dist/types/index.d.ts",
     "files": [
         "dist"
-    ]
+    ],
+    "rapidmx": {
+        "plugin": {
+            "apiVersion": 1,
+            "displayName": "MAPI over HTTP",
+            "description": "Lets Outlook for Windows connect with the MAPI/HTTP protocol (served at /mapi/emsmdb and /mapi/nspi).",
+            "settings": []
+        }
+    }
 }

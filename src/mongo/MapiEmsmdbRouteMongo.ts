@@ -26,14 +26,17 @@ import { RopDeleteFolderHandler } from "../rop/RopDeleteFolderHandler.js";
 import { RopFastTransferSourceCopyToHandler } from "../rop/RopFastTransferSourceCopyToHandler.js";
 import { RopFastTransferSourceCopyPropertiesHandler } from "../rop/RopFastTransferSourceCopyPropertiesHandler.js";
 import { RopFastTransferSourceGetBufferHandler } from "../rop/RopFastTransferSourceGetBufferHandler.js";
+import { RouteDecorators } from "@rapidrest/service-core";
+const { Route } = RouteDecorators;
 
 /**
- * Mongo-backed concrete `BaseMapiEmsmdbRoute`. A deployment mounts this at the well-known MAPI/HTTP path via
- * its own trivial `@Route("/mapi/emsmdb")` subclass, following the same pattern `EasRouteMongo.ts`'s doc
- * comment describes.
+ * Mongo-backed concrete `BaseMapiEmsmdbRoute`, mounted at `/mapi/emsmdb`. Exported from this plugin's
+ * `./mongo` entry point, so the server host mounts it without a wrapper class of its
+ * own.
  *
  * @author Jean-Philippe Steinmetz
  */
+@Route("/mapi/emsmdb")
 export class MapiEmsmdbRouteMongo extends BaseMapiEmsmdbRoute<MailboxMongo> {
     protected mailboxClass: any = MailboxMongo;
     protected folderClass: any = FolderMongo;
