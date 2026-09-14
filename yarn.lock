@@ -724,11 +724,11 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@rapidmx/mapi@workspace:.":
+"@rapidmx/mapi-plugin@workspace:.":
   version: 0.0.0-use.local
-  resolution: "@rapidmx/mapi@workspace:."
+  resolution: "@rapidmx/mapi-plugin@workspace:."
   dependencies:
-    "@rapidmx/restapi": "npm:^0.8.0"
+    "@rapidmx/restapi": "npm:^0.9.0"
     "@rapidrest/core": "npm:^5.2.2"
     "@rapidrest/service-core": "npm:^2.0.0"
     "@swc/core": "npm:^1.16.2"
@@ -765,15 +765,15 @@ __metadata:
     vitest: "npm:^5.0.0"
     winston: "npm:^3.19.0"
   peerDependencies:
-    "@rapidmx/restapi": ^0.8.0
+    "@rapidmx/restapi": 0.x
     "@rapidrest/core": 5.x
     "@rapidrest/service-core": 2.x
   languageName: unknown
   linkType: soft
 
-"@rapidmx/restapi@npm:^0.8.0":
-  version: 0.8.0
-  resolution: "@rapidmx/restapi@npm:0.8.0"
+"@rapidmx/restapi@npm:^0.9.0":
+  version: 0.9.0
+  resolution: "@rapidmx/restapi@npm:0.9.0"
   dependencies:
     "@peculiar/x509": "npm:^2.1.0"
     acme-client: "npm:^5.4.0"
@@ -804,7 +804,7 @@ __metadata:
       optional: true
     pdf-parse:
       optional: true
-  checksum: 10c0/17252bdfa839bff990241f40a7a824dafd05d2fbec02215b5b9307cfc3fcc68c9b09a1928b70b41ed51d3f0c4ea1fc4823ff95c8535bbbbeb366d17efd0eaa5d
+  checksum: 10c0/0ff9735974e9e60c0b3a38c505967b377d323dcf65cdb732b1b124f4c4fff5ac02ec505472cb8f1923d1757b38e9c5791225edb95f0d0c042d19f028717362a5
   languageName: node
   linkType: hard
 
