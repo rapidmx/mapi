@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.3] - 2026-09-14
+
+### Added
+- Added a test that each entry point exports only the mounted MAPI routes and that the manifest is present
+
+### Changed
+- Convert this library into a RapidMX server plugin: package.json carries a rapidmx.plugin manifest, and the ./mongo and ./sql entry points export MapiEmsmdbRoute and MapiNspiRoute mounted at /mapi/emsmdb and /mapi/nspi, so a server needs no wrapper classes
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Upgraded deps
+- Changing package name to @rapidmx/mapi-plugin
+
 ## [1.0.0-beta.2] - 2026-09-13
 
 ### Changed
@@ -96,7 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.3...HEAD
+[1.0.0-beta.3]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.0...v1.0.0-beta.1
 [1.0.0-beta.0]: https://github.com/RapidMX/mapi/releases/tag/v1.0.0-beta.0
