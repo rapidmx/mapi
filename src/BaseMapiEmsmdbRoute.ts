@@ -187,10 +187,10 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
                 await this.handleConnect(req, res, user);
                 return;
             case "Execute":
-                await this.handleExecute(req, res);
+                await this.handleExecute(req, res, user);
                 return;
             case "Disconnect":
-                await this.handleDisconnect(req, res);
+                await this.handleDisconnect(req, res, user);
                 return;
             case "NotificationWait":
                 // Real, spec-defined request type, deliberately deferred - no push-notification support in
@@ -242,11 +242,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
      * allocates/frees table-wide handle slots at the framing level; individual `RopHandler`s manage their own
      * entries within `session.handles` instead).
      */
-    private async handleExecute(req: HttpRequest, res: HttpResponse): Promise<void> {
-        const sessionId: string | undefined = req.cookies["MapiContext"];
-        const session: MapiSessionContext | undefined = sessionId
-            ? await this.sessionManager!.load(sessionId)
-            : undefined;
+    private async handleExecute(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
+        const session: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
         if (!session) {
             res.setHeader("X-ResponseCode", String(ERROR_SESSION_NOT_FOUND));
             const body = new BufferWriter();
@@ -303,10 +300,22 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         res.status(200).send(body.toBuffer());
     }
 
-    private async handleDisconnect(req: HttpRequest, res: HttpResponse): Promise<void> {
+    /**
+     * Loads the session named by the `MapiContext` cookie, but only if the authenticated caller is the user who
+     * `Connect`ed it. The cookie value alone is a bearer token for someone else's mailbox otherwise, so a session
+     * belonging to another user is treated exactly like one that doesn't exist.
+     */
+    private async loadOwnSession(req: HttpRequest, user: JWTUser): Promise<MapiSessionContext | undefined> {
         const sessionId: string | undefined = req.cookies["MapiContext"];
-        if (sessionId) {
-            await this.sessionManager!.destroy(sessionId);
+        const session: MapiSessionContext | undefined = sessionId ? await this.sessionManager!.load(sessionId) : undefined;
+        return session && session.userUid === user.uid ? session : undefined;
+    }
+
+    private async handleDisconnect(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
+        // Another user's session is left alone, with the same success response as for an unknown session.
+        const session: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
+        if (session) {
+            await this.sessionManager!.destroy(session.uid);
         }
         const body = new BufferWriter();
         body.writeUInt32LE(0); // StatusCode

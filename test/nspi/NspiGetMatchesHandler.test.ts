@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import { BufferReader, BufferWriter } from "../../src/codec/BufferCursor.js";
 import { PropertyType, readPropertyValue, writePropertyTag, writeTaggedPropertyValue } from "../../src/codec/PropertyValue.js";
-import { handleNspiGetMatches } from "../../src/nspi/NspiGetMatchesHandler.js";
+import { handleNspiGetMatches, MAX_MATCH_ROWS } from "../../src/nspi/NspiGetMatchesHandler.js";
 import { writeStat, type Stat } from "../../src/nspi/NspiCodec.js";
 
 function makeRes() {
@@ -51,7 +51,7 @@ describe("handleNspiGetMatches Tests", () => {
 
         await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
-        expect(contactRepo.find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1" }, { ignoreACL: true });
+        expect(contactRepo.find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", limit: 50 }, { ignoreACL: true, limit: 50 });
         expect(res.status).toHaveBeenCalledWith(200);
     });
 
@@ -199,7 +199,7 @@ describe("handleNspiGetMatches Tests", () => {
 
         await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
-        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(jane)" }, { ignoreACL: true });
+        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(jane)", limit: 50 }, { ignoreACL: true, limit: 50 });
         expect(find).toHaveBeenCalledTimes(4); // displayName/givenName/surname/company
         const body = res.send.mock.calls[0][0] as Buffer;
         const reader = new BufferReader(body);
@@ -247,6 +247,49 @@ describe("handleNspiGetMatches Tests", () => {
 
         await handleNspiGetMatches(req as any, res as any, "mailbox-1", contactRepo as any);
 
-        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(a\\.b)" }, { ignoreACL: true });
+        expect(find).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "regex(a\\.b)", limit: 50 }, { ignoreACL: true, limit: 50 });
+    });
+
+    function searchRequest(term: string, rowCount: number) {
+        return buildRequest((writer) => {
+            writer.writeUInt32LE(0);
+            writer.writeUInt8(0);
+            writer.writeUInt8(0);
+            writer.writeUInt32LE(0);
+            writer.writeUInt8(1); // HasFilter
+            writer.writeUInt8(0x03);
+            writer.writeUInt16LE(0x0001);
+            writer.writeUInt16LE(0x0001);
+            writePropertyTag(writer, { propertyId: 0x3001, propertyType: PropertyType.PtypString });
+            writeTaggedPropertyValue(writer, { propertyId: 0x3001, propertyType: PropertyType.PtypString, value: term });
+            writer.writeUInt8(0); // HasPropertyName
+            writer.writeUInt32LE(rowCount);
+            writer.writeUInt8(0);
+            writer.writeUInt32LE(0);
+        });
+    }
+
+    it("Truncates a long, metacharacter-heavy search term so its escaped regex fits service-core's 100-character limit.", async () => {
+        const find = vi.fn().mockResolvedValue([]);
+
+        await handleNspiGetMatches(searchRequest("(".repeat(80) + "abc", 50) as any, makeRes() as any, "mailbox-1", { find } as any);
+
+        expect(find).toHaveBeenCalledTimes(4);
+        for (const [query] of find.mock.calls) {
+            expect(query.displayName ?? query.givenName ?? query.surname ?? query.company).toBe(`regex(${"\\(".repeat(50)})`);
+        }
+    });
+
+    it("Passes a query limit matching RowCount, clamped to at least 1 and at most MAX_MATCH_ROWS.", async () => {
+        for (const [rowCount, limit] of [
+            [0, 1],
+            [7, 7],
+            [MAX_MATCH_ROWS + 1, MAX_MATCH_ROWS],
+            [0xffffffff, MAX_MATCH_ROWS],
+        ]) {
+            const find = vi.fn().mockResolvedValue([]);
+            await handleNspiGetMatches(searchRequest("jane", rowCount) as any, makeRes() as any, "mailbox-1", { find } as any);
+            expect(find).toHaveBeenCalledWith(expect.objectContaining({ limit }), { ignoreACL: true, limit });
+        }
     });
 });

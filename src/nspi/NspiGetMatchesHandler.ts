@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz. All rights reserved.
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { StringUtils } from "@rapidrest/core";
 import type { HttpRequest, HttpResponse, RepoUtils } from "@rapidrest/service-core";
+import { boundedEscapedPattern } from "../RegexPatternUtils.js";
 import { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyType, type PropertyTag, type PropertyValueData } from "../codec/PropertyValue.js";
 import { defaultValueForType } from "../rop/PropertyResolvers.js";
@@ -22,6 +22,9 @@ import {
  * (`SearchCommand.ts`'s `DisplayName`/`EmailAddress`). */
 const PID_TAG_DISPLAY_NAME = 0x3001;
 const PID_TAG_EMAIL_ADDRESS = 0x3003;
+/** The most rows one `GetMatches` lookup asks the repo for per query - `RepoUtils.find()`'s own page cap. */
+export const MAX_MATCH_ROWS = 1000;
+
 const DEFAULT_COLUMNS: PropertyTag[] = [
     { propertyId: PID_TAG_DISPLAY_NAME, propertyType: PropertyType.PtypString },
     { propertyId: PID_TAG_EMAIL_ADDRESS, propertyType: PropertyType.PtypString },
@@ -81,15 +84,20 @@ async function findMatchingContacts(
     mailboxUid: string,
     contactRepo: RepoUtils<any>,
     searchTerm: string | undefined,
+    limit: number,
 ): Promise<ContactRow[]> {
+    // `limit` goes in both the query (what the SQL query builder reads) and the options (what Mongo reads);
+    // without it each backend silently falls back to its own 100-row default regardless of `RowCount`.
     if (!searchTerm) {
-        return contactRepo.find({ mailboxUid }, { ignoreACL: true });
+        return contactRepo.find({ mailboxUid, limit } as any, { ignoreACL: true, limit });
     }
 
-    const pattern = StringUtils.escapeRegExp(searchTerm);
+    // Bounded so the escaped operand never trips service-core's regex length guard, which would fail the whole
+    // NSPI call with INVALID_REQUEST for a long or metacharacter-heavy search term.
+    const pattern = boundedEscapedPattern(searchTerm);
     const perField = await Promise.all(
         ["displayName", "givenName", "surname", "company"].map((field) =>
-            contactRepo.find({ mailboxUid, [field]: `regex(${pattern})` } as any, { ignoreACL: true }),
+            contactRepo.find({ mailboxUid, [field]: `regex(${pattern})`, limit } as any, { ignoreACL: true, limit }),
         ),
     );
     const byUid = new Map<string, ContactRow>();
@@ -144,7 +152,12 @@ export async function handleNspiGetMatches(req: HttpRequest, res: HttpResponse, 
     const columns = reader.readUInt8() ? readLargePropertyTagArray(reader) : DEFAULT_COLUMNS;
     // AuxiliaryBufferSize/AuxiliaryBuffer intentionally left unread - no auxiliary-payload support.
 
-    const matches = await findMatchingContacts(mailboxUid, contactRepo, searchTerm);
+    const matches = await findMatchingContacts(
+        mailboxUid,
+        contactRepo,
+        searchTerm,
+        Math.min(Math.max(rowCount, 1), MAX_MATCH_ROWS),
+    );
     const page = matches.slice(0, rowCount);
 
     const body = new BufferWriter();

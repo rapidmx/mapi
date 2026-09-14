@@ -1648,6 +1648,43 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             const executeResult = await execute(cookie, emptyRop);
             expect(executeResult.headers["x-responsecode"]).not.toBe("0");
         });
+
+        it("Treats another user's MapiContext session as not found for both Execute and Disconnect.", async () => {
+            await createMailbox(owner.uid);
+            const connectResult = await connect();
+            const cookie = cookieHeaderFrom(connectResult.headers["set-cookie"]);
+            const other: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+            await createMailbox(other.uid);
+            const otherToken = JWTUtils.createTokenSync(config.get("auth"), other);
+            const emptyRop = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
+            const asOther = (requestType: string, body: Buffer) =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + otherToken, "X-RequestType": requestType, "Content-Type": "application/mapi-http", Cookie: cookie },
+                    body,
+                );
+
+            const executeBody = new BufferWriter();
+            executeBody.writeUInt32LE(0); // Flags
+            executeBody.writeUInt32LE(emptyRop.length);
+            executeBody.writeBytes(emptyRop);
+            executeBody.writeUInt32LE(256 * 1024); // MaxRopOut
+            executeBody.writeUInt32LE(0); // AuxiliaryBufferSize
+            const stolenExecute = await asOther("Execute", executeBody.toBuffer());
+            expect(stolenExecute.status).toBe(200);
+            expect(stolenExecute.headers["x-responsecode"]).not.toBe("0");
+            const reader = new BufferReader(stolenExecute.body);
+            expect(reader.readUInt32LE()).toBe(0); // StatusCode
+            expect(reader.readUInt32LE()).not.toBe(0); // ErrorCode
+
+            const stolenDisconnect = await asOther("Disconnect", Buffer.alloc(0));
+            expect(stolenDisconnect.status).toBe(200);
+
+            // The owner's session survived the other user's Disconnect.
+            const ownerExecute = await execute(cookie, emptyRop);
+            expect(ownerExecute.headers["x-responsecode"]).toBe("0");
+        });
     });
 
     describe("Unrecognized/deferred request types", () => {

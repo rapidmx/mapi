@@ -322,3 +322,29 @@ staged/unstaged per the standing commit-discipline rule.
 README still referenced the pre-rename package names (`@rapidmx/mapi`, `@rapidmx/autodiscover`, including the
 npm badge and `import ... from "@rapidmx/mapi/mongo"`). Updated them to `@rapidmx/mapi-plugin` /
 `@rapidmx/autodiscover-plugin`, matching `package.json`. Docs only, no code change, not committed.
+
+### 2026-09-14 (2) — Round-2 review fixes (session ownership, NSPI GetMatches pattern/limit)
+
+Each finding was confirmed in code first. Not committed; no version or peerDependency changes.
+
+- **MEDIUM: `Execute`/`Disconnect` never checked who owned the session.** Both loaded the session named by the
+  `MapiContext` cookie without comparing `session.userUid` to the authenticated JWT user. Anyone holding
+  another user's cookie value could run ROPs against that user's mailbox, or end their session. A new private
+  `loadOwnSession(req, user)` returns the session only when `session.userUid === user.uid`.
+  - `Execute` treats a mismatch exactly like a missing session (`ERROR_SESSION_NOT_FOUND`).
+  - `Disconnect` leaves another user's session alone and returns the same success body as for an unknown
+    session.
+  - The real-HTTP test is in `test/routes/mongo/MapiEmsmdbRoute.test.ts`: a second user's Execute gets
+    session-not-found, their Disconnect doesn't end the owner's session, and the owner's Execute still succeeds.
+- **LOW: `NspiGetMatches` pattern and limit.** `escapeRegExp(searchTerm)` was unbounded, so a long or
+  metacharacter-heavy term produced a `regex()` operand over service-core's 100-character guard and failed the
+  whole NSPI call. Results were also silently capped at the repo's 100-row default whatever `RowCount` asked
+  for.
+  - Copied activesync's `RegexPatternUtils.ts` (`boundedEscapedPattern`, `MAX_REGEX_PATTERN_LENGTH`) and its
+    test into this repo, since there's no shared package. Keep the two copies in sync.
+  - Every query now passes `limit = clamp(RowCount, 1, MAX_MATCH_ROWS = 1000)` in both the query (SQL reads
+    that) and the options (Mongo reads that).
+  - Known limitation: with a filter, each of the 4 per-field queries is limited separately before the in-memory
+    merge and sort, so `TotalRecs` counts at most what was fetched, not every match.
+  - Tests are in `test/RegexPatternUtils.test.ts` (copied) and `test/nspi/NspiGetMatchesHandler.test.ts`
+    (truncation and limit clamping; existing expectations updated for `limit`).
