@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { DecodeError } from "../src/codec/BufferCursor.js";
-import { dispatchRops } from "../src/RopDispatcher.js";
+import { dispatchRops, ExecuteBufferTooSmallError } from "../src/RopDispatcher.js";
 import { WorkBudgetExceededError } from "../src/rop/ExecuteBudget.js";
 import { RopReleaseHandler } from "../src/rop/RopReleaseHandler.js";
 import type { RopContext, RopHandler } from "../src/rop/RopHandler.js";
@@ -99,8 +99,8 @@ describe("RopDispatcher Tests", () => {
         expect(response).toEqual(Buffer.concat([Buffer.alloc(6), Buffer.from([0xff, 8, 0, 0x40, 8, 0x40, 1])]));
         expect(context.ropOutputRemaining).toBeUndefined();
 
-        // No room even for RopBufferTooSmall: processing just stops.
-        expect(await dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, makeContext(), { maxOutputBytes: 8 })).toEqual(Buffer.alloc(6));
+        // No room even for RopBufferTooSmall: the whole Execute fails rather than dropping ROPs silently.
+        await expect(dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, makeContext(), { maxOutputBytes: 8 })).rejects.toBeInstanceOf(ExecuteBufferTooSmallError);
         // Never more than a 16-bit RopSize can describe.
         const huge = new Map<number, RopHandler>([[0x41, { ropId: 0x41, handle: (_reader, writer) => void writer.writeBytes(Buffer.alloc(70000)) }]]);
         expect(await dispatchRops(Buffer.from([0x41]), huge, makeContext(), { maxOutputBytes: 1 << 20 })).toEqual(Buffer.from([0xff, 0xff, 0xff, 0x41]));

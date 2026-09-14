@@ -42,7 +42,7 @@ export class RopGetHierarchyTableHandler implements RopHandler {
             return;
         }
 
-        const rows: string[] = await resolveFolderChildren(context.mailboxUid, folderHandle.entityUid, context.folderRepo);
+        const rows: string[] = await resolveFolderChildren(context.mailboxUid, folderHandle.entityUid, context.folderRepo, undefined, context.budget);
         assignHandle(context.session, outputHandleIndex, { type: "table", entityUid: folderHandle.entityUid, rows, cursor: 0 });
 
         writer.writeUInt8(ROP_ID_GET_HIERARCHY_TABLE);

@@ -68,11 +68,27 @@ describe("RopReadStream output space", () => {
         expect(writer.toBuffer().readUInt16LE(6)).toBe(30);
         expect(context.session.handles[6].streamPosition).toBe(30);
 
+        // No room for any data: a DataSize of 0 would look like the end of the stream, so the response asks for what the
+        // read needs (and doesn't fit, becoming RopBufferTooSmall), leaving the position alone.
         context.ropOutputRemaining = 3;
         const none = new BufferWriter();
         await new RopReadStreamHandler().handle(new BufferReader(new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(10).toBuffer()), none, context);
-        expect(none.toBuffer().readUInt16LE(6)).toBe(0);
+        expect(none.toBuffer().readUInt16LE(6)).toBe(10);
+        expect(none.length).toBeGreaterThan(3);
         expect(context.session.handles[6].streamPosition).toBe(30);
+
+        // Exactly the 8 header bytes of room: the same.
+        context.ropOutputRemaining = 8;
+        const header = new BufferWriter();
+        await new RopReadStreamHandler().handle(new BufferReader(new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(10).toBuffer()), header, context);
+        expect(header.length).toBe(18);
+        expect(context.session.handles[6].streamPosition).toBe(30);
+
+        // At the real end of the stream, DataSize 0 still fits in the header alone.
+        context.session.handles[6].streamPosition = 100000;
+        const end = new BufferWriter();
+        await new RopReadStreamHandler().handle(new BufferReader(new BufferWriter().writeUInt8(0).writeUInt8(6).writeUInt16LE(10).toBuffer()), end, context);
+        expect(end.toBuffer().readUInt16LE(6)).toBe(0);
     });
 });
 
@@ -204,7 +220,8 @@ describe("Per-Execute work budget", () => {
 
         expect(second).toEqual(first);
         expect(findOne).toHaveBeenCalledTimes(1);
-        expect(budget.bytesRemaining).toBe(MAX_BYTES_BUILT_PER_EXECUTE - first.length);
+        // The raw message is charged before it is parsed, then the decoded body.
+        expect(budget.bytesRemaining).toBe(MAX_BYTES_BUILT_PER_EXECUTE - Buffer.byteLength("Subject: Hi\r\n\r\nBody") - first.length);
     });
 });
 

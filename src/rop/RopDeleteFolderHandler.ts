@@ -59,7 +59,8 @@ const UID_SORT: RepoSort = { uid: "ASC" };
  * **Bounded.** The subfolder tree is walked iteratively with a visited set (a corrupt `parentFolderUid` cycle
  * can't loop), at most `MAX_FOLDER_DEPTH` deep and `MAX_FOLDERS_PER_DELETE` wide, and only through folders in the
  * caller's own mailbox. Items are fetched in explicit, paged queries (a bare `find()` stops at 100 rows, which used
- * to leave items behind in a folder that was then deleted), up to `MAX_ITEMS_PER_DELETE`.
+ * to leave items behind in a folder that was then deleted), up to `MAX_ITEMS_PER_DELETE`. Every query and delete is
+ * charged to the request's `ExecuteBudget` before it runs, so repeating this ROP can't multiply the walk unbounded.
  *
  * The request's own `InputHandleIndex` (nominally the *parent* folder of the one being deleted) is validated to
  * be a real, open folder handle but not cross-checked against the target folder's actual `parentFolderUid` -
@@ -95,7 +96,7 @@ export class RopDeleteFolderHandler implements RopHandler {
             return;
         }
         const childQuery = { parentFolderUid: uid, mailboxUid: context.mailboxUid };
-        if ((deleteFolderFlags & DEL_FOLDERS) === 0 && (await findPage(context.folderRepo, childQuery, UID_SORT, 0, 1)).length > 0) {
+        if ((deleteFolderFlags & DEL_FOLDERS) === 0 && (await findPage(context.folderRepo, childQuery, UID_SORT, 0, 1, context.budget)).length > 0) {
             this.writeFailure(writer, inputHandleIndex, ERROR_INVALID_OBJECT);
             return;
         }
@@ -113,6 +114,7 @@ export class RopDeleteFolderHandler implements RopHandler {
                 partialCompletion = true;
                 break;
             }
+            context.budget?.chargeQueries();
             await context.folderRepo.delete(folderUid, { ignoreACL: true });
         }
 
@@ -137,7 +139,7 @@ export class RopDeleteFolderHandler implements RopHandler {
 
     private async hasItems(folderUid: string, context: RopContext): Promise<boolean> {
         for (const repo of this.itemRepos(context)) {
-            if ((await findPage(repo, { folderUid, mailboxUid: context.mailboxUid }, UID_SORT, 0, 1)).length > 0) {
+            if ((await findPage(repo, { folderUid, mailboxUid: context.mailboxUid }, UID_SORT, 0, 1, context.budget)).length > 0) {
                 return true;
             }
         }
@@ -160,6 +162,7 @@ export class RopDeleteFolderHandler implements RopHandler {
                 { parentFolderUid: uid, mailboxUid: context.mailboxUid },
                 UID_SORT,
                 MAX_FOLDERS_PER_DELETE,
+                context.budget,
             );
             if (truncated) {
                 return undefined;
@@ -186,8 +189,10 @@ export class RopDeleteFolderHandler implements RopHandler {
                 { folderUid, mailboxUid: context.mailboxUid },
                 UID_SORT,
                 budget.remaining,
+                context.budget,
             );
             for (const item of items) {
+                context.budget?.chargeQueries();
                 await repo.delete(item.uid, { ignoreACL: true });
                 if (repo === context.messageRepo) {
                     await auditMessageDelete(context, item);

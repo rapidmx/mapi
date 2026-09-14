@@ -10,6 +10,8 @@ import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { AvVerdict, FolderType, SpamVerdict } from "@rapidmx/restapi";
 import { InMemoryBlobStore } from "../testDoubles.js";
 import { writeStreamKey } from "../../src/rop/RopWriteStreamHandler.js";
+import { MAX_RECIPIENTS_PER_MESSAGE } from "../../src/rop/AddressList.js";
+import { ExecuteBudget, WorkBudgetExceededError } from "../../src/rop/ExecuteBudget.js";
 
 function buildRequest({ logonId = 0, inputHandleIndex = 5, submitFlags = 0 }): Buffer {
     const writer = new BufferWriter();
@@ -250,7 +252,7 @@ describe("RopSubmitMessageHandler Tests", () => {
 
     it("Sends to resolved 'Name <address>' recipients (split on ';' only) and to bare display names matching one contact.", async () => {
         const contactFind = vi.fn().mockImplementation((query: any) =>
-            Promise.resolve(query.displayName === "Ada Lovelace" ? [{ emails: [{ address: "not valid" }, { address: "ada@example.com" }] }] : []),
+            Promise.resolve(query.displayName === "eq(Ada Lovelace)" ? [{ displayName: "Ada Lovelace", emails: [{ address: "not valid" }, { address: "ada@example.com" }] }] : []),
         );
         const context = makeContext({ contactRepo: { find: contactFind } as any });
         context.session.handles[5] = {
@@ -266,7 +268,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         response.readUInt8();
         response.readUInt8();
         expect(response.readUInt32LE()).toBe(0);
-        expect(contactFind).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "Ada Lovelace", limit: 2 }, { ignoreACL: true, limit: 2 });
+        expect(contactFind).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "eq(Ada Lovelace)", limit: 2 }, { ignoreACL: true, limit: 2 });
         const [rawSent, envelope] = (context.scanPipeline as any).run.mock.calls[0];
         expect(envelope.to).toEqual(["jane@example.com", "ada@example.com", "john@example.com"]);
         const parsed = await simpleParser(rawSent as Buffer);
@@ -284,8 +286,15 @@ describe("RopSubmitMessageHandler Tests", () => {
 
     it.each([
         ["no contact", []],
-        ["several contacts", [{ emails: [{ address: "a@example.com" }] }, { emails: [{ address: "b@example.com" }] }]],
-        ["a contact without an email", [{}]],
+        [
+            "several contacts",
+            [
+                { displayName: "Someone Unknown", emails: [{ address: "a@example.com" }] },
+                { displayName: "Someone Unknown", emails: [{ address: "b@example.com" }] },
+            ],
+        ],
+        ["a contact without an email", [{ displayName: "Someone Unknown" }]],
+        ["only a contact whose name isn't exactly it", [{ displayName: "someone unknown", emails: [{ address: "a@example.com" }] }]],
     ])("Returns MAPI_E_NOT_FOUND, not access denied, for a display name matching %s.", async (_label, contacts) => {
         const context = makeContext({ contactRepo: { find: vi.fn().mockResolvedValue(contacts) } as any });
         context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "ok@example.com; Someone Unknown" } };
@@ -586,11 +595,8 @@ describe("RopSubmitMessageHandler Tests", () => {
             expect(mailboxRepo.findOne).not.toHaveBeenCalled();
         });
 
-        it("Accepts an organizer address that is one of the mailbox's aliases, and leaves a malformed attendee out of the invite.", async () => {
-            const event = makeCalendarEvent({
-                organizer: { address: "alias@example.com" },
-                attendees: [{ address: "good@example.com" }, { address: "bad@example.com\r\nBcc: victim@example.com" }],
-            });
+        it("Accepts an organizer address that is one of the mailbox's aliases.", async () => {
+            const event = makeCalendarEvent({ organizer: { address: "alias@example.com" }, attendees: [{ address: "good@example.com" }] });
             const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "owner@example.com", aliasAddresses: ["Alias@example.com"] }) };
             const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any, mailboxRepo: mailboxRepo as any });
             context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment" } };
@@ -598,48 +604,25 @@ describe("RopSubmitMessageHandler Tests", () => {
 
             await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
 
-            const [rawSent, envelope] = (context.scanPipeline as any).run.mock.calls[0];
-            expect(envelope.to).toEqual(["good@example.com"]);
-            expect((rawSent as Buffer).toString()).not.toContain("victim@example.com");
+            expect(writer.toBuffer().readUInt32LE(2)).toBe(0);
         });
 
-        it("Sends a real iCalendar METHOD:REQUEST invite to every attendee, without creating a Sent Items message.", async () => {
-            const event = makeCalendarEvent({
-                attendees: [{ address: "attendee1@example.com" }, { address: "attendee2@example.com" }],
-            });
+        it("Sends no invite itself, leaving it to restapi's MeetingSchedulingJob, and can be submitted again after an edit.", async () => {
+            const event = makeCalendarEvent({ attendees: [{ address: "attendee1@example.com" }, { address: "attendee2@example.com" }] });
             const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any });
-            context.session.handles[5] = {
-                type: "message",
-                entityUid: "calendarEvent:evt1",
-                draftProperties: { "26": "IPM.Appointment" },
-            };
+            context.session.handles[5] = { type: "message", entityUid: "calendarEvent:evt1", draftProperties: { "26": "IPM.Appointment" } };
             const handler = new RopSubmitMessageHandler();
-            const writer = new BufferWriter();
 
-            await handler.handle(new BufferReader(buildRequest({})), writer, context);
+            for (let i = 0; i < 2; i++) {
+                const writer = new BufferWriter();
+                await handler.handle(new BufferReader(buildRequest({})), writer, context);
+                expect(writer.toBuffer()).toEqual(Buffer.from([0x32, 5, 0, 0, 0, 0]));
+            }
 
-            const response = new BufferReader(writer.toBuffer());
-            expect(response.readUInt8()).toBe(0x32);
-            expect(response.readUInt8()).toBe(5);
-            expect(response.readUInt32LE()).toBe(0); // ReturnValue - success
-
-            const scanPipeline = context.scanPipeline as any;
-            expect(scanPipeline.run).toHaveBeenCalledTimes(1);
-            const [rawSent, envelope] = scanPipeline.run.mock.calls[0];
-            expect(envelope).toEqual({ from: "owner@example.com", to: ["attendee1@example.com", "attendee2@example.com"] });
-
-            const raw = (rawSent as Buffer).toString("utf-8");
-            expect(raw).toContain("text/calendar; charset=utf-8; method=REQUEST");
-            expect(raw).toContain("BEGIN:VEVENT");
-            expect(raw).toContain("UID:abc-123@mapi");
-            expect(raw).toContain("SUMMARY:Standup");
-            expect(raw).toContain("LOCATION:Room 1");
-            expect(raw).toContain("ORGANIZER:mailto:owner@example.com");
-            expect(raw).toContain("ATTENDEE;RSVP=TRUE:mailto:attendee1@example.com");
-            expect(raw).toContain("ATTENDEE;RSVP=TRUE:mailto:attendee2@example.com");
-
-            expect(context.mailTransport.send).toHaveBeenCalledTimes(1);
+            expect((context.scanPipeline as any).run).not.toHaveBeenCalled();
+            expect(context.mailTransport.send).not.toHaveBeenCalled();
             expect((context.messageRepo as any).create).not.toHaveBeenCalled();
+            expect(context.session.handles[5].submitted).toBeUndefined();
         });
 
         it("Ignores an unrecognized IPM.Appointment.* subclass exactly the same way (prefix match, not exact match).", async () => {
@@ -659,25 +642,6 @@ describe("RopSubmitMessageHandler Tests", () => {
             response.readUInt8();
             response.readUInt8();
             expect(response.readUInt32LE()).toBe(0);
-        });
-
-        it("Omits LOCATION from the invite when the event has none.", async () => {
-            const event = makeCalendarEvent({ location: undefined, attendees: [{ address: "attendee@example.com" }] });
-            const context = makeContext({ calendarEventRepo: { findOne: vi.fn().mockResolvedValue(event) } as any });
-            context.session.handles[5] = {
-                type: "message",
-                entityUid: "calendarEvent:evt1",
-                draftProperties: { "26": "IPM.Appointment" },
-            };
-            const handler = new RopSubmitMessageHandler();
-            const writer = new BufferWriter();
-
-            await handler.handle(new BufferReader(buildRequest({})), writer, context);
-
-            const scanPipeline = context.scanPipeline as any;
-            const [rawSent] = scanPipeline.run.mock.calls[0];
-            const raw = (rawSent as Buffer).toString("utf-8");
-            expect(raw).not.toContain("LOCATION:");
         });
     });
 
@@ -703,6 +667,73 @@ describe("RopSubmitMessageHandler Tests", () => {
 
             expect(context.mailTransport.send).not.toHaveBeenCalled();
             expect((context.messageRepo as any).create).not.toHaveBeenCalled();
+        });
+    });
+    describe("Round 5: once per draft", () => {
+        it("Marks a mail draft submitted, refuses a second submit of it, and deletes its write-stream chunks.", async () => {
+            const context = makeContext();
+            const streamBytes = Buffer.concat([Buffer.from("Hello", "utf16le"), Buffer.from([0, 0])]);
+            context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "to@example.com" } };
+            context.session.handles[6] = { type: "stream", entityUid: "", generation: "g6", writeTargetHandleIndex: 5, writeSize: streamBytes.length };
+            await handleDataStoreOf(context).putChunk(writeStreamKey(context.session.uid, 6, "g6"), 0, streamBytes, 60);
+            const handler = new RopSubmitMessageHandler();
+
+            const first = new BufferWriter();
+            await handler.handle(new BufferReader(buildRequest({})), first, context);
+            const second = new BufferWriter();
+            await handler.handle(new BufferReader(buildRequest({})), second, context);
+
+            expect(first.toBuffer().readUInt32LE(2)).toBe(0);
+            expect(second.toBuffer().readUInt32LE(2)).toBe(0x80070005);
+            expect(context.session.handles[5].submitted).toBe(true);
+            expect(context.mailTransport.send).toHaveBeenCalledTimes(1);
+            expect((context.messageRepo as any).create).toHaveBeenCalledTimes(1);
+            expect(await handleDataStoreOf(context).readChunks(writeStreamKey(context.session.uid, 6, "g6"), streamBytes.length)).toBeUndefined();
+        });
+
+        it("Uses up the draft even when the attempt fails, and a failed chunk delete doesn't fail the submit.", async () => {
+            const handleData = { readChunks: vi.fn().mockResolvedValue(undefined), delete: vi.fn().mockRejectedValue(new Error("redis down")) };
+            const context = makeContext({ handleData: handleData as any });
+            context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "to@example.com" } };
+            context.session.handles[6] = { type: "stream", entityUid: "", generation: "g6", writeTargetHandleIndex: 5, writeSize: 4 };
+            const writer = new BufferWriter();
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+            expect(writer.toBuffer().readUInt32LE(2)).toBe(0x80004005);
+            expect(context.session.handles[5].submitted).toBe(true);
+            expect(handleData.delete).toHaveBeenCalled();
+        });
+
+        it("Marks a meeting response submitted too.", async () => {
+            const context = makeContext({ calendarEventRepo: { find: vi.fn().mockResolvedValue([]) } as any });
+            context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "26": "IPM.Schedule.Meeting.Resp.Neg" } };
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context);
+
+            expect(context.session.handles[5].submitted).toBe(true);
+        });
+
+        it("Refuses more than MAX_RECIPIENTS_PER_MESSAGE recipients with MAPI_E_TOO_BIG before looking any name up.", async () => {
+            const contactFind = vi.fn().mockResolvedValue([]);
+            const context = makeContext({ contactRepo: { find: contactFind } as any });
+            const to = Array.from({ length: MAX_RECIPIENTS_PER_MESSAGE }, (_, i) => `r${i}@example.com`).join("; ");
+            context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": to, "3586": "Some Name" } };
+            const writer = new BufferWriter();
+
+            await new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), writer, context);
+
+            expect(writer.toBuffer().readUInt32LE(2)).toBe(0x80040305);
+            expect(contactFind).not.toHaveBeenCalled();
+            expect(context.mailTransport.send).not.toHaveBeenCalled();
+        });
+
+        it("Charges every submit to the Execute's budget.", async () => {
+            const context = makeContext({ budget: new ExecuteBudget(undefined, undefined, { maxSubmits: 0 }) });
+            context.session.handles[5] = { type: "message", entityUid: "", draftProperties: { "3588": "to@example.com" } };
+
+            await expect(new RopSubmitMessageHandler().handle(new BufferReader(buildRequest({})), new BufferWriter(), context)).rejects.toBeInstanceOf(WorkBudgetExceededError);
+            expect(context.mailTransport.send).not.toHaveBeenCalled();
         });
     });
 });

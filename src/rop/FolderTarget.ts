@@ -5,12 +5,14 @@
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Folder } from "@rapidmx/restapi";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
-import { findAllCapped } from "./RepoPaging.js";
+import type { ExecuteBudget } from "./ExecuteBudget.js";
+import { findAllCapped, MAX_COLLECTION_ROWS } from "./RepoPaging.js";
 
 /** Every folder in `mailboxUid` (up to `MAX_COLLECTION_ROWS`), by name. Paged explicitly: a bare `find()` stops at
- * the repo's 100-row default, which silently dropped folders from hierarchy tables in larger mailboxes. */
-async function findMailboxFolders(mailboxUid: string, folderRepo: RepoUtils<any>): Promise<Folder[]> {
-    return (await findAllCapped<Folder>(folderRepo, { mailboxUid }, { name: "ASC", uid: "ASC" })).items;
+ * the repo's 100-row default, which silently dropped folders from hierarchy tables in larger mailboxes. Each page is
+ * charged to `budget` before it is read. */
+async function findMailboxFolders(mailboxUid: string, folderRepo: RepoUtils<any>, budget?: ExecuteBudget): Promise<Folder[]> {
+    return (await findAllCapped<Folder>(folderRepo, { mailboxUid }, { name: "ASC", uid: "ASC" }, MAX_COLLECTION_ROWS, budget)).items;
 }
 
 /**
@@ -58,11 +60,12 @@ export async function resolveFolderInfo(
     target: string,
     folderRepo: RepoUtils<any>,
     cache?: FolderResolutionCache,
+    budget?: ExecuteBudget,
 ): Promise<FolderTargetInfo> {
     if (target.startsWith("folder:")) {
         const uid = target.slice("folder:".length);
         const folder: Folder | undefined = await folderRepo.findOne(uid, { ignoreACL: true });
-        const hasChildren = (await resolveFolderChildren(mailboxUid, target, folderRepo, cache)).length > 0;
+        const hasChildren = (await resolveFolderChildren(mailboxUid, target, folderRepo, cache, budget)).length > 0;
         return {
             displayName: folder?.name ?? "",
             unreadCount: folder?.unreadCount ?? 0,
@@ -71,7 +74,7 @@ export async function resolveFolderInfo(
         };
     }
     const name = target.slice("virtual:".length);
-    const hasChildren = (await resolveFolderChildren(mailboxUid, target, folderRepo, cache)).length > 0;
+    const hasChildren = (await resolveFolderChildren(mailboxUid, target, folderRepo, cache, budget)).length > 0;
     return { displayName: VIRTUAL_DISPLAY_NAMES[name] ?? name, unreadCount: 0, totalCount: 0, hasChildren };
 }
 
@@ -104,6 +107,7 @@ export async function resolveFolderChildren(
     target: string,
     folderRepo: RepoUtils<any>,
     cache?: FolderResolutionCache,
+    budget?: ExecuteBudget,
 ): Promise<string[]> {
     const isTopLevel = target === "virtual:root" || target === "virtual:ipmSubtree";
     let parentFolderUid: string | undefined;
@@ -117,10 +121,10 @@ export async function resolveFolderChildren(
 
     let allFolders: Folder[];
     if (cache) {
-        cache.allFolders ??= await findMailboxFolders(mailboxUid, folderRepo);
+        cache.allFolders ??= await findMailboxFolders(mailboxUid, folderRepo, budget);
         allFolders = cache.allFolders;
     } else {
-        allFolders = await findMailboxFolders(mailboxUid, folderRepo);
+        allFolders = await findMailboxFolders(mailboxUid, folderRepo, budget);
     }
     return allFolders
         .filter((f) => (isTopLevel ? f.parentFolderUid == null : f.parentFolderUid === parentFolderUid))

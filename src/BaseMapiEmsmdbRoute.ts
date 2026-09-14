@@ -14,9 +14,10 @@ import {
 } from "@rapidrest/service-core";
 import { BufferReader, BufferWriter, DecodeError } from "./codec/BufferCursor.js";
 import { decodeRopBuffer, encodeRopBuffer, type RopBuffer } from "./codec/RopBuffer.js";
-import { MapiSessionContext, MapiSessionManager } from "./MapiSessionManager.js";
-import { dispatchRops, MAX_ROPS_LIST_BYTES } from "./RopDispatcher.js";
-import type { RopContext, RopHandler } from "./rop/RopHandler.js";
+import { MapiSessionContext, MapiSessionManager, SESSION_LOCK_RENEW_MS, takeReleasedHandleData } from "./MapiSessionManager.js";
+import { dispatchRops, ExecuteBufferTooSmallError, MAX_ROPS_LIST_BYTES } from "./RopDispatcher.js";
+import type { HandleDataStore } from "./rop/HandleDataCache.js";
+import { handleDataStoreOf, type RopContext, type RopHandler } from "./rop/RopHandler.js";
 import { ScanPipeline } from "@rapidmx/restapi/scan";
 import { Folder, Mailbox, RecoverableRepoUtils, recordAuditLog, resolveCallerMailboxUid, type BlobStore } from "@rapidmx/restapi";
 const { Config, Init, Inject, Logger } = ObjectDecorators;
@@ -37,6 +38,10 @@ const ERROR_SESSION_TOO_BIG = 0x80040305;
 /** `[MS-OXCMAPIHTTP]` `X-ResponseCode` 15, "Invalid Sequence": the request overlapped another one on the same
  * session context. Sent when the session changed underneath this request (see `MapiSessionManager.save()`). */
 const RESPONSE_CODE_INVALID_SEQUENCE = 15;
+
+/** `ecBufferTooSmall` ([MS-OXCRPC]), the body `ErrorCode` when even a `RopBufferTooSmall` response doesn't fit in the
+ * client's `MaxRopOut`. */
+const ERROR_BUFFER_TOO_SMALL = 0x0000047d;
 
 /** The largest `RopBufferSize` accepted - the `[MS-OXCRPC]` ROP input buffer limit. */
 export const MAX_ROP_BUFFER_SIZE = 32767;
@@ -290,13 +295,21 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
      * allocates/frees table-wide handle slots at the framing level; individual `RopHandler`s manage their own
      * entries within `session.handles` instead).
      *
-     * - **One request at a time per session.** The session's lock is taken before anything runs; an overlapping
-     * request gets `X-ResponseCode` 15 (Invalid Sequence) without any side effects. The save stays compare-and-set.
-     * - **Retries.** The response is remembered with the request's `X-RequestId`; a request repeating the last id (a
-     * client retrying after a lost response) gets that response again instead of running its ROPs twice.
+     * - **One request at a time per session.** Only the caller's own session (whose mailbox is still the caller's) is
+     * locked. The lock is taken before any ROP runs and renewed every `SESSION_LOCK_RENEW_MS` while the request runs,
+     * so a slow request keeps it; an overlapping request gets `X-ResponseCode` 15 (Invalid Sequence) without any side
+     * effects. The save stays compare-and-set. Each `Execute` also refreshes the session's place in the per-user cap.
+     * - **Retries.** While a request with an `X-RequestId` runs, an in-progress marker for that id is kept (renewed with
+     * the lock); a retry of it is answered with code 15 instead of running again. Its response then replaces the
+     * marker, and a request repeating the last id (a client retrying after a lost response) gets that response again
+     * instead of running its ROPs twice. A request that ends without a stored response drops its marker.
      * `MapiSequence` isn't validated - the lock and the replay cache cover what it guards against here.
      * - **Output size.** ROP responses are held to the client's `MaxRopOut`, less the `RopSize` field and handle
-     * table, and to what a 16-bit `RopSize` can describe (see `dispatchRops`).
+     * table, and to what a 16-bit `RopSize` can describe (see `dispatchRops`). When not even a `RopBufferTooSmall`
+     * fits, the whole `Execute` answers `ecBufferTooSmall` in the body `ErrorCode`.
+     * - **Released handles.** Once the session is saved, the FastTransfer streams and write-stream chunks of handles
+     * the request released are deleted from the shared store; `Disconnect` and session eviction delete a session's
+     * whole set.
      * - **Malformed ROPs.** A ROP that can't be decoded answers 400; the ROPs before it already ran, so the session is
      * still saved first.
      */
@@ -306,32 +319,63 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             this.sendExecuteFailure(res, RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
             return;
         }
+        // Ownership first: someone else's session (or a mailbox reassigned since Connect) is never locked by this caller.
+        const owned: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
+        if (!owned || (await resolveCallerMailboxUid(this.mailboxRepo!, user)) !== owned.mailboxUid) {
+            this.sendExecuteFailure(res, RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
+            return;
+        }
         const lockToken: string | undefined = await this.sessionManager!.acquireLock(sessionId);
         if (!lockToken) {
             this.sendExecuteFailure(res, RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE);
             return;
         }
+        const running: { requestId?: string } = {};
+        // Renewed while the request runs, so a slow Execute never loses its lock (or its in-progress marker) to a retry.
+        const renewal = setInterval(() => {
+            void this.sessionManager!.renewLock(sessionId, lockToken).catch(() => undefined);
+            if (running.requestId) {
+                void this.sessionManager!.markInProgress(sessionId, running.requestId).catch(() => undefined);
+            }
+        }, SESSION_LOCK_RENEW_MS);
+        renewal.unref();
         try {
-            await this.executeLocked(req, res, user);
+            await this.executeLocked(req, res, user, running);
         } finally {
+            clearInterval(renewal);
+            if (running.requestId) {
+                await this.sessionManager!.clearInProgress(sessionId, running.requestId).catch(() => undefined);
+            }
             await this.sessionManager!.releaseLock(sessionId, lockToken);
         }
     }
 
-    private async executeLocked(req: HttpRequest, res: HttpResponse, user: JWTUser): Promise<void> {
+    /** Runs an `Execute` under its session's lock. `running.requestId` is set while this request's in-progress marker is
+     * stored, and cleared once its response is stored instead. */
+    private async executeLocked(req: HttpRequest, res: HttpResponse, user: JWTUser, running: { requestId?: string }): Promise<void> {
+        // Loaded again under the lock: the copy read before locking may already be out of date.
         const session: MapiSessionContext | undefined = await this.loadOwnSession(req, user);
-        // The caller must still own the session's mailbox: a mailbox reassigned since Connect ends the session.
-        if (!session || (await resolveCallerMailboxUid(this.mailboxRepo!, user)) !== session.mailboxUid) {
+        if (!session) {
             this.sendExecuteFailure(res, RESPONSE_CODE_CONTEXT_NOT_FOUND, ERROR_SESSION_NOT_FOUND);
             return;
         }
 
         const requestId: string = firstHeader(req, "x-requestid") ?? "";
-        const replay: Buffer | undefined = requestId ? await this.sessionManager!.storedResponse(session.uid, requestId) : undefined;
+        const replay = requestId ? await this.sessionManager!.storedResponse(session.uid, requestId) : undefined;
+        if (replay === "inProgress") {
+            // The same request is still running elsewhere (its lock lapsed, or its pod died moments ago).
+            this.sendExecuteFailure(res, RESPONSE_CODE_INVALID_SEQUENCE, RESPONSE_CODE_INVALID_SEQUENCE);
+            return;
+        }
         if (replay) {
             res.status(200).send(replay);
             return;
         }
+        if (requestId) {
+            await this.sessionManager!.markInProgress(session.uid, requestId);
+            running.requestId = requestId;
+        }
+        await this.sessionManager!.touch(session).catch(() => undefined);
 
         const { ropsList, handleTable, maxRopOut } = decodeExecuteRequest(req.rawBody ?? Buffer.alloc(0));
         const context: RopContext = {
@@ -367,10 +411,15 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         }).catch((error: unknown) => ({ error }));
 
         const saved = await this.sessionManager!.save(session);
-        if (!Buffer.isBuffer(dispatched)) {
+        const released: string[] = takeReleasedHandleData(session);
+        if (saved === "saved") {
+            // Streams and write chunks of handles this request released; best effort, they expire anyway.
+            const store: HandleDataStore = handleDataStoreOf(context);
+            await Promise.all(released.map((key) => store.delete(key).catch(() => undefined)));
+        }
+        if (!Buffer.isBuffer(dispatched) && !(dispatched.error instanceof ExecuteBufferTooSmallError)) {
             throw dispatched.error instanceof DecodeError ? new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST) : dispatched.error;
         }
-        const responseRopsList: Buffer = dispatched;
         if (saved !== "saved") {
             // conflict: another request saved first (possible once a lock has expired), so this request's handle
             // changes can't be kept and the client retries. missing: the session ended meanwhile. tooBig: see
@@ -384,6 +433,12 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             this.sendExecuteFailure(res, responseCode, errorCode);
             return;
         }
+        if (!Buffer.isBuffer(dispatched)) {
+            // [MS-OXCRPC] ecBufferTooSmall: not even a RopBufferTooSmall response fits in what the client allows.
+            this.sendExecuteFailure(res, 0, ERROR_BUFFER_TOO_SMALL);
+            return;
+        }
+        const responseRopsList: Buffer = dispatched;
 
         const responseRopBuffer: Buffer = encodeRopBuffer({ ropsList: responseRopsList, handleTable });
         const body = new BufferWriter();
@@ -396,6 +451,7 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         const responseBody: Buffer = body.toBuffer();
         if (requestId) {
             await this.sessionManager!.storeResponse(session.uid, requestId, responseBody);
+            delete running.requestId;
         }
         res.status(200).send(responseBody);
     }

@@ -5,7 +5,15 @@
 import * as crypto from "crypto";
 import { ObjectDecorators } from "@rapidrest/core";
 import { DatabaseDecorators, SimpleEntity } from "@rapidrest/service-core";
-import { handleDataCache, handleDataKey, MemoryHandleDataStore, RedisHandleDataStore, type HandleDataStore } from "./rop/HandleDataCache.js";
+import {
+    handleDataCache,
+    handleDataKey,
+    MemoryHandleDataStore,
+    RedisHandleDataStore,
+    sessionHandleDataIndex,
+    writeStreamKey,
+    type HandleDataStore,
+} from "./rop/HandleDataCache.js";
 const { Init } = ObjectDecorators;
 const { Redis } = DatabaseDecorators;
 
@@ -16,7 +24,8 @@ export const SESSION_TTL_SECONDS = 15 * 60;
 /** The longest a session may live, however active it stays. A client simply `Connect`s again afterwards. */
 export const MAX_SESSION_LIFETIME_MS = 24 * 60 * 60 * 1000;
 
-/** The most sessions one user may hold at once. `Connect` past this ends that user's oldest session. */
+/** The most sessions one user may hold at once. `Connect` past this ends that user's least recently used session (each
+ * `Execute` refreshes its session's place - see `MapiSessionManager.touch`). */
 export const MAX_SESSIONS_PER_USER = 20;
 
 /** The largest a serialized session may grow. Everything that grows with use is capped on its own (handles by their
@@ -24,9 +33,13 @@ export const MAX_SESSIONS_PER_USER = 20;
  * past it fails with `MAPI_E_TOO_BIG` rather than storing megabytes every later request has to load. */
 export const MAX_SESSION_BYTES = 4 * 1024 * 1024;
 
-/** How long an `Execute` holds its session's lock. Longer than any request should take; a crashed pod's lock simply
- * expires. The session save is still compare-and-set, so an expired lock can't corrupt state. */
+/** How long an `Execute`'s session lock lives without being renewed. A running `Execute` renews it every
+ * `SESSION_LOCK_RENEW_MS`, so only a crashed pod's lock expires. The session save is still compare-and-set, so an
+ * expired lock can't corrupt state. */
 export const SESSION_LOCK_TTL_MS = 120 * 1000;
+
+/** How often a running `Execute` renews its session lock and in-progress marker. */
+export const SESSION_LOCK_RENEW_MS = SESSION_LOCK_TTL_MS / 3;
 
 /** Tags what a ROP-assigned integer handle (the `ServerObjectHandleTable` index space) refers to.
  * `entityUid` for a `"folder"` handle is one of `session.folderIds`' own value strings (`"virtual:<name>"` or
@@ -79,6 +92,9 @@ export interface MapiObjectHandle {
     transferColumns?: { propertyId: number; propertyType: number }[];
     transferExcludeIds?: number[];
     transferPosition?: number;
+    /** Set on a draft message once `RopSubmitMessage` has tried to send it, whatever the outcome. A submitted draft
+     * can't be submitted again or changed. */
+    submitted?: boolean;
 }
 
 /**
@@ -160,11 +176,28 @@ export function releaseHandle(session: MapiSessionContext, index: number): void 
     }
     delete session.handles[index];
     handleDataCache.delete(handleDataKey(session.uid, index, handle.generation));
+    if (handle.type === "fastTransfer" || handle.type === "stream") {
+        const released = releasedHandleData.get(session) ?? [];
+        released.push(handle.type === "fastTransfer" ? handleDataKey(session.uid, index, handle.generation) : writeStreamKey(session.uid, index, handle.generation));
+        releasedHandleData.set(session, released);
+    }
     for (const [key, candidate] of Object.entries(session.handles)) {
         if (candidate.writeTargetHandleIndex === index && candidate.writeTargetGeneration === handle.generation) {
             releaseHandle(session, Number(key));
         }
     }
+}
+
+/** Session object -> the `HandleDataStore` keys of the handles released on it since the last `takeReleasedHandleData`.
+ * Kept beside the session, never in it, so it isn't saved. */
+const releasedHandleData = new WeakMap<object, string[]>();
+
+/** The shared-store keys (FastTransfer streams, write-stream chunks) of every handle released on `session` since the
+ * last call, for the route to delete once the session's changes are saved. */
+export function takeReleasedHandleData(session: MapiSessionContext): string[] {
+    const released = releasedHandleData.get(session) ?? [];
+    releasedHandleData.delete(session);
+    return released;
 }
 
 /** The outcome of `MapiSessionManager.save()`. `"conflict"` means another request saved the session first;
@@ -182,13 +215,18 @@ export interface MapiSessionStore {
     create(key: string, value: string, ttlSeconds: number): Promise<void>;
     compareAndSet(key: string, expectedVersion: number, value: string, ttlSeconds: number): Promise<"saved" | "conflict" | "missing">;
     delete(key: string): Promise<void>;
-    /** Atomically records `sessionId` in the user's index (ordered by `createdAtMs`): drops ids whose session is gone,
-     * ends the oldest sessions until fewer than `max` remain, then adds it. Returns the ids it ended. */
+    /** Atomically records `sessionId` in the user's index (ordered by last use, starting at `createdAtMs`): drops ids
+     * whose session is gone, ends the least recently used sessions until fewer than `max` remain, then adds it. Returns
+     * the ids it ended. */
     addToUserIndex(indexKey: string, sessionId: string, createdAtMs: number, max: number, ttlSeconds: number): Promise<string[]>;
     /** `SET NX` with a TTL: `true` when the lock was free and is now held with `token`. */
     acquireLock(key: string, token: string, ttlMs: number): Promise<boolean>;
     /** Releases the lock only if it is still held with `token`. */
     releaseLock(key: string, token: string): Promise<void>;
+    /** Extends the lock to `ttlMs` from now, only while it is still held with `token`. */
+    renewLock(key: string, token: string, ttlMs: number): Promise<boolean>;
+    /** Moves `sessionId` to `score` in the user's index when it is still there. */
+    touchUserIndex(indexKey: string, sessionId: string, score: number): Promise<void>;
     getValue(key: string): Promise<string | undefined>;
     putValue(key: string, value: string, ttlSeconds: number): Promise<void>;
 }
@@ -244,6 +282,18 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('DEL', KEYS[1]) end
 return 1
 `;
 
+/** KEYS: lock. ARGV: token, ttl ms. Returns 1 when the token still held the lock and it was extended. */
+export const RENEW_LOCK_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then redis.call('PEXPIRE', KEYS[1], ARGV[2]) return 1 end
+return 0
+`;
+
+/** KEYS: user index. ARGV: score, session id. Updates the score of a member that is still present. */
+export const TOUCH_USER_INDEX_SCRIPT = `
+redis.call('ZADD', KEYS[1], 'XX', ARGV[1], ARGV[2])
+return 1
+`;
+
 /** A `MapiSessionStore` on a node-redis client. Every read goes to Redis, never a per-process copy, so each
  * replica sees the same session. */
 export class RedisMapiSessionStore implements MapiSessionStore {
@@ -285,6 +335,14 @@ export class RedisMapiSessionStore implements MapiSessionStore {
 
     public async releaseLock(key: string, token: string): Promise<void> {
         await this.client.eval(RELEASE_LOCK_SCRIPT, { keys: [key], arguments: [token] });
+    }
+
+    public async renewLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+        return Number(await this.client.eval(RENEW_LOCK_SCRIPT, { keys: [key], arguments: [token, String(ttlMs)] })) === 1;
+    }
+
+    public async touchUserIndex(indexKey: string, sessionId: string, score: number): Promise<void> {
+        await this.client.eval(TOUCH_USER_INDEX_SCRIPT, { keys: [indexKey], arguments: [String(score), sessionId] });
     }
 
     public async getValue(key: string): Promise<string | undefined> {
@@ -365,6 +423,21 @@ export class MemoryMapiSessionStore implements MapiSessionStore {
         }
     }
 
+    public async renewLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+        if (this.read(key) !== token) {
+            return false;
+        }
+        this.entries.set(key, { value: token, expiresAt: Date.now() + ttlMs });
+        return true;
+    }
+
+    public async touchUserIndex(indexKey: string, sessionId: string, score: number): Promise<void> {
+        const members = this.indexes.get(indexKey);
+        if (members?.has(sessionId)) {
+            members.set(sessionId, score);
+        }
+    }
+
     public async getValue(key: string): Promise<string | undefined> {
         return this.read(key);
     }
@@ -441,19 +514,28 @@ export class MapiSessionManager {
         this.handleDataStore = this.redisClient ? new RedisHandleDataStore(this.redisClient) : new MemoryHandleDataStore();
     }
 
-    /** Creates a session for `userUid`, ending that user's oldest sessions if they already hold
-     * `MAX_SESSIONS_PER_USER`. */
+    /** Creates a session for `userUid`, ending that user's least recently used sessions (and their stored handle data)
+     * if they already hold `MAX_SESSIONS_PER_USER`. */
     public async create(mailboxUid: string, userUid: string): Promise<MapiSessionContext> {
         const context = new MapiSessionContext({ mailboxUid, userUid });
         await this.store!.create(sessionKey(context.uid), JSON.stringify(context), SESSION_TTL_SECONDS);
-        await this.store!.addToUserIndex(
+        const ended = await this.store!.addToUserIndex(
             userIndexKey(userUid),
             encodeURIComponent(context.uid),
             Date.now(),
             MAX_SESSIONS_PER_USER,
             MAX_SESSION_LIFETIME_MS / 1000,
         );
+        for (const id of ended) {
+            await this.deleteHandleData(decodeURIComponent(id));
+        }
         return context;
+    }
+
+    /** Records that `session` was just used, so the per-user cap ends the least recently used session rather than the
+     * oldest one. */
+    public async touch(session: MapiSessionContext): Promise<void> {
+        await this.store!.touchUserIndex(userIndexKey(session.userUid), encodeURIComponent(session.uid), Date.now());
     }
 
     /** Loads a session straight from the store. A session past `MAX_SESSION_LIFETIME_MS` is ended and treated as
@@ -487,8 +569,15 @@ export class MapiSessionManager {
         return result;
     }
 
+    /** Ends a session, deleting its stored handle data too. */
     public async destroy(sessionId: string): Promise<void> {
         await this.store!.delete(sessionKey(sessionId));
+        await this.deleteHandleData(sessionId);
+    }
+
+    /** Deletes every FastTransfer stream and write-stream chunk the session stored. Best effort: they expire anyway. */
+    private async deleteHandleData(sessionId: string): Promise<void> {
+        await this.handleDataStore!.deleteOwnedBy(sessionHandleDataIndex(sessionId)).catch(() => undefined);
     }
 
     /** Takes the session's `Execute` lock. Returns the token to release it with, or `undefined` while another
@@ -502,11 +591,34 @@ export class MapiSessionManager {
         await this.store!.releaseLock(`${sessionKey(sessionId)}.lock`, token);
     }
 
-    /** The response last sent on this session, if it answered `requestId`. */
-    public async storedResponse(sessionId: string, requestId: string): Promise<Buffer | undefined> {
+    /** Extends the session's lock by another `SESSION_LOCK_TTL_MS`. `false` when `token` no longer holds it. */
+    public async renewLock(sessionId: string, token: string): Promise<boolean> {
+        return this.store!.renewLock(`${sessionKey(sessionId)}.lock`, token, SESSION_LOCK_TTL_MS);
+    }
+
+    /** The response last sent on this session if it answered `requestId`; `"inProgress"` while a request with that id
+     * is still running (or ran on a pod that died less than `SESSION_LOCK_TTL_MS` ago); otherwise `undefined`. */
+    public async storedResponse(sessionId: string, requestId: string): Promise<Buffer | "inProgress" | undefined> {
         const json = await this.store!.getValue(`${sessionKey(sessionId)}.last`);
-        const stored: { requestId: string; body: string } | undefined = json ? JSON.parse(json) : undefined;
-        return stored?.requestId === requestId ? Buffer.from(stored.body, "base64") : undefined;
+        const stored: { requestId: string; body?: string } | undefined = json ? JSON.parse(json) : undefined;
+        if (stored?.requestId !== requestId) {
+            return undefined;
+        }
+        return stored.body === undefined ? "inProgress" : Buffer.from(stored.body, "base64");
+    }
+
+    /** Records that `requestId` is running on this session, for `SESSION_LOCK_TTL_MS` (renewed along with the lock). A
+     * retry of it is then answered as busy instead of running a second time. */
+    public async markInProgress(sessionId: string, requestId: string): Promise<void> {
+        await this.store!.putValue(`${sessionKey(sessionId)}.last`, JSON.stringify({ requestId }), SESSION_LOCK_TTL_MS / 1000);
+    }
+
+    /** Drops the in-progress marker of `requestId` when it is still there (the request ended without storing a
+     * response), so a retry runs. */
+    public async clearInProgress(sessionId: string, requestId: string): Promise<void> {
+        if ((await this.storedResponse(sessionId, requestId)) === "inProgress") {
+            await this.store!.delete(`${sessionKey(sessionId)}.last`);
+        }
     }
 
     /** Remembers `body` as this session's answer to `requestId`. Only the latest request is kept. */

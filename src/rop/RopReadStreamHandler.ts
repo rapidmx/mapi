@@ -62,7 +62,19 @@ export class RopReadStreamHandler implements RopHandler {
         const position = handle.streamPosition ?? 0;
         // Also held to the room left in this request's ROP output buffer, after this response's 8 fixed bytes.
         const room = Math.max(0, (context.ropOutputRemaining ?? Infinity) - RESPONSE_HEADER_BYTES);
-        const slice = bytes.subarray(position, position + Math.min(requestedCount, MAX_DATA_SIZE, room));
+        const wanted = Math.min(requestedCount, MAX_DATA_SIZE);
+        const available = bytes.subarray(position, position + wanted);
+        if (room === 0 && available.length > 0) {
+            // No room for even one byte: a DataSize of 0 would read as the end of the stream. Answer with what the read
+            // needs instead, which doesn't fit, so the dispatcher turns it into RopBufferTooSmall. The position stays.
+            writer.writeUInt8(ROP_ID_READ_STREAM);
+            writer.writeUInt8(inputHandleIndex);
+            writer.writeUInt32LE(0);
+            writer.writeUInt16LE(available.length);
+            writer.writeBytes(available);
+            return;
+        }
+        const slice = available.subarray(0, room);
         handle.streamPosition = position + slice.length;
 
         writer.writeUInt8(ROP_ID_READ_STREAM);

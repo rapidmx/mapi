@@ -30,6 +30,8 @@ import {
 } from "./CalendarNamedProperties.js";
 import { assignOrGetMid } from "./MessageTarget.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
+import { MAX_RECIPIENTS_PER_MESSAGE } from "./AddressList.js";
+import { asEntity } from "./RestapiRules.js";
 import { parseAddressList } from "./RopSubmitMessageHandler.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -38,6 +40,9 @@ const ROP_ID_SAVE_CHANGES_MESSAGE = 0x0c;
 /** The well-known MAPI HRESULT `MAPI_E_INVALID_OBJECT`, reused for "the referenced handle isn't a message (or
  * doesn't exist)" - the same constant `RopGetPropertiesSpecificHandler` uses for its own analogous check. */
 const ERROR_INVALID_OBJECT = 0x80070005;
+
+/** `MAPI_E_TOO_BIG`: a meeting with more than `MAX_RECIPIENTS_PER_MESSAGE` attendees. */
+const ERROR_TOO_BIG = 0x80040305;
 
 // The same well-known property IDs RopSetPropertiesHandler tracks - duplicated here (rather than imported)
 // since importing them would only save a handful of literals; see that file for the real documentation of what
@@ -76,7 +81,10 @@ const MESSAGE_CLASS_APPOINTMENT_PREFIX = "IPM.Appointment";
  * `"calendarEvent:<uid>"`) a real `CalendarEvent` row, so a subsequent `RopGetPropertiesSpecific` can read it
  * back before `RopSubmitMessage` is ever called (a calendar item must exist as soon as it's saved, the same way
  * a real Exchange server behaves - unlike a mail draft, which this pragmatic subset never persists at all until
- * Submit).
+ * Submit). Attendees of a saved meeting are invited by restapi's `MeetingSchedulingJob` (see
+ * `RopSubmitMessageHandler.submitAppointment`), which is why a meeting is capped at `MAX_RECIPIENTS_PER_MESSAGE`
+ * attendees here. Client-supplied times and reminder minutes that don't parse are ignored (the field keeps its
+ * existing or default value) rather than stored as `Invalid Date`/`NaN`, and an update is versioned (`asEntity`).
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -102,6 +110,12 @@ export class RopSaveChangesMessageHandler implements RopHandler {
         const mid = messageClass.startsWith(MESSAGE_CLASS_APPOINTMENT_PREFIX)
             ? await this.saveAppointment(handle, draftProperties, context)
             : BigInt(assignOrGetMid(context.session, handle.entityUid !== "" ? handle.entityUid : `draft:${inputHandleIndex}`));
+        if (mid === undefined) {
+            writer.writeUInt8(ROP_ID_SAVE_CHANGES_MESSAGE);
+            writer.writeUInt8(responseHandleIndex);
+            writer.writeUInt32LE(ERROR_TOO_BIG);
+            return;
+        }
 
         writer.writeUInt8(ROP_ID_SAVE_CHANGES_MESSAGE);
         writer.writeUInt8(responseHandleIndex);
@@ -117,9 +131,15 @@ export class RopSaveChangesMessageHandler implements RopHandler {
      * below - the write-side mirror of `PropertyResolvers.calendarEventValueFor`'s read-side switch. A field the
      * client never set (e.g. no `RopSetProperties` call touched `PidLidBusyStatus`) falls back to the existing
      * row's own value on an update, or the entity class's own default on a fresh create.
+     *
+     * Returns `undefined`, saving nothing, for more than `MAX_RECIPIENTS_PER_MESSAGE` attendees: restapi's
+     * `MeetingSchedulingJob` mails every attendee of a saved meeting.
      */
-    private async saveAppointment(handle: MapiObjectHandle, draftProperties: Record<string, string>, context: RopContext): Promise<bigint> {
+    private async saveAppointment(handle: MapiObjectHandle, draftProperties: Record<string, string>, context: RopContext): Promise<bigint | undefined> {
         const decoded = decodeCalendarFieldsFromDraft(context.session, draftProperties);
+        if (decoded.attendeeAddresses.length > MAX_RECIPIENTS_PER_MESSAGE) {
+            return undefined;
+        }
         const attendees: Attendee[] = decoded.attendeeAddresses.map((address) => ({
             address,
             role: AttendeeRole.REQUIRED,
@@ -156,7 +176,7 @@ export class RopSaveChangesMessageHandler implements RopHandler {
                 };
                 await context.calendarEventRepo.update(
                     { ...updated, sequence: (existing.sequence ?? 0) + (isSchedulingRelevantChange(existing, updated) ? 1 : 0) },
-                    existing,
+                    asEntity(context.calendarEventRepo, existing),
                     { ignoreACL: true },
                 );
             }
@@ -270,10 +290,10 @@ function decodeCalendarFieldsFromDraft(session: MapiSessionContext, properties: 
                     decoded.location = value;
                     break;
                 case LID_APPOINTMENT_START_WHOLE:
-                    decoded.startDate = new Date(value);
+                    decoded.startDate = validDate(value);
                     break;
                 case LID_APPOINTMENT_END_WHOLE:
-                    decoded.endDate = new Date(value);
+                    decoded.endDate = validDate(value);
                     break;
                 case LID_BUSY_STATUS:
                     decoded.busyStatus = BUSY_STATUS_FROM_CODE[Number(value)] ?? BusyStatus.BUSY;
@@ -288,9 +308,22 @@ function decodeCalendarFieldsFromDraft(session: MapiSessionContext, properties: 
                     break;
             }
         } else if (guid === PSETID_COMMON && named.lid === LID_REMINDER_DELTA) {
-            decoded.reminderMinutesBeforeStart = Number(value);
+            decoded.reminderMinutesBeforeStart = validMinutes(value);
         }
     }
 
     return decoded;
+}
+
+/** `value` as a date, or `undefined` (the field is left as it was) when it doesn't parse. A client picks the property
+ * type it sends, so a "time" can arrive as any string. */
+function validDate(value: string): Date | undefined {
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+/** `value` as a whole, non-negative number of minutes, or `undefined` when it isn't one. */
+function validMinutes(value: string): number | undefined {
+    const minutes = Number(value);
+    return value.trim() !== "" && Number.isSafeInteger(minutes) && minutes >= 0 ? minutes : undefined;
 }

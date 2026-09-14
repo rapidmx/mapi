@@ -365,7 +365,7 @@ export async function resolvePropertyValues(
     const folderInfo =
         isMessage || isCalendarEvent || isContact || isTask
             ? undefined
-            : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo, cache);
+            : await resolveFolderInfo(context.mailboxUid, target, context.folderRepo, cache, context.budget);
     const messageInfo = isMessage ? await resolveMessageInfo(target, context.messageRepo) : undefined;
     const calendarEventInfo = isCalendarEvent ? await resolveCalendarEventInfo(target, context.calendarEventRepo) : undefined;
     const contactInfo = isContact && context.contactRepo ? await resolveContactInfo(target, context.contactRepo) : undefined;

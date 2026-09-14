@@ -488,3 +488,91 @@ peerDependency changes. 632 tests pass (was 575); coverage 100% statements/funct
   replay, 400-after-save, MaxRopOut -> RopBufferTooSmall, `tooBig`.
 - Lesson: bash heredocs containing some quote/backtick mixes fail in this environment (`unexpected EOF`); write
   scripts with the Write tool instead.
+
+### 2026-09-14 (5) — Round-5 review fixes (submit replay, work budget, handle data cleanup, meeting lookups, locks)
+
+All 13 findings (at HEAD 25e46b1) were checked against the code and were real; none skipped. The MID-map redesign was
+out of scope and not touched. Not committed; no version or peerDependency changes. 680 tests pass (was 632); coverage
+100% statements/functions/lines, 98.95% branches; `yarn lint` and `npx tsc --noEmit -p .` clean.
+
+- **Submit replay (1).** `MapiObjectHandle.submitted`: set on a mail or meeting-response draft as soon as Submit gets
+  past the handle check, whatever the outcome (the finding asked for "successful or not"). A submitted handle answers
+  `MAPI_E_INVALID_OBJECT` to Submit, `RopSetProperties` and `RopWriteStream` (checked via `writeTargetHandleIndex`).
+  The draft's write-stream chunks are deleted once read. `ExecuteBudget.chargeSubmit()` caps Submits at
+  `MAX_SUBMITS_PER_EXECUTE = 16` (past it: `MAPI_E_TOO_COMPLEX`). `MAX_RECIPIENTS_PER_MESSAGE = 500` in
+  `AddressList.ts`, same as activesync's `MAX_COMPOSE_RECIPIENTS` (restapi has no such cap): Submit counts parsed
+  To/Cc/Bcc entries before any contact lookup (`MAPI_E_TOO_BIG`); `RopSaveChangesMessage` refuses a meeting with more
+  attendees (`MAPI_E_TOO_BIG`, nothing saved). Appointment Submit is no longer a relay at all (see 6), so it isn't
+  marked and can be repeated after an edit.
+- **Work budget (2).** `ExecuteBudget` gained `MAX_QUERIES_PER_EXECUTE = 20000`, `MAX_ROWS_FETCHED_PER_EXECUTE =
+  100000`, and `assertBytesLeft()`; the constructor takes a third `limits` object. `findPage`/`findAllCapped`/
+  `findWindow` take an optional trailing `budget`: the query is charged before `repo.find`, the returned rows after.
+  Threaded through `resolveFolderChildren`/`resolveFolderInfo` (hierarchy tables and `hasChildren`),
+  `resolveFolderMessages`/`resolveFolderCalendarEvents` (FastTransfer), `resolveContentsWindow`, and every paged
+  query in `RopDeleteFolder` (`collectSubtree`, `hasItems`, the child check, `deleteItems`); each item delete and folder
+  delete charges a query first. `resolveContentsKind` charges its `findOne`. `loadStreamBody`/
+  `resolveMessageBodyBytes` refuse at `bytesRemaining <= 0` before `findOne`, and charge the raw blob before
+  `simpleParser` (then the decoded body, as before). Per-row `findOne`s in `resolvePropertyValues` stay under the row
+  budget.
+- **Handle data cleanup and quotas (3).** `HandleDataStore` changed: `set`/`putChunk` take optional `owners` and
+  return `boolean` (`false` = quota refused, nothing stored); new `deleteOwnedBy(index)`; `writeStreamKey` moved to
+  `HandleDataCache.ts` (re-exported from `RopWriteStreamHandler.ts`). `handleDataOwners(sessionUid, userUid)`:
+  session index `session.<uid>` capped at `MAX_HANDLE_DATA_BYTES_PER_SESSION = 64 MB`, user index `user.<uid>` at
+  `MAX_HANDLE_DATA_BYTES_PER_USER = 128 MB` (raw bytes). Redis: owner indexes are sorted sets
+  `mapi.handle-owner.<index>` (member = key, score = raw bytes, TTL 24h); `SET_WITH_QUOTA_SCRIPT`/
+  `PUT_CHUNK_WITH_QUOTA_SCRIPT` prune members whose key is gone, sum the rest (excluding the key being written), and
+  store only under the cap. The value itself goes through EVAL (up to ~43 MB of base64 for a 32 MB stream). Chunks are
+  now stored as unpadded `base64url` so the chunk script sizes an existing chunk exactly (`floor(len*3/4)`); Node's
+  `"base64"` decode reads both forms. `DELETE_OWNED_SCRIPT` returns the deleted members so the local LRU drops them too.
+  Like `ADD_TO_USER_INDEX_SCRIPT`, the quota/delete scripts build data keys from members, so they are single-node only
+  (not cluster-safe). Memory store: same accounting in-process (`HandleDataCache.sizeOf` added, a non-touching peek).
+  Cleanup: `releaseHandle` records released `fastTransfer`/`stream` handles' store keys in a module `WeakMap` beside
+  the session (`takeReleasedHandleData`); the route deletes them after a `"saved"` save (best effort). `destroy()`
+  (Disconnect, lifetime expiry) and eviction in `create()` call `deleteOwnedBy(session index)` (errors swallowed).
+  FastTransfer open/rebuild pass owners; a refused open releases the new handle and answers `MAPI_E_TOO_BIG`, a
+  refused rebuild reports `"tooBig"`. `RopWriteStream` refused by quota answers `MAPI_E_TOO_BIG`.
+  `RopFastTransferSourceCopyProperties` dedupes tags by property id (first wins).
+- **Meeting lookups (4, 11).** `rop/RestapiRules.ts` copies restapi's `boundIndexedValue` and `asEntity` (neither is
+  exported from `@rapidmx/restapi` 0.9.0; keep in sync with `util/ConversationUtils.ts`/`util/EntityUtils.ts`) and
+  adds `literalQueryValue(v) = "eq(v)"`: service-core's `op(x)` regex is greedy, so `eq(ne(x))` compares against
+  `ne(x)`. It still coerces operands (`null`, numbers, `me` -> 403 without a user), so callers also filter rows in
+  memory and treat a thrown query as no match. `findCallerCopies` queries `icalUid: eq(boundIndexedValue(uid))` and
+  keeps `row.icalUid === key`; `AddressList.findContactsByDisplayName` queries `displayName: eq(name)` and keeps exact
+  matches. Grepped the rest of `src` for queries built from client/sender strings: NSPI GetMatches already escapes its
+  regex (round 2); every other query uses server-assigned uids/targets.
+- **Versioned updates (5).** `asEntity(repo, row)` wraps the `existing` argument of every update of a restapi-owned
+  row read with `find`/`findOne`: both updates in `MeetingMessageClassHandler`, the new series-exception update, and
+  `RopSaveChangesMessageHandler`'s appointment update.
+- **Invites (6).** Chose to stop sending from MAPI. restapi's `MeetingSchedulingJob` already sends a REQUEST for every
+  organizer-owned event with `inviteSequenceSent !== sequence`, claims each revision with a versioned update, and uses
+  `buildEventIcs` (RRULE + exceptions), so it gives the only correct recurring invite; stamping from MAPI would have
+  kept the single-instance ICS. `submitAppointment` now only checks the organizer (success, or `MAPI_E_INVALID_OBJECT`
+  as before); `buildMeetingRequestIcs` and helpers were removed. Trade-off: a meeting saved via MAPI is invited on the
+  job's next run even if never submitted (same as a REST-created meeting).
+- **RopBufferTooSmall (7).** When a response doesn't fit and neither does `RopBufferTooSmall` (3 bytes + rest of the
+  request), `dispatchRops` throws `ExecuteBufferTooSmallError`; the route saves the session (earlier ROPs ran) and,
+  unless the save failed, answers `X-ResponseCode 0` with body `ErrorCode` `ecBufferTooSmall` (`0x47D`) and no ROP
+  buffer. A pre-run check was tried first and rejected: it failed Executes whose next response would have fit.
+- **Declining an exception copy (8).** Decline via an override row soft-deletes it and appends its `recurrenceId` to
+  the series' `recurrenceRule.exceptions` (versioned, skipped when already present or the series doesn't recur),
+  mirroring `ScanQueueJob`'s occurrence CANCEL. Shared helper `addSeriesException`.
+- **Lock (9).** Ownership (`loadOwnSession` + mailbox check) now runs before `acquireLock`; the session is loaded again
+  under the lock (gone -> code 10). The lock is renewed every `SESSION_LOCK_RENEW_MS = 40s` (`RENEW_LOCK_SCRIPT`,
+  token-checked PEXPIRE; `setInterval` unref'd, cleared in `finally`). With an `X-RequestId`, `markInProgress` stores
+  `{requestId}` (no body) in `.last` with the lock's TTL, renewed with the lock; `storedResponse` returns
+  `"inProgress"` for it and the route answers code 15. `storeResponse` replaces the marker; a request that ends without
+  storing one calls `clearInProgress` (only deletes a still-in-progress marker for that id).
+- **ReadStream (10).** At zero room with data left, the handler writes the full would-be response without advancing
+  `streamPosition`, so the dispatcher turns it into `RopBufferTooSmall`; `DataSize 0` now only means end of stream.
+- **LRU session cap (12).** `MapiSessionManager.touch(session)` (`TOUCH_USER_INDEX_SCRIPT`, `ZADD XX`) on every
+  Execute, best effort, so the cap evicts the least recently used session.
+- **Draft values and logon (13).** `validDate` (unparseable -> field left unset) for start/end, `validMinutes`
+  (non-negative safe integer) for the reminder. `RopLogon`'s well-known folder query sorts `dateCreated ASC, uid ASC`
+  in the query object with `limit 1`, like `findOrCreateWellKnownFolder`.
+- Tests: new `test/Round5Review.test.ts`; `fakeRedis.ts` emulates the five new scripts; updates to
+  `MeetingMessageClassHandler`, `RopSubmitMessageHandler` (appointment tests now assert nothing is sent), `RopDispatcher`,
+  `Round4Review` tests; Mongo integration tests for `ecBufferTooSmall`, ownership-before-lock, in-progress marker,
+  lock/marker renewal (spied `setInterval`), session vanishing under the lock, and released write-stream deletion.
+- Lesson: the Bash tool also rejects some heredocs containing apostrophes inside a quoted `'PYEOF'` block; the Write tool
+  plus a script file is reliable. Some test files flip to CRLF on disk after edits, so string-replace scripts should
+  normalize `\r\n` first.

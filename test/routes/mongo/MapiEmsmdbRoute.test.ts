@@ -24,7 +24,8 @@ import { BufferReader, BufferWriter } from "../../../src/codec/BufferCursor.js";
 import { decodeGuid, encodeGuid } from "../../../src/codec/MapiGuid.js";
 import { PropertyType, readPropertyValue, writePropertyTag, writeTaggedPropertyValue, type TaggedPropertyValue } from "../../../src/codec/PropertyValue.js";
 import { decodeRopBuffer, encodeRopBuffer } from "../../../src/codec/RopBuffer.js";
-import { MapiSessionManager } from "../../../src/MapiSessionManager.js";
+import { MapiSessionManager, SESSION_LOCK_RENEW_MS } from "../../../src/MapiSessionManager.js";
+import { MemoryHandleDataStore } from "../../../src/rop/HandleDataCache.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -421,6 +422,161 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             expect(ropsList[0]).toBe(0xff);
             expect(ropsList.readUInt16LE(1)).toBeGreaterThan(34);
             expect(ropsList.subarray(3)).toEqual(logon);
+        });
+
+        it("Fails the whole Execute with ecBufferTooSmall when not even RopBufferTooSmall fits in MaxRopOut.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+            const ropBuffer = encodeRopBuffer({ ropsList: logon, handleTable: [0xffffffff] });
+            // 16 - RopSize (2) - one handle (4) leaves 10 bytes: less than RopBufferTooSmall's 3 plus the 14-byte request.
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(ropBuffer.length).writeBytes(ropBuffer).writeUInt32LE(16).writeUInt32LE(0).toBuffer();
+
+            const result = await mapiRequest(
+                server.getApplication(),
+                baseUrl,
+                { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie },
+                body,
+            );
+
+            expect(result.headers["x-responsecode"]).toBe("0");
+            expect(result.body.readUInt32LE(4)).toBe(0x47d);
+            expect(result.body.readUInt32LE(12)).toBe(0); // no RopBuffer
+        });
+
+        it("Checks session ownership before taking the lock, and refreshes the session's place in the per-user cap.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const stranger: any = { uid: uuid.v4(), roles: [], elevated: Date.now() };
+            const lock = vi.spyOn(MapiSessionManager.prototype, "acquireLock");
+            const touch = vi.spyOn(MapiSessionManager.prototype, "touch").mockRejectedValueOnce(new Error("redis down"));
+            try {
+                const foreign = await mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    {
+                        Authorization: "jwt " + JWTUtils.createTokenSync(config.get("auth"), stranger),
+                        "X-RequestType": "Execute",
+                        "Content-Type": "application/mapi-http",
+                        Cookie: cookie,
+                    },
+                    new BufferWriter().writeUInt32LE(0).writeUInt32LE(0).toBuffer(),
+                );
+                expect(foreign.headers["x-responsecode"]).toBe("10");
+                expect(lock).not.toHaveBeenCalled();
+
+                // A failing touch doesn't fail the request.
+                const own = await execute(cookie, encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] }));
+                expect(own.headers["x-responsecode"]).toBe("0");
+                expect(touch).toHaveBeenCalledTimes(1);
+            } finally {
+                lock.mockRestore();
+                touch.mockRestore();
+            }
+        });
+
+        it("Answers a retry of a request that is still running with X-ResponseCode 15, and drops the marker of a request that failed.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const sessionId = /MapiContext=([^;]+)/.exec(cookie)![1];
+            const empty = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(empty.length).writeBytes(empty).writeUInt32LE(0x10008).writeUInt32LE(0).toBuffer();
+            const send = (requestId: string) =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": requestId },
+                    body,
+                );
+
+            const stored = vi.spyOn(MapiSessionManager.prototype, "storedResponse").mockResolvedValueOnce("inProgress");
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            try {
+                const retry = await send("{guid}:7");
+                expect(retry.headers["x-responsecode"]).toBe("15");
+                expect(save).not.toHaveBeenCalled();
+            } finally {
+                stored.mockRestore();
+            }
+
+            // A session that ends while the request waits for its lock is not found.
+            const originalLoad = MapiSessionManager.prototype.load;
+            const load = vi
+                .spyOn(MapiSessionManager.prototype, "load")
+                .mockImplementationOnce(function (this: MapiSessionManager, id: string) {
+                    return originalLoad.call(this, id);
+                })
+                .mockResolvedValueOnce(undefined);
+            try {
+                expect((await send("{guid}:6")).headers["x-responsecode"]).toBe("10");
+            } finally {
+                load.mockRestore();
+            }
+
+            // A request that fails after marking itself in progress (a conflicting save) leaves no marker behind.
+            save.mockResolvedValueOnce("conflict");
+            const markInProgress = vi.spyOn(MapiSessionManager.prototype, "markInProgress");
+            const clearInProgress = vi.spyOn(MapiSessionManager.prototype, "clearInProgress");
+            try {
+                expect((await send("{guid}:8")).headers["x-responsecode"]).toBe("15");
+                expect(markInProgress).toHaveBeenCalledWith(sessionId, "{guid}:8");
+                expect(clearInProgress).toHaveBeenCalledWith(sessionId, "{guid}:8");
+                const again = await send("{guid}:8");
+                expect(again.headers["x-responsecode"]).toBe("0");
+                // Dropping the marker is best effort.
+                clearInProgress.mockRejectedValueOnce(new Error("redis down"));
+                save.mockResolvedValueOnce("conflict");
+                expect((await send("{guid}:10")).headers["x-responsecode"]).toBe("15");
+                expect(save).toHaveBeenCalledTimes(3);
+            } finally {
+                save.mockRestore();
+                markInProgress.mockRestore();
+                clearInProgress.mockRestore();
+            }
+        });
+
+        it("Renews the session lock and the in-progress marker while a request runs, best effort.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const empty = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(empty.length).writeBytes(empty).writeUInt32LE(0x10008).writeUInt32LE(0).toBuffer();
+            const realSetInterval = global.setInterval;
+            let tick: (() => void) | undefined;
+            const interval = vi.spyOn(global, "setInterval").mockImplementation(((callback: () => void, ms: number) => {
+                if (ms === SESSION_LOCK_RENEW_MS) {
+                    tick = callback;
+                }
+                return realSetInterval(() => undefined, 1 << 30);
+            }) as any);
+            const renewLock = vi.spyOn(MapiSessionManager.prototype, "renewLock").mockRejectedValueOnce(new Error("redis down"));
+            const markInProgress = vi.spyOn(MapiSessionManager.prototype, "markInProgress");
+            const originalSave = MapiSessionManager.prototype.save;
+            // The renewal fires while the request is still running (during its save): once failing, once succeeding.
+            const save = vi.spyOn(MapiSessionManager.prototype, "save").mockImplementationOnce(async function (this: MapiSessionManager, session: any) {
+                markInProgress.mockRejectedValueOnce(new Error("redis down"));
+                tick!();
+                tick!();
+                return originalSave.call(this, session);
+            });
+            try {
+                const result = await mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:9" },
+                    body,
+                );
+                expect(result.headers["x-responsecode"]).toBe("0");
+                expect(renewLock).toHaveBeenCalledTimes(2);
+                expect(markInProgress).toHaveBeenCalledTimes(3); // once at the start, twice renewed
+                // Once the response is stored the marker isn't renewed any more.
+                tick!();
+                expect(markInProgress).toHaveBeenCalledTimes(3);
+            } finally {
+                interval.mockRestore();
+                renewLock.mockRestore();
+                markInProgress.mockRestore();
+                save.mockRestore();
+            }
         });
 
         it("Fails a request that would grow the session past its size cap with MAPI_E_TOO_BIG.", async () => {
@@ -1615,6 +1771,28 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             writer.writeUInt8(0); // SubmitFlags
             return writer.toBuffer();
         };
+
+        it("Deletes a released write stream's chunks from the shared store once the session is saved.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const sessionId = /MapiContext=([^;]+)/.exec(cookie)![1];
+            // Best effort: a failing delete doesn't fail the request.
+            const del = vi.spyOn(MemoryHandleDataStore.prototype, "delete").mockRejectedValueOnce(new Error("redis down"));
+            try {
+                await execute(cookie, encodeRopBuffer({ ropsList: buildLogonRops(0), handleTable: [0xffffffff] }));
+                const rops = Buffer.concat([
+                    buildCreateMessageRops(0, 3, 5n),
+                    buildOpenStreamRops(3, 4, { propertyId: 0x1000, propertyType: PropertyType.PtypString }, 0x02),
+                    buildWriteStreamRops(4, Buffer.from("hi", "utf16le")),
+                    Buffer.from([0x01, 0x00, 0x04]), // RopRelease(4)
+                ]);
+                const result = await execute(cookie, encodeRopBuffer({ ropsList: rops, handleTable: [0xffffffff] }));
+                expect(result.headers["x-responsecode"]).toBe("0");
+                expect(del.mock.calls.some(([key]) => key.startsWith(`${sessionId}:4:`) && key.endsWith(":write"))).toBe(true);
+            } finally {
+                del.mockRestore();
+            }
+        });
 
         it("Composes and sends a real message end to end, saving a Sent Items copy.", async () => {
             mailTransport().sent = [];

@@ -46,7 +46,9 @@ export class RopFastTransferSourceCopyPropertiesHandler implements RopHandler {
         reader.readUInt8(); // Level - subfolder recursion not honored, see class doc comment
         reader.readUInt8(); // CopyFlags (1 byte here, unlike CopyTo's 4) - not honored, see class doc comment
         reader.readUInt8(); // SendOptions - not honored, see class doc comment
-        const columns: PropertyTag[] | undefined = readPropertyTagArray(reader, reader.readUInt16LE());
+        const tags: PropertyTag[] | undefined = readPropertyTagArray(reader, reader.readUInt16LE());
+        // One column per property: a repeated tag would only repeat the same value in every row of the stream.
+        const columns = tags?.filter((tag, index) => tags.findIndex((other) => other.propertyId === tag.propertyId) === index);
 
         const handle = context.session.handles[inputHandleIndex];
         if (!handle || (handle.type !== "folder" && handle.type !== "message")) {

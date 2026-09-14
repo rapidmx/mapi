@@ -114,8 +114,10 @@ export class RopLogonHandler implements RopHandler {
                 if (!folder.folderType) {
                     return `virtual:${folder.name}`;
                 }
+                // The oldest folder of the type, like restapi's findOrCreateWellKnownFolder, so a mailbox that somehow
+                // has two gets the same one every time.
                 const existing: Folder[] = await context.folderRepo.find(
-                    { mailboxUid: context.mailboxUid, type: folder.folderType },
+                    { mailboxUid: context.mailboxUid, type: folder.folderType, sort: { dateCreated: "ASC", uid: "ASC" }, limit: 1 } as any,
                     { ignoreACL: true, limit: 1 },
                 );
                 return existing[0] ? `folder:${existing[0].uid}` : `virtual:${folder.name}`;

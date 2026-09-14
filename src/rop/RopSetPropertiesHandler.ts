@@ -144,7 +144,8 @@ export class RopSetPropertiesHandler implements RopHandler {
         }
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || handle.type !== "message") {
+        // A draft already submitted is finished: changing it can't change what was sent, and must not set up a resend.
+        if (!handle || handle.type !== "message" || handle.submitted) {
             writer.writeUInt8(ROP_ID_SET_PROPERTIES);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);

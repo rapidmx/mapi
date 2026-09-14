@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import addressparser from "nodemailer/lib/addressparser/index.js";
+import { literalQueryValue } from "./RestapiRules.js";
 import type { RopContext } from "./RopHandler.js";
 
 /** Splits a `PidTagDisplayTo`/`Cc`/`Bcc`-style string on the semicolons Outlook separates recipients with,
@@ -92,6 +93,27 @@ export interface RecipientResolution {
 /** The most contacts looked at when resolving one display name - two is enough to tell "exactly one" apart. */
 const MAX_NAME_MATCHES = 2;
 
+/** The most recipients (To, Cc and Bcc together) one submitted message or meeting may have - the same limit
+ * `@rapidmx/activesync`'s `ComposeMailCommand` enforces (`MAX_COMPOSE_RECIPIENTS`). */
+export const MAX_RECIPIENTS_PER_MESSAGE = 500;
+
+/** The caller's contacts whose display name is exactly `name`. The name comes from the client, so it is matched
+ * literally (`literalQueryValue`) and re-checked on the returned rows; a name the query layer rejects matches nothing. */
+async function findContactsByDisplayName(context: Pick<RopContext, "mailboxUid" | "contactRepo">, name: string): Promise<{ displayName?: string; emails?: { address: string }[] }[]> {
+    if (!context.contactRepo) {
+        return [];
+    }
+    try {
+        const rows: { displayName?: string; emails?: { address: string }[] }[] = await context.contactRepo.find(
+            { mailboxUid: context.mailboxUid, displayName: literalQueryValue(name), limit: MAX_NAME_MATCHES } as any,
+            { ignoreACL: true, limit: MAX_NAME_MATCHES },
+        );
+        return rows.filter((row) => row.displayName === name);
+    } catch {
+        return [];
+    }
+}
+
 /**
  * Resolves a display string into addresses. An entry carrying an address is used as is; a bare display name (Outlook
  * writes names, not addresses, into `PidTagDisplayTo` once it has resolved a recipient against an address book) is
@@ -109,12 +131,7 @@ export async function resolveRecipientList(
         } else if (entry.address) {
             resolution.recipients.push({ name: entry.name, address: entry.address });
         } else {
-            const contacts: { emails?: { address: string }[] }[] = context.contactRepo
-                ? await context.contactRepo.find(
-                      { mailboxUid: context.mailboxUid, displayName: entry.name, limit: MAX_NAME_MATCHES },
-                      { ignoreACL: true, limit: MAX_NAME_MATCHES },
-                  )
-                : [];
+            const contacts = await findContactsByDisplayName(context, entry.name);
             const address = contacts.length === 1 ? contacts[0].emails?.map((email) => email.address).find(isPlainEmailAddress) : undefined;
             if (address) {
                 resolution.recipients.push({ name: entry.name, address });

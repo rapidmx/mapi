@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
-import { handleDataKey } from "./HandleDataCache.js";
+import { handleDataOwners, writeStreamKey } from "./HandleDataCache.js";
 import { handleDataStoreOf, type RopContext, type RopHandler } from "./RopHandler.js";
 
 const ROP_ID_WRITE_STREAM = 0x2d;
@@ -22,10 +22,8 @@ export const MAX_WRITE_STREAM_BYTES = 4 * 1024 * 1024;
 /** How long a write stream's chunks are kept after its last write - the session's own idle lifetime. */
 export const WRITE_STREAM_TTL_SECONDS = 15 * 60;
 
-/** The `HandleDataStore` key of the write stream at `handleIndex`. */
-export function writeStreamKey(sessionUid: string, handleIndex: number, generation: string | undefined): string {
-    return `${handleDataKey(sessionUid, handleIndex, generation)}:write`;
-}
+// Re-exported for existing importers; the key lives next to the other handle data keys.
+export { writeStreamKey } from "./HandleDataCache.js";
 
 /**
  * `RopWriteStream` (`[MS-OXCPRPT]`/`[MS-OXCROPS]`): writes bytes to a stream opened in `ReadWrite`/`Create`
@@ -34,7 +32,8 @@ export function writeStreamKey(sessionUid: string, handleIndex: number, generati
  * offset in the `HandleDataStore` (Redis when configured), not in the session: only `writeSize` is session state.
  * Keying by offset makes a retried write (after a request whose session save lost a conflict) replace its chunk
  * instead of appending it twice. Up to `MAX_WRITE_STREAM_BYTES`; a write past that fails with `MAPI_E_TOO_BIG` and
- * nothing is stored. `RopSubmitMessageHandler` reassembles the body (`readWriteStream`) once composing is complete.
+ * nothing is stored, as it is when the session's or user's handle data quota (`handleDataOwners`) is used up. A stream
+ * whose draft has already been submitted takes no more writes. `RopSubmitMessageHandler` reassembles the body (`readWriteStream`) once composing is complete.
  *
  * Like `RopReadStream`, `[MS-OXCROPS]` documents only one combined response-buffer shape for this ROP (no
  * separate Success/Failure pages) - `WrittenSize` is always present, `0` standing in for the failure case.
@@ -52,7 +51,8 @@ export class RopWriteStreamHandler implements RopHandler {
         const data: Buffer = reader.readBytes(dataSize);
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || handle.type !== "stream" || handle.writeTargetHandleIndex === undefined) {
+        const target = handle?.writeTargetHandleIndex !== undefined ? context.session.handles[handle.writeTargetHandleIndex] : undefined;
+        if (!handle || handle.type !== "stream" || handle.writeTargetHandleIndex === undefined || target?.submitted) {
             writer.writeUInt8(ROP_ID_WRITE_STREAM);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
@@ -61,20 +61,22 @@ export class RopWriteStreamHandler implements RopHandler {
         }
 
         const existingSize: number = handle.writeSize ?? 0;
-        if (existingSize + data.length > MAX_WRITE_STREAM_BYTES) {
+        const stored =
+            existingSize + data.length <= MAX_WRITE_STREAM_BYTES &&
+            (data.length === 0 ||
+                (await handleDataStoreOf(context).putChunk(
+                    writeStreamKey(context.session.uid, inputHandleIndex, handle.generation),
+                    existingSize,
+                    data,
+                    WRITE_STREAM_TTL_SECONDS,
+                    handleDataOwners(context.session.uid, context.session.userUid),
+                )));
+        if (!stored) {
             writer.writeUInt8(ROP_ID_WRITE_STREAM);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_TOO_BIG);
             writer.writeUInt16LE(0); // WrittenSize
             return;
-        }
-        if (data.length > 0) {
-            await handleDataStoreOf(context).putChunk(
-                writeStreamKey(context.session.uid, inputHandleIndex, handle.generation),
-                existingSize,
-                data,
-                WRITE_STREAM_TTL_SECONDS,
-            );
         }
         handle.writeSize = existingSize + data.length;
 

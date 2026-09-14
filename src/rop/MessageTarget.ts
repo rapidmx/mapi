@@ -5,7 +5,8 @@
 import type { RepoUtils } from "@rapidrest/service-core";
 import { Message } from "@rapidmx/restapi";
 import type { MapiSessionContext } from "../MapiSessionManager.js";
-import { findAllCapped, type RepoSort } from "./RepoPaging.js";
+import type { ExecuteBudget } from "./ExecuteBudget.js";
+import { findAllCapped, MAX_COLLECTION_ROWS, type RepoSort } from "./RepoPaging.js";
 
 /**
  * The `RopGetContentsTable` analog of `FolderTarget.ts`: resolves a `"message:<uid>"` row target (see
@@ -43,8 +44,8 @@ export const MESSAGE_SORT: RepoSort = { receivedDate: "DESC", uid: "ASC" };
 
 /** Resolves the messages directly in `folderUid`, newest first and capped at `MAX_COLLECTION_ROWS`, as
  * `"message:<uid>"` target strings. */
-export async function resolveFolderMessages(folderUid: string, messageRepo: RepoUtils<any>): Promise<string[]> {
-    const { items: messages } = await findAllCapped<Message>(messageRepo, { folderUid }, MESSAGE_SORT);
+export async function resolveFolderMessages(folderUid: string, messageRepo: RepoUtils<any>, budget?: ExecuteBudget): Promise<string[]> {
+    const { items: messages } = await findAllCapped<Message>(messageRepo, { folderUid }, MESSAGE_SORT, MAX_COLLECTION_ROWS, budget);
     return messages.map((m) => `message:${m.uid}`);
 }
 

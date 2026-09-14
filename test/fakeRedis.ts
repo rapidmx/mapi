@@ -8,7 +8,10 @@ import {
     COMPARE_AND_SET_SCRIPT,
     CREATE_SCRIPT,
     RELEASE_LOCK_SCRIPT,
+    RENEW_LOCK_SCRIPT,
+    TOUCH_USER_INDEX_SCRIPT,
 } from "../src/MapiSessionManager.js";
+import { DELETE_OWNED_SCRIPT, PUT_CHUNK_WITH_QUOTA_SCRIPT, SET_WITH_QUOTA_SCRIPT } from "../src/rop/HandleDataCache.js";
 
 /** A node-redis stand-in holding values in Maps. `eval` applies the semantics of each script the store runs, so the
  * store's handling of each result can be exercised without a Redis server. Scripts run synchronously, like Redis. */
@@ -70,6 +73,51 @@ export class FakeRedisClient {
                     this.values.delete(keys[0]);
                 }
                 return 1;
+            case RENEW_LOCK_SCRIPT:
+                if (this.values.get(keys[0]) !== args[0]) {
+                    return 0;
+                }
+                this.ttls.set(keys[0], Number(args[1]));
+                return 1;
+            case TOUCH_USER_INDEX_SCRIPT: {
+                const set = this.sortedSets.get(keys[0]);
+                if (set?.has(args[1])) {
+                    set.set(args[1], Number(args[0]));
+                }
+                return 1;
+            }
+            case SET_WITH_QUOTA_SCRIPT: {
+                const size = Number(args[2]);
+                if (keys.slice(1).some((index, i) => this.ownerTotal(index, args[4], args[5]) + size > Number(args[6 + i]))) {
+                    return 0;
+                }
+                this.setValue(keys[0], args[0], Number(args[1]));
+                this.recordOwners(keys.slice(1), args[5], size, Number(args[3]));
+                return 1;
+            }
+            case PUT_CHUNK_WITH_QUOTA_SCRIPT: {
+                const hash = this.hashes.get(keys[0]) ?? new Map<string, string>();
+                let size = Number(args[2]);
+                for (const [field, value] of hash) {
+                    size += field === args[6] ? 0 : Math.floor((value.length * 3) / 4);
+                }
+                if (keys.slice(1).some((index, i) => this.ownerTotal(index, args[4], args[5]) + size > Number(args[7 + i]))) {
+                    return 0;
+                }
+                hash.set(args[6], args[0]);
+                this.hashes.set(keys[0], hash);
+                this.ttls.set(keys[0], Number(args[1]));
+                this.recordOwners(keys.slice(1), args[5], size, Number(args[3]));
+                return 1;
+            }
+            case DELETE_OWNED_SCRIPT: {
+                const members = [...(this.sortedSets.get(keys[0])?.keys() ?? [])];
+                for (const member of members) {
+                    await this.del(args[0] + member);
+                }
+                this.sortedSets.delete(keys[0]);
+                return members;
+            }
             default:
                 throw new Error("FakeRedisClient: unknown script");
         }
@@ -102,6 +150,27 @@ export class FakeRedisClient {
 
     public async expire(key: string, ttl: number): Promise<void> {
         this.ttls.set(key, ttl);
+    }
+
+    /** The live members' sizes in an owner index, dropping members whose data is gone, leaving out `member`. */
+    private ownerTotal(index: string, prefix: string, member: string): number {
+        const set = this.sortedSets.get(index) ?? new Map<string, number>();
+        let total = 0;
+        for (const [name, size] of set) {
+            if (!this.values.has(prefix + name) && !this.hashes.has(prefix + name)) {
+                set.delete(name);
+            } else if (name !== member) {
+                total += size;
+            }
+        }
+        return total;
+    }
+
+    private recordOwners(indexes: string[], member: string, size: number, ttl: number): void {
+        for (const index of indexes) {
+            this.sortedSets.set(index, (this.sortedSets.get(index) ?? new Map<string, number>()).set(member, size));
+            this.ttls.set(index, ttl);
+        }
     }
 
     private setValue(key: string, value: string, ttl: number): void {

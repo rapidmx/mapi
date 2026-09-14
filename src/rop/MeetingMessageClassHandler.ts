@@ -10,6 +10,7 @@ import { decodeGlobalObjectId, globalObjectIdInstanceDate } from "../codec/Globa
 import type { MapiSessionContext } from "../MapiSessionManager.js";
 import { LID_GLOBAL_OBJECT_ID, PSETID_MEETING } from "./CalendarNamedProperties.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
+import { asEntity, boundIndexedValue, literalQueryValue } from "./RestapiRules.js";
 import type { RopContext } from "./RopHandler.js";
 import { sendOrThrow } from "./TransportSend.js";
 
@@ -66,7 +67,9 @@ const ERROR_CALL_FAILED = 0x80004005;
  * tentatively accepting changes nothing locally. Either way the `REPLY` names just that occurrence (`RECURRENCE-ID`).
  *
  * **The whole meeting** (no instance date, or a copy that doesn't recur): the caller's `Attendee.responseStatus` is
- * recorded; declining soft-deletes the caller's copy instead.
+ * recorded; declining soft-deletes the caller's copy instead. Declining an occurrence through its exception copy also
+ * adds that occurrence to the series' exceptions, so the series doesn't show it again. Every update is versioned
+ * (`asEntity`), so a concurrent change fails the response instead of being overwritten.
  *
  * The `REPLY` (restapi's own `buildEventIcs`) goes out through `sendOrThrow`, so a transport that rejects it is
  * reported as `MAPI_E_CALL_FAILED` instead of success; the response itself stays recorded. An organizer or attendee
@@ -89,7 +92,8 @@ export async function submitMeetingResponse(messageClass: string, draftPropertie
         return ERROR_INVALID_PARAMETER;
     }
 
-    const picked = pickOccurrence(await findCallerCopies(context, icalUid), globalObjectIdInstanceDate(globalObjectId));
+    const copies = await findCallerCopies(context, icalUid);
+    const picked = pickOccurrence(copies, globalObjectIdInstanceDate(globalObjectId));
     const mailbox = picked ? await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true }) : undefined;
     if (!picked || !mailbox) {
         return ERROR_NOT_FOUND;
@@ -105,20 +109,24 @@ export async function submitMeetingResponse(messageClass: string, draftPropertie
     let replyEvent: CalendarEventRow = event;
     if (occurrence) {
         if (responseStatus === AttendeeResponseStatus.DECLINED) {
-            const rule = event.recurrenceRule!;
-            const exceptions = (rule.exceptions ?? []).map((date) => new Date(date));
-            if (!exceptions.some((date) => date.getTime() === occurrence.getTime())) {
-                const recurrenceRule = { ...rule, exceptions: [...exceptions, occurrence] };
-                await context.calendarEventRepo.update({ uid: event.uid, version: event.version, recurrenceRule }, event, { ignoreACL: true });
-            }
+            await addSeriesException(context, event, occurrence);
         }
         const duration = new Date(event.endDate).getTime() - new Date(event.startDate).getTime();
         replyEvent = { ...event, recurrenceRule: undefined, recurrenceId: occurrence, startDate: occurrence, endDate: new Date(occurrence.getTime() + duration) };
     } else if (responseStatus === AttendeeResponseStatus.DECLINED) {
         await context.calendarEventRepo.delete(event.uid, { ignoreACL: true });
+        // Declining an occurrence that has its own exception copy: deleting the copy alone would bring the series'
+        // original occurrence back, so it is excluded from the series too (as restapi's ScanQueueJob does for an
+        // occurrence CANCEL).
+        const series = copies.find((copy) => copy.recurrenceId == null);
+        if (event.recurrenceId != null && series?.recurrenceRule) {
+            await addSeriesException(context, series, new Date(event.recurrenceId));
+        }
     } else {
         const attendees: Attendee[] = event.attendees.map((attendee) => (attendee === respondingAttendee ? updatedAttendee : attendee));
-        await context.calendarEventRepo.update({ uid: event.uid, version: event.version, attendees }, event, { ignoreACL: true });
+        await context.calendarEventRepo.update({ uid: event.uid, version: event.version, attendees }, asEntity(context.calendarEventRepo, event), {
+            ignoreACL: true,
+        });
     }
 
     try {
@@ -140,11 +148,40 @@ const REPLY_SUBJECT_PREFIX: Record<string, string> = {
     [AttendeeResponseStatus.DECLINED]: "Declined",
 };
 
-/** The caller's copies of the meeting `icalUid` names. An `OutlookID`'s hex UID may have been stored in either case,
- * so a miss is retried in lower case. */
+/** Adds `occurrence` to `series`' recurrence exceptions (a versioned update), unless it is already there. */
+async function addSeriesException(context: RopContext, series: CalendarEventRow, occurrence: Date): Promise<void> {
+    const rule = series.recurrenceRule!;
+    const exceptions = (rule.exceptions ?? []).map((date) => new Date(date));
+    if (exceptions.some((date) => date.getTime() === occurrence.getTime())) {
+        return;
+    }
+    const recurrenceRule = { ...rule, exceptions: [...exceptions, occurrence] };
+    await context.calendarEventRepo.update({ uid: series.uid, version: series.version, recurrenceRule }, asEntity(context.calendarEventRepo, series), {
+        ignoreACL: true,
+    });
+}
+
+/**
+ * The caller's copies of the meeting `icalUid` names. An `OutlookID`'s hex UID may have been stored in either case, so a
+ * miss is retried in lower case.
+ *
+ * The UID comes from the client (and originally from whoever sent the invite), so it is looked up the way restapi
+ * stores it (`boundIndexedValue`, hashed past 255 characters), matched literally (a UID like `ne(x)` is not an
+ * operator), and every returned row's `icalUid` is compared again.
+ */
 async function findCallerCopies(context: RopContext, icalUid: string): Promise<CalendarEventRow[]> {
-    const find = (uid: string): Promise<CalendarEventRow[]> =>
-        context.calendarEventRepo.find({ icalUid: uid, mailboxUid: context.mailboxUid, limit: MAX_EVENT_COPIES }, { ignoreACL: true, limit: MAX_EVENT_COPIES });
+    const find = async (uid: string): Promise<CalendarEventRow[]> => {
+        const key = boundIndexedValue(uid);
+        try {
+            const rows: CalendarEventRow[] = await context.calendarEventRepo.find(
+                { icalUid: literalQueryValue(key), mailboxUid: context.mailboxUid, limit: MAX_EVENT_COPIES } as any,
+                { ignoreACL: true, limit: MAX_EVENT_COPIES },
+            );
+            return rows.filter((row) => row.icalUid === key);
+        } catch {
+            return []; // a UID the query layer can't take as a value matches nothing
+        }
+    };
     const events = await find(icalUid);
     return events.length > 0 || icalUid.toLowerCase() === icalUid ? events : find(icalUid.toLowerCase());
 }

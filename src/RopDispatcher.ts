@@ -22,6 +22,18 @@ export const ERROR_CALL_FAILED = 0x80004005;
 /** `MAPI_E_TOO_COMPLEX`: the ROP would have gone past this request's `ExecuteBudget`. */
 export const ERROR_TOO_COMPLEX = 0x80040117;
 
+/** `RopBufferTooSmall`'s fixed fields: `RopId` and `SizeNeeded`. */
+const BUFFER_TOO_SMALL_HEADER_BYTES = 3;
+
+/** Thrown by `dispatchRops` when the room left can't even hold a `RopBufferTooSmall` for the next ROP. The route
+ * answers the whole `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]). The ROPs before it have run. */
+export class ExecuteBufferTooSmallError extends Error {
+    public constructor() {
+        super("Execute: MaxRopOut is too small for even a RopBufferTooSmall response.");
+        this.name = "ExecuteBufferTooSmallError";
+    }
+}
+
 export interface DispatchOptions {
     /** Stop after this many ROPs. Defaults to `MAX_ROPS_PER_EXECUTE`. */
     maxRops?: number;
@@ -66,7 +78,9 @@ function decodingReader(reader: BufferReader): BufferReader {
  * reader points.
  * - **Output space.** `context.ropOutputRemaining` tells each handler how much room is left. A response that still
  * doesn't fit is replaced by `RopBufferTooSmall` (`SizeNeeded` plus the unprocessed request bytes, from this ROP
- * on, for the client to resend) and processing stops. That ROP's side effects have happened, as on Exchange.
+ * on, for the client to resend) and processing stops. That ROP's side effects have happened, as on Exchange. When
+ * even the `RopBufferTooSmall` doesn't fit, `ExecuteBufferTooSmallError` is thrown and the route fails the whole
+ * `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]), so no ROP is ever dropped without the client being told.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -107,14 +121,15 @@ export async function dispatchRops(
             }
 
             if (response.length > remaining) {
-                const tooSmall = new BufferWriter()
+                if (BUFFER_TOO_SMALL_HEADER_BYTES + (ropsList.length - start) > remaining) {
+                    // Not even RopBufferTooSmall fits: the client couldn't be told which ROPs went unprocessed, so the
+                    // whole Execute fails instead of dropping them silently.
+                    throw new ExecuteBufferTooSmallError();
+                }
+                writer
                     .writeUInt8(ROP_ID_BUFFER_TOO_SMALL)
                     .writeUInt16LE(Math.min(response.length, 0xffff)) // SizeNeeded
-                    .writeBytes(ropsList.subarray(start)) // RequestBuffers
-                    .toBuffer();
-                if (tooSmall.length <= remaining) {
-                    writer.writeBytes(tooSmall);
-                }
+                    .writeBytes(ropsList.subarray(start)); // RequestBuffers
                 break;
             }
             writer.writeBytes(response);

@@ -7,6 +7,7 @@ import type { RepoUtils } from "@rapidrest/service-core";
 import { Message, type BlobStore } from "@rapidmx/restapi";
 import { BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
+import type { ExecuteBudget } from "./ExecuteBudget.js";
 import { handleDataCache, handleDataKey } from "./HandleDataCache.js";
 import type { RopContext } from "./RopHandler.js";
 
@@ -27,15 +28,18 @@ export const PID_TAG_BODY = 0x1000;
  * `sanitizedHtmlBlobKey` - `PidTagBody` is specifically the plain-text body per `[MS-OXPROPS]`, unlike EAS's
  * `Body` element, which can carry either format tagged by its own `Type` field.
  *
- * Does no caching itself - `loadStreamBody` below is what the stream ROPs call.
+ * Does no caching itself - `loadStreamBody` below is what the stream ROPs call. With a `budget`, nothing is fetched
+ * once its bytes are used up, and the raw message's size is charged before it is parsed.
  */
-export async function resolveMessageBodyBytes(target: string, messageRepo: RepoUtils<any>, blobStore: BlobStore): Promise<Buffer> {
+export async function resolveMessageBodyBytes(target: string, messageRepo: RepoUtils<any>, blobStore: BlobStore, budget?: ExecuteBudget): Promise<Buffer> {
+    budget?.assertBytesLeft();
     const uid = target.slice("message:".length);
     const message: Message | undefined = await messageRepo.findOne(uid, { ignoreACL: true });
     if (!message) {
         return Buffer.alloc(0);
     }
     const raw = await blobStore.get(message.bodyBlobKey);
+    budget?.chargeBytes(raw.length);
     const parsed = await simpleParser(raw);
     const writer = new BufferWriter();
     writer.writeNullTerminatedUtf16LE(parsed.text ?? "");
@@ -60,7 +64,8 @@ export async function loadStreamBody(context: RopContext, handleIndex: number, s
     const budget = context.budget;
     let pending = budget?.bodies.get(stream.entityUid);
     if (!pending) {
-        pending = resolveMessageBodyBytes(stream.entityUid, context.messageRepo, context.blobStore);
+        budget?.assertBytesLeft();
+        pending = resolveMessageBodyBytes(stream.entityUid, context.messageRepo, context.blobStore, budget);
         budget?.bodies.set(stream.entityUid, pending);
         budget?.chargeBytes((await pending).length);
     }

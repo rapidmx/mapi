@@ -68,7 +68,7 @@ describe("submitMeetingResponse Tests", () => {
         await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
 
         expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith(
-            { icalUid: "evt-uid@example.com", mailboxUid: "mailbox-1", limit: 100 },
+            { icalUid: "eq(evt-uid@example.com)", mailboxUid: "mailbox-1", limit: 100 },
             { ignoreACL: true, limit: 100 },
         );
     });
@@ -80,13 +80,13 @@ describe("submitMeetingResponse Tests", () => {
         expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith(
-            { icalUid: "unknown@example.com", mailboxUid: "mailbox-1", limit: 100 },
+            { icalUid: "eq(unknown@example.com)", mailboxUid: "mailbox-1", limit: 100 },
             { ignoreACL: true, limit: 100 },
         );
     });
 
     it("Returns MAPI_E_NOT_FOUND when the caller's mailbox can't be resolved.", async () => {
-        const event = { uid: "evt1", version: 1, attendees: [{ address: "caller@example.com" }] };
+        const event = { uid: "evt1", version: 1, icalUid: "evt-uid@example.com", attendees: [{ address: "caller@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update: vi.fn() } as any,
             mailboxRepo: { findOne: vi.fn().mockResolvedValue(undefined) } as any,
@@ -99,7 +99,7 @@ describe("submitMeetingResponse Tests", () => {
     });
 
     it("Returns MAPI_E_NOT_FOUND when the caller isn't actually an attendee of the event.", async () => {
-        const event = { uid: "evt1", version: 1, attendees: [{ address: "someone-else@example.com" }] };
+        const event = { uid: "evt1", version: 1, icalUid: "evt-uid@example.com", attendees: [{ address: "someone-else@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update: vi.fn() } as any,
             mailboxRepo: { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) } as any,
@@ -115,6 +115,7 @@ describe("submitMeetingResponse Tests", () => {
         const event = {
             uid: "evt1",
             version: 2,
+            icalUid: "evt-uid@example.com",
             attendees: [
                 { address: "Caller@Example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
                 { address: "other@example.com", role: AttendeeRole.REQUIRED, responseStatus: AttendeeResponseStatus.NEEDS_ACTION, isOrganizer: false },
@@ -143,6 +144,7 @@ describe("submitMeetingResponse Tests", () => {
         const event = {
             uid: "evt1",
             version: 1,
+            icalUid: "evt-uid@example.com",
             attendees: [{ address: "caller@example.com", responseStatus: AttendeeResponseStatus.NEEDS_ACTION }],
         };
         const calendarEventRepo = { find: vi.fn().mockResolvedValue([event]), update: vi.fn().mockResolvedValue(undefined) };
@@ -162,6 +164,7 @@ describe("submitMeetingResponse Tests", () => {
         const event = {
             uid: "evt1",
             version: 1,
+            icalUid: "evt-uid@example.com",
             attendees: [{ address: "caller@example.com", responseStatus: AttendeeResponseStatus.NEEDS_ACTION }],
         };
         const calendarEventRepo = {
@@ -262,8 +265,8 @@ describe("submitMeetingResponse Tests", () => {
     });
 
     it("Prefers the caller's exception copy for the occurrence the GlobalObjectId names, falling back to the series.", async () => {
-        const series = { uid: "series", version: 1, attendees: [{ address: "caller@example.com" }] };
-        const exception = { uid: "exception", version: 1, recurrenceId: new Date("2026-10-08T10:00:00.000Z"), attendees: [{ address: "caller@example.com" }] };
+        const series = { uid: "series", version: 1, icalUid: "evt-uid@example.com", attendees: [{ address: "caller@example.com" }] };
+        const exception = { uid: "exception", version: 1, icalUid: "evt-uid@example.com", recurrenceId: new Date("2026-10-08T10:00:00.000Z"), attendees: [{ address: "caller@example.com" }] };
         const mailboxRepo = { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) };
         const instanceProperty = (session: MapiSessionContext, year: number, month: number, day: number): Record<string, string> => {
             const id = assignOrGetNamedPropertyId(session, { guid: PSETID_MEETING, kind: "lid", lid: LID_GLOBAL_OBJECT_ID });
@@ -298,7 +301,7 @@ describe("submitMeetingResponse Tests", () => {
     });
 
     it("Returns MAPI_E_NOT_FOUND when the caller holds only exception copies and none matches.", async () => {
-        const exception = { uid: "exception", version: 1, recurrenceId: new Date("2026-10-08T10:00:00.000Z"), attendees: [{ address: "caller@example.com" }] };
+        const exception = { uid: "exception", version: 1, icalUid: "evt-uid@example.com", recurrenceId: new Date("2026-10-08T10:00:00.000Z"), attendees: [{ address: "caller@example.com" }] };
         const context = makeContext({
             calendarEventRepo: { find: vi.fn().mockResolvedValue([exception]), update: vi.fn() } as any,
             mailboxRepo: { findOne: vi.fn() } as any,
@@ -422,7 +425,7 @@ describe("submitMeetingResponse Tests", () => {
         zeroed.fill(0, 16, 20);
         const hexUid = zeroed.toString("hex").toUpperCase();
         const event = { uid: "evt1", version: 1, icalUid: hexUid.toLowerCase(), attendees: [{ address: "caller@example.com" }] };
-        const find = vi.fn().mockImplementation((query: any) => Promise.resolve(query.icalUid === hexUid.toLowerCase() ? [event] : []));
+        const find = vi.fn().mockImplementation((query: any) => Promise.resolve(query.icalUid === `eq(${hexUid.toLowerCase()})` ? [event] : []));
         const context = makeContext({
             calendarEventRepo: { find, update: vi.fn().mockResolvedValue(undefined) } as any,
             mailboxRepo: { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) } as any,
@@ -431,7 +434,7 @@ describe("submitMeetingResponse Tests", () => {
 
         expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", { [String(id)]: blob.toString("base64") }, context)).toBe(0);
 
-        expect(find.mock.calls.map((call) => call[0].icalUid)).toEqual([hexUid, hexUid.toLowerCase()]);
+        expect(find.mock.calls.map((call) => call[0].icalUid)).toEqual([`eq(${hexUid})`, `eq(${hexUid.toLowerCase()})`]);
         expect((context.calendarEventRepo as any).update).toHaveBeenCalledTimes(1);
     });
 
@@ -439,6 +442,7 @@ describe("submitMeetingResponse Tests", () => {
         const event = {
             uid: "evt1",
             version: 1,
+            icalUid: "evt-uid@example.com",
             attendees: [{ address: "alias@example.com", responseStatus: AttendeeResponseStatus.NEEDS_ACTION }],
         };
         const calendarEventRepo = { find: vi.fn().mockResolvedValue([event]), update: vi.fn().mockResolvedValue(undefined) };
@@ -451,5 +455,87 @@ describe("submitMeetingResponse Tests", () => {
         await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
 
         expect(calendarEventRepo.update).toHaveBeenCalledTimes(1);
+    });
+    describe("Round 5: lookups and versioned updates", () => {
+        const mailboxRepo = () => ({ findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) });
+
+        it("Looks the UID up literally and ignores rows whose icalUid isn't exactly it, so a UID like ne(x) can't pick another meeting.", async () => {
+            const other = { uid: "other", version: 1, icalUid: "someone-elses-meeting", attendees: [{ address: "caller@example.com" }] };
+            const find = vi.fn().mockResolvedValue([other]);
+            const context = makeContext({ calendarEventRepo: { find, update: vi.fn(), delete: vi.fn() } as any, mailboxRepo: mailboxRepo() as any });
+
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", globalObjectIdProperty(context.session, "ne(x)"), context)).toBe(0x8004010f);
+
+            expect(find.mock.calls[0][0].icalUid).toBe("eq(ne(x))");
+            expect((context.calendarEventRepo as any).delete).not.toHaveBeenCalled();
+        });
+
+        it("Bounds a UID over 255 characters the way restapi stores it, and treats a query the repo rejects as no match.", async () => {
+            const longUid = "u".repeat(300);
+            const { createHash } = await import("crypto");
+            const stored = `sha256:${createHash("sha256").update(longUid, "utf8").digest("hex")}`;
+            const event = { uid: "evt1", version: 1, icalUid: stored, attendees: [{ address: "caller@example.com" }] };
+            const find = vi.fn().mockResolvedValue([event]);
+            const context = makeContext({ calendarEventRepo: { find, update: vi.fn().mockResolvedValue(undefined) } as any, mailboxRepo: mailboxRepo() as any });
+
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(context.session, longUid), context)).toBe(0);
+            expect(find.mock.calls[0][0].icalUid).toBe(`eq(${stored})`);
+
+            const rejecting = makeContext({ calendarEventRepo: { find: vi.fn().mockRejectedValue(new Error("unknown operator")) } as any, mailboxRepo: mailboxRepo() as any });
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(rejecting.session, "Me"), rejecting)).toBe(0x8004010f);
+        });
+
+        it("Updates through an instance of the repo's model class, so the version lock applies to plain Mongo documents.", async () => {
+            class Model {
+                public constructor(other: object) {
+                    Object.assign(this, other);
+                }
+            }
+            const event = { uid: "evt1", version: 3, icalUid: "evt-uid@example.com", attendees: [{ address: "caller@example.com" }] };
+            const update = vi.fn().mockResolvedValue(undefined);
+            const context = makeContext({ calendarEventRepo: { find: vi.fn().mockResolvedValue([event]), update, modelClass: Model } as any, mailboxRepo: mailboxRepo() as any });
+
+            await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(context.session, "evt-uid@example.com"), context);
+
+            const existing = update.mock.calls[0][1];
+            expect(existing).toBeInstanceOf(Model);
+            expect(existing.version).toBe(3);
+        });
+
+        it("Declining an occurrence through its exception copy deletes the copy and adds the occurrence to the series' exceptions.", async () => {
+            const recurrenceId = new Date("2026-10-08T10:00:00.000Z");
+            const series = { uid: "series", version: 2, icalUid: "evt-uid@example.com", recurrenceRule: { freq: "weekly", interval: 1 }, attendees: [{ address: "caller@example.com" }] };
+            const exception = { uid: "exception", version: 1, icalUid: "evt-uid@example.com", recurrenceId, attendees: [{ address: "caller@example.com" }] };
+            const instanceProperty = (session: MapiSessionContext): Record<string, string> => {
+                const id = assignOrGetNamedPropertyId(session, { guid: PSETID_MEETING, kind: "lid", lid: LID_GLOBAL_OBJECT_ID });
+                const bytes = encodeGlobalObjectId("evt-uid@example.com", new Date());
+                bytes[16] = 2026 >> 8;
+                bytes[17] = 2026 & 0xff;
+                bytes[18] = 10;
+                bytes[19] = 8;
+                return { [String(id)]: bytes.toString("base64") };
+            };
+            const repo = { find: vi.fn().mockResolvedValue([series, exception]), update: vi.fn().mockResolvedValue(undefined), delete: vi.fn().mockResolvedValue(undefined) };
+            const context = makeContext({ calendarEventRepo: repo as any, mailboxRepo: mailboxRepo() as any });
+
+            expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", instanceProperty(context.session), context)).toBe(0);
+
+            expect(repo.delete).toHaveBeenCalledWith("exception", { ignoreACL: true });
+            expect(repo.update).toHaveBeenCalledTimes(1);
+            expect(repo.update.mock.calls[0][0]).toEqual({ uid: "series", version: 2, recurrenceRule: { freq: "weekly", interval: 1, exceptions: [recurrenceId] } });
+
+            // Already excluded, or a series that doesn't recur (or isn't in the caller's mailbox): only the copy goes.
+            for (const copies of [
+                [{ ...series, recurrenceRule: { freq: "weekly", interval: 1, exceptions: [recurrenceId.toISOString()] } }, exception],
+                [{ ...series, recurrenceRule: undefined }, exception],
+                [exception],
+            ]) {
+                const again = { find: vi.fn().mockResolvedValue(copies), update: vi.fn(), delete: vi.fn().mockResolvedValue(undefined) };
+                const next = makeContext({ calendarEventRepo: again as any, mailboxRepo: mailboxRepo() as any });
+                expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", instanceProperty(next.session), next)).toBe(0);
+                expect(again.delete).toHaveBeenCalledWith("exception", { ignoreACL: true });
+                expect(again.update).not.toHaveBeenCalled();
+            }
+        });
     });
 });

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import type { RepoUtils } from "@rapidrest/service-core";
+import type { ExecuteBudget } from "./ExecuteBudget.js";
 
 /** `RepoUtils.find()`'s own largest page. */
 export const REPO_PAGE_SIZE = 1000;
@@ -17,9 +18,22 @@ export type RepoSort = Record<string, "ASC" | "DESC">;
 /**
  * Fetches one page. `limit`/`page`/`sort` go in both the query (what the SQL query builder reads) and the options
  * (what Mongo reads); without them each backend silently returns its own 100-row default in an unspecified order.
+ *
+ * With a `budget`, the query is charged before it runs and the rows it returned right after, so a request past its
+ * `ExecuteBudget` stops before the next query.
  */
-export async function findPage<T>(repo: RepoUtils<any>, query: Record<string, any>, sort: RepoSort, page: number, pageSize: number = REPO_PAGE_SIZE): Promise<T[]> {
-    return repo.find({ ...query, sort, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+export async function findPage<T>(
+    repo: RepoUtils<any>,
+    query: Record<string, any>,
+    sort: RepoSort,
+    page: number,
+    pageSize: number = REPO_PAGE_SIZE,
+    budget?: ExecuteBudget,
+): Promise<T[]> {
+    budget?.chargeQueries();
+    const rows: T[] = await repo.find({ ...query, sort, limit: pageSize, page } as any, { ignoreACL: true, limit: pageSize, page });
+    budget?.chargeFetchedRows(rows.length);
+    return rows;
 }
 
 /**
@@ -31,10 +45,11 @@ export async function findAllCapped<T>(
     query: Record<string, any>,
     sort: RepoSort,
     cap: number = MAX_COLLECTION_ROWS,
+    budget?: ExecuteBudget,
 ): Promise<{ items: T[]; truncated: boolean }> {
     const items: T[] = [];
     for (let page = 0; ; page++) {
-        const rows: T[] = await findPage<T>(repo, query, sort, page);
+        const rows: T[] = await findPage<T>(repo, query, sort, page, REPO_PAGE_SIZE, budget);
         items.push(...rows);
         if (rows.length < REPO_PAGE_SIZE) {
             return { items: items.slice(0, cap), truncated: items.length > cap };
@@ -49,12 +64,19 @@ export async function findAllCapped<T>(
  * Fetches the rows at positions `[start, start + count)` of `query` in `sort` order, reading only the pages that
  * window touches.
  */
-export async function findWindow<T>(repo: RepoUtils<any>, query: Record<string, any>, sort: RepoSort, start: number, count: number): Promise<T[]> {
+export async function findWindow<T>(
+    repo: RepoUtils<any>,
+    query: Record<string, any>,
+    sort: RepoSort,
+    start: number,
+    count: number,
+    budget?: ExecuteBudget,
+): Promise<T[]> {
     const result: T[] = [];
     let position = start;
     while (result.length < count) {
         const page = Math.floor(position / REPO_PAGE_SIZE);
-        const rows: T[] = await findPage<T>(repo, query, sort, page);
+        const rows: T[] = await findPage<T>(repo, query, sort, page, REPO_PAGE_SIZE, budget);
         const taken = rows.slice(position - page * REPO_PAGE_SIZE, position - page * REPO_PAGE_SIZE + (count - result.length));
         result.push(...taken);
         position += taken.length;

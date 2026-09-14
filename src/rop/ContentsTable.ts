@@ -24,6 +24,7 @@ const SORT_BY_KIND: Record<ContentsKind, RepoSort> = {
 /** Which repo a folder's items live in, decided by the folder's own `type`: a `Contact`/`Task`/`CalendarEvent` is
  * its own entity, never a `Message` row. */
 export async function resolveContentsKind(folderUid: string, context: RopContext): Promise<ContentsKind> {
+    context.budget?.chargeQueries();
     const folder: Folder | undefined = await context.folderRepo.findOne(folderUid, { ignoreACL: true });
     switch (folder?.type) {
         case FolderType.CALENDAR:
@@ -66,6 +67,6 @@ export async function resolveContentsWindow(context: RopContext, table: MapiObje
         return [];
     }
     const folderUid = table.entityUid.slice("folder:".length);
-    const rows: { uid: string }[] = await findWindow(repo, { folderUid, mailboxUid: context.mailboxUid }, SORT_BY_KIND[kind], start, count);
+    const rows: { uid: string }[] = await findWindow(repo, { folderUid, mailboxUid: context.mailboxUid }, SORT_BY_KIND[kind], start, count, context.budget);
     return rows.map((row) => `${kind}:${row.uid}`);
 }

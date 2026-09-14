@@ -5,9 +5,9 @@
 import { Folder, FolderType } from "@rapidmx/restapi";
 import { BufferWriter } from "../codec/BufferCursor.js";
 import { PropertyType, writeTaggedPropertyValue } from "../codec/PropertyValue.js";
-import { assignHandle, type MapiObjectHandle } from "../MapiSessionManager.js";
+import { assignHandle, releaseHandle, type MapiObjectHandle } from "../MapiSessionManager.js";
 import { resolveFolderCalendarEvents } from "./CalendarEventTarget.js";
-import { handleDataKey } from "./HandleDataCache.js";
+import { handleDataKey, handleDataOwners } from "./HandleDataCache.js";
 import { resolveFolderMessages } from "./MessageTarget.js";
 import { resolvePropertyValues } from "./PropertyResolvers.js";
 import { handleDataStoreOf, type RopContext } from "./RopHandler.js";
@@ -129,8 +129,8 @@ export async function buildFastTransferStream(
             const folder: Folder | undefined = await context.folderRepo.findOne(folderUid, { ignoreACL: true });
             const isCalendar = folder?.type === FolderType.CALENDAR;
             const rows = isCalendar
-                ? await resolveFolderCalendarEvents(folderUid, context.calendarEventRepo)
-                : await resolveFolderMessages(folderUid, context.messageRepo);
+                ? await resolveFolderCalendarEvents(folderUid, context.calendarEventRepo, context.budget)
+                : await resolveFolderMessages(folderUid, context.messageRepo, context.budget);
             const messageColumns = options.columns ?? filterExcluded(isCalendar ? DEFAULT_CALENDAR_COLUMNS : DEFAULT_MESSAGE_COLUMNS, exclude);
 
             for (const row of rows) {
@@ -181,7 +181,8 @@ export type FastTransferLoadFailure = "tooBig" | "lost";
  * nothing has been paged out yet. Part-way through, a rebuild could differ from what the client already has (items
  * added or changed since), and continuing at the old offset would hand it bytes from a different stream, so that
  * case reports `"lost"` and the client restarts the transfer. A rebuild is held to `MAX_FAST_TRANSFER_BYTES` like
- * the original build.
+ * the original build, and storing it to the session's and user's handle data quota (`handleDataOwners`); either
+ * failing reports `"tooBig"`.
  */
 export async function loadFastTransferBuffer(
     context: RopContext,
@@ -198,17 +199,17 @@ export async function loadFastTransferBuffer(
         return "lost";
     }
     const buffer = await rebuildFastTransferStream(transfer, context);
-    if (!buffer) {
+    if (!buffer || !(await store.set(key, buffer, FAST_TRANSFER_TTL_SECONDS, handleDataOwners(context.session.uid, context.session.userUid)))) {
         return "tooBig";
     }
-    await store.set(key, buffer, FAST_TRANSFER_TTL_SECONDS);
     return buffer;
 }
 
 /**
  * Shared by `RopFastTransferSourceCopyTo`/`CopyProperties`: builds the stream for `source`, and on success stores a
  * `"fastTransfer"` handle at `outputHandleIndex` with the stream in the `HandleDataStore`. Returns `false`, storing
- * nothing, when the stream exceeds `MAX_FAST_TRANSFER_BYTES`.
+ * nothing, when the stream exceeds `MAX_FAST_TRANSFER_BYTES` or the session's or user's handle data quota
+ * (`handleDataOwners`) has no room for it.
  */
 export async function openFastTransferHandle(
     context: RopContext,
@@ -229,6 +230,14 @@ export async function openFastTransferHandle(
         return false;
     }
     assignHandle(context.session, outputHandleIndex, transfer);
-    await handleDataStoreOf(context).set(handleDataKey(context.session.uid, outputHandleIndex, transfer.generation), buffer, FAST_TRANSFER_TTL_SECONDS);
-    return true;
+    const stored = await handleDataStoreOf(context).set(
+        handleDataKey(context.session.uid, outputHandleIndex, transfer.generation),
+        buffer,
+        FAST_TRANSFER_TTL_SECONDS,
+        handleDataOwners(context.session.uid, context.session.userUid),
+    );
+    if (!stored) {
+        releaseHandle(context.session, outputHandleIndex);
+    }
+    return stored;
 }

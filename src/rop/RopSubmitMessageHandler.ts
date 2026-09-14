@@ -14,9 +14,10 @@ import {
 } from "@rapidmx/restapi";
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
-import { isPlainEmailAddress, resolveRecipientList, type ResolvedRecipient } from "./AddressList.js";
+import { MAX_RECIPIENTS_PER_MESSAGE, parseRecipientList, resolveRecipientList, type ResolvedRecipient } from "./AddressList.js";
+import { writeStreamKey } from "./HandleDataCache.js";
 import { submitMeetingResponse } from "./MeetingMessageClassHandler.js";
-import type { RopContext, RopHandler } from "./RopHandler.js";
+import { handleDataStoreOf, type RopContext, type RopHandler } from "./RopHandler.js";
 import { readWriteStream } from "./RopWriteStreamHandler.js";
 
 const ROP_ID_SUBMIT_MESSAGE = 0x32;
@@ -32,6 +33,9 @@ const ERROR_INVALID_PARAMETER = 0x80070057;
 
 /** `MAPI_E_NOT_FOUND`: a recipient given only by display name matches no single contact of the caller's. */
 const ERROR_NOT_FOUND = 0x8004010f;
+
+/** `MAPI_E_TOO_BIG`: more than `MAX_RECIPIENTS_PER_MESSAGE` recipients. */
+const ERROR_TOO_BIG = 0x80040305;
 
 /** `MAPI_E_CALL_FAILED`: the body written through `RopWriteStream` can no longer be reassembled (its chunks expired). */
 const ERROR_CALL_FAILED = 0x80004005;
@@ -102,6 +106,12 @@ function writeResult(writer: BufferWriter, inputHandleIndex: number, returnValue
  * own `requestReceipt` field - honored only when the client explicitly sets it, not this mailbox's
  * `alwaysRequestReceiptInternal`/`External` defaults (those apply to the REST/webmail compose path only).
  *
+ * **Once per draft.** A mail or meeting-response draft is marked `submitted` as soon as a submit gets past the handle
+ * check, whatever the outcome, and a submitted draft can't be submitted again (`MAPI_E_INVALID_OBJECT`) or changed by
+ * `RopSetProperties`/`RopWriteStream`; its write-stream chunks are deleted once read. Each `Execute` runs at most
+ * `MAX_SUBMITS_PER_EXECUTE` submits, and a message may have at most `MAX_RECIPIENTS_PER_MESSAGE` recipients
+ * (`MAPI_E_TOO_BIG`), counted before any display name is looked up.
+ *
  * **Calendar branches**: a draft whose `PidTagMessageClass` starts with `"IPM.Appointment"` is routed to
  * `submitAppointment()` instead of the mail path below - see that method's own doc comment. One starting with
  * `"IPM.Schedule.Meeting.Resp."` (an attendee's own accept/decline/tentative response to a meeting this server
@@ -119,12 +129,13 @@ export class RopSubmitMessageHandler implements RopHandler {
         reader.readUInt8(); // SubmitFlags - see class doc comment
 
         const handle = context.session.handles[inputHandleIndex];
-        if (!handle || handle.type !== "message") {
+        if (!handle || handle.type !== "message" || handle.submitted) {
             writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
             writer.writeUInt8(inputHandleIndex);
             writer.writeUInt32LE(ERROR_INVALID_OBJECT);
             return;
         }
+        context.budget?.chargeSubmit();
 
         const properties = handle.draftProperties ?? {};
         const messageClass = properties[String(PID_TAG_MESSAGE_CLASS)] ?? "IPM.Note";
@@ -132,8 +143,19 @@ export class RopSubmitMessageHandler implements RopHandler {
             await this.submitAppointment(handle, context, writer, inputHandleIndex);
             return;
         }
+        // From here on the draft is used up by this attempt, whatever its outcome, so it can't be sent again.
+        handle.submitted = true;
         if (messageClass.startsWith(MESSAGE_CLASS_MEETING_RESPONSE_PREFIX)) {
             writeResult(writer, inputHandleIndex, await submitMeetingResponse(messageClass, properties, context));
+            return;
+        }
+
+        const recipientCount = [PID_TAG_DISPLAY_TO, PID_TAG_DISPLAY_CC, PID_TAG_DISPLAY_BCC].reduce(
+            (count, propertyId) => count + parseRecipientList(properties[String(propertyId)]).length,
+            0,
+        );
+        if (recipientCount > MAX_RECIPIENTS_PER_MESSAGE) {
+            writeResult(writer, inputHandleIndex, ERROR_TOO_BIG);
             return;
         }
 
@@ -264,98 +286,31 @@ export class RopSubmitMessageHandler implements RopHandler {
     }
 
     /**
-     * Submits a Calendar item. The appointment itself is already persisted (`RopSaveChangesMessageHandler`
-     * writes the real `CalendarEvent` row at Save time, unlike a mail draft, which stays purely in-session until
-     * Submit) - this method's only job is notifying attendees, if any were set (via `PidTagDisplayTo`/`Cc`,
-     * decoded into `CalendarEvent.attendees` at Save time). No attendees means no invite to send (e.g. a private,
-     * non-meeting appointment) - a well-formed success response either way, since the appointment already exists.
+     * Submits a Calendar item. The appointment itself is already persisted (`RopSaveChangesMessageHandler` writes the
+     * real `CalendarEvent` row at Save time, unlike a mail draft, which stays purely in-session until Submit), so there
+     * is nothing left to store and nothing is sent from here.
      *
-     * Unlike ordinary mail, there is no separate "Sent Items copy" to create - the appointment's durable copy
-     * *is* the `CalendarEvent` row already sitting in the organizer's own Calendar folder.
+     * **Invites are restapi's `MeetingSchedulingJob`'s job.** That job sends an iTIP `REQUEST` for every
+     * organizer-owned event whose `inviteSequenceSent` differs from its `sequence`, which includes every meeting saved
+     * through MAPI (created at sequence 0, bumped on scheduling-relevant edits). It claims each revision with a
+     * versioned update before sending, builds the invite with restapi's own `buildEventIcs` (so a recurring meeting's
+     * invite carries its `RRULE` and exceptions), and sends each revision once. An earlier version also sent its own
+     * single-instance `REQUEST` here without stamping `inviteSequenceSent`, so attendees got two invites (one wrong
+     * for a recurring meeting), and every repeated Submit relayed another. Letting the job send is the only way to get
+     * one correct invite; the trade-off is that a saved meeting's invites go out on the job's next run even if the
+     * client never submits it, which is also how a meeting created through REST behaves.
      *
-     * The invite itself is a minimal iCalendar (`RFC 5545`) `VEVENT` with `METHOD:REQUEST` (`RFC 5546`),
-     * attached via `nodemailer`'s own `MailComposer` `icalEvent` option (which produces both a `text/calendar;
-     * method=REQUEST` MIME alternative and an `.ics` attachment - the standard dual form real invite emails use)
-     * - reusing the identical `scanAndRelay()` pipeline the mail path above already calls.
+     * Only the organizer's own copy may be submitted (an attendee's copy of someone else's meeting answers
+     * `MAPI_E_INVALID_OBJECT`, as before), and a success response is returned either way for the organizer.
      */
     private async submitAppointment(handle: MapiObjectHandle, context: RopContext, writer: BufferWriter, inputHandleIndex: number): Promise<void> {
         const uid = handle.entityUid.startsWith("calendarEvent:") ? handle.entityUid.slice("calendarEvent:".length) : undefined;
         const event: CalendarEvent | undefined = uid ? await context.calendarEventRepo.findOne(uid, { ignoreACL: true }) : undefined;
         const mailbox = event?.mailboxUid === context.mailboxUid ? await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true }) : undefined;
         const callerAddresses: string[] = mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a: string) => a.toLowerCase()) : [];
-        // Only the organizer sends invites. An attendee's own copy of a meeting (delivered into their calendar) is
-        // also a CalendarEvent they can open and submit, which would otherwise mail a REQUEST to every attendee as if
-        // they had organized it.
-        if (!event || !callerAddresses.includes((event.organizer?.address ?? "").toLowerCase())) {
-            writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
-            writer.writeUInt8(inputHandleIndex);
-            writer.writeUInt32LE(ERROR_INVALID_OBJECT);
-            return;
-        }
-
-        const attendees = event.attendees.filter((attendee) => isPlainEmailAddress(attendee.address));
-        if (attendees.length > 0) {
-            const envelopeFrom: string = mailbox.primarySmtpAddress;
-            const attendeeAddresses = attendees.map((attendee) => attendee.address);
-            const ics = buildMeetingRequestIcs({ ...event, attendees }, envelopeFrom);
-            const raw: Buffer = await new MailComposer({
-                from: envelopeFrom,
-                to: attendeeAddresses,
-                subject: event.title,
-                text: `You have been invited to: ${event.title}`,
-                icalEvent: { method: "REQUEST", content: ics },
-            })
-                .compile()
-                .build();
-            await scanAndRelay(raw, envelopeFrom, attendeeAddresses, context.scanPipeline, context.mailTransport, context.blobStore);
-        }
-
-        writer.writeUInt8(ROP_ID_SUBMIT_MESSAGE);
-        writer.writeUInt8(inputHandleIndex);
-        writer.writeUInt32LE(0); // ReturnValue - success
+        const isOrganizer = !!event && callerAddresses.includes((event.organizer?.address ?? "").toLowerCase());
+        writeResult(writer, inputHandleIndex, isOrganizer ? 0 : ERROR_INVALID_OBJECT);
     }
-}
-
-/** `YYYYMMDDTHHMMSSZ` - the `RFC 5545` "form 2" (UTC) `DATE-TIME` format every field below uses. */
-function formatIcsDateUtc(date: Date): string {
-    return date.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
-}
-
-/** Escapes the `RFC 5545` §3.3.11 `TEXT` value special characters (backslash, semicolon, comma, newline) - the
- * only value types this minimal builder ever emits unescaped text into (`SUMMARY`/`LOCATION`). */
-function escapeIcsText(value: string): string {
-    return value.replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\r?\n/g, "\\n");
-}
-
-/**
- * Builds a minimal `RFC 5545`/`RFC 5546` `METHOD:REQUEST` iCalendar document for `event`. Deliberately not a
- * general-purpose iCalendar writer (see `AutodiscoverXml.ts`'s own doc comment for the same "hand-build just
- * the fields this pass needs" precedent) - no `RRULE` (recurring meeting invites are a documented gap, same as
- * this pragmatic subset's other recurrence-adjacent limitations), no line-folding at the 75-octet boundary
- * `RFC 5545` §3.1 technically requires (every field emitted here is short enough in practice that folding would
- * never trigger), no `VTIMEZONE` block (times are always emitted as UTC `Z`-suffixed values instead).
- */
-function buildMeetingRequestIcs(event: CalendarEvent, organizerAddress: string): string {
-    const lines = [
-        "BEGIN:VCALENDAR",
-        "PRODID:-//RapidREST//Mail//EN",
-        "VERSION:2.0",
-        "METHOD:REQUEST",
-        "BEGIN:VEVENT",
-        `UID:${event.icalUid}`,
-        `SEQUENCE:${event.sequence}`,
-        `DTSTAMP:${formatIcsDateUtc(new Date())}`,
-        `DTSTART:${formatIcsDateUtc(event.startDate)}`,
-        `DTEND:${formatIcsDateUtc(event.endDate)}`,
-        `SUMMARY:${escapeIcsText(event.title)}`,
-        ...(event.location ? [`LOCATION:${escapeIcsText(event.location)}`] : []),
-        `ORGANIZER:mailto:${organizerAddress}`,
-        ...event.attendees.map((attendee) => `ATTENDEE;RSVP=TRUE:mailto:${attendee.address}`),
-        "STATUS:CONFIRMED",
-        "END:VEVENT",
-        "END:VCALENDAR",
-    ];
-    return lines.join("\r\n");
 }
 
 /** A recipient as nodemailer's `MailComposer` takes it: a display name only when there is one. */
@@ -384,6 +339,10 @@ async function resolveDraftBody(context: RopContext, messageHandleIndex: number,
             candidate.writeSize
         ) {
             const raw = await readWriteStream(context, Number(index), candidate);
+            // The chunks are only needed for this one submit; best effort, they expire anyway.
+            await handleDataStoreOf(context)
+                .delete(writeStreamKey(context.session.uid, Number(index), candidate.generation))
+                .catch(() => undefined);
             return raw?.toString("utf16le").replace(/\0+$/, "");
         }
     }
