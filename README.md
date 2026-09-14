@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/RapidMX/mapi/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/RapidMX/mapi/actions/workflows/build.yml)
 [![Coverage Status](https://coveralls.io/repos/github/RapidMX/mapi/badge.svg?branch=main)](https://coveralls.io/github/RapidMX/mapi?branch=main)
-[![npm version](https://img.shields.io/npm/v/@rapidmx/mapi)](https://www.npmjs.com/package/@rapidmx/mapi)
+[![npm version](https://img.shields.io/npm/v/@rapidmx/mapi-plugin)](https://www.npmjs.com/package/@rapidmx/mapi-plugin)
 
 MAPI over HTTP protocol support for a [`@rapidmx/restapi`](https://github.com/RapidMX/restapi)-based mail
 server — covers the pragmatic subset a real Outlook desktop client (and the "New Outlook"/Monarch client, for
@@ -31,16 +31,16 @@ out of scope here - E2E is designed so a real Outlook client needs no protocol c
 restapi's own specs document encrypted-mail search as unachievable from Outlook, not a gap this package could
 close.
 
-A [`@rapidmx/autodiscover`](https://github.com/RapidMX/autodiscover) mount lets real Outlook clients find
+A [`@rapidmx/autodiscover-plugin`](https://github.com/RapidMX/autodiscover) mount lets real Outlook clients find
 this package's endpoints from just an email address.
 
 ## Usage
 
 Mount `MapiEmsmdbRouteMongo`/`SQL` (mailbox/store access) and `MapiNspiRouteMongo`/`SQL` (address book) from
-`@rapidmx/mapi/mongo` or `/sql` at their conventional paths, each with a trivial one-line subclass:
+`@rapidmx/mapi-plugin/mongo` or `/sql` at their conventional paths, each with a trivial one-line subclass:
 
 ```ts
-import { MapiEmsmdbRouteMongo, MapiNspiRouteMongo } from "@rapidmx/mapi/mongo";
+import { MapiEmsmdbRouteMongo, MapiNspiRouteMongo } from "@rapidmx/mapi-plugin/mongo";
 import { RouteDecorators } from "@rapidrest/service-core";
 const { Route } = RouteDecorators;
 

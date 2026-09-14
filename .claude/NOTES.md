@@ -316,3 +316,9 @@ full-suite-only failures (different files, different garbage values each run) ma
 documented `mongodb-memory-server`/raw-socket-client flakiness pattern under load - every affected file passed
 100% in isolation immediately after, and the specific failure was never the same twice. Not committed - left
 staged/unstaged per the standing commit-discipline rule.
+
+### 2026-09-14 — README package names
+
+README still referenced the pre-rename package names (`@rapidmx/mapi`, `@rapidmx/autodiscover`, including the
+npm badge and `import ... from "@rapidmx/mapi/mongo"`). Updated them to `@rapidmx/mapi-plugin` /
+`@rapidmx/autodiscover-plugin`, matching `package.json`. Docs only, no code change, not committed.
