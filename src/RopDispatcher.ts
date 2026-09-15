@@ -25,8 +25,8 @@ export const ERROR_TOO_COMPLEX = 0x80040117;
 /** `RopBufferTooSmall`'s fixed fields: `RopId` and `SizeNeeded`. */
 const BUFFER_TOO_SMALL_HEADER_BYTES = 3;
 
-/** Thrown by `dispatchRops` when the room left can't even hold a `RopBufferTooSmall` for the next ROP. The route
- * answers the whole `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]). The ROPs before it have run. */
+/** Thrown by `dispatchRops`, before any ROP runs, when the room for responses can't even hold a `RopBufferTooSmall`
+ * carrying the whole request. The route answers the `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]). No ROP has run. */
 export class ExecuteBufferTooSmallError extends Error {
     public constructor() {
         super("Execute: MaxRopOut is too small for even a RopBufferTooSmall response.");
@@ -76,11 +76,17 @@ function decodingReader(reader: BufferReader): BufferReader {
  * `ExecuteBudget`, `MAPI_E_TOO_COMPLEX`) takes its place, and the following ROPs still run. The handler has
  * already read its whole request by the time it does work that can fail, so the next ROP is still where the
  * reader points.
- * - **Output space.** `context.ropOutputRemaining` tells each handler how much room is left. A response that still
- * doesn't fit is replaced by `RopBufferTooSmall` (`SizeNeeded` plus the unprocessed request bytes, from this ROP
- * on, for the client to resend) and processing stops. That ROP's side effects have happened, as on Exchange. When
- * even the `RopBufferTooSmall` doesn't fit, `ExecuteBufferTooSmallError` is thrown and the route fails the whole
- * `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]), so no ROP is ever dropped without the client being told.
+ * - **Output space.** Room for a `RopBufferTooSmall` covering the next ROP and everything after it (3 bytes plus
+ * those request bytes) is always kept free. `context.ropOutputRemaining` tells each handler the room left *after*
+ * that reserve (computed from where the reader stands, so once a handler has read its request it excludes the
+ * handler's own bytes). A response that doesn't leave the reserve is replaced by `RopBufferTooSmall` (`SizeNeeded`
+ * plus the unprocessed request bytes, from this ROP on, for the client to resend) and processing stops; that always
+ * fits, because the reserve for this ROP was kept by the one before it. Handlers that change state by how much they
+ * return (`RopQueryRows`, `RopReadStream`, `RopFastTransferSourceGetBuffer`) size their response to the room, so they
+ * are never replaced after moving a cursor. Only when the request as a whole can't be covered by a
+ * `RopBufferTooSmall` is `ExecuteBufferTooSmallError` thrown, before anything runs, and the route answers the
+ * `Execute` with `ecBufferTooSmall` ([MS-OXCRPC]). So a failed `Execute` never follows state already changed and
+ * saved, which a retry would skip past.
  *
  * @author Jean-Philippe Steinmetz
  */
@@ -95,6 +101,17 @@ export async function dispatchRops(
     const reader = decodingReader(new BufferReader(ropsList));
     const writer = new BufferWriter();
     context.budget ??= new ExecuteBudget();
+    /** Room for a RopBufferTooSmall resending the request from `offset` on (nothing when there is nothing left). */
+    const reserveFrom = (offset: number): number => (offset < ropsList.length ? BUFFER_TOO_SMALL_HEADER_BYTES + ropsList.length - offset : 0);
+    if (reserveFrom(0) > maxOutputBytes) {
+        throw new ExecuteBufferTooSmallError();
+    }
+    let remaining = maxOutputBytes;
+    Object.defineProperty(context, "ropOutputRemaining", {
+        configurable: true,
+        enumerable: true,
+        get: () => Math.max(0, remaining - reserveFrom(reader.position)),
+    });
     let processed = 0;
     try {
         // Stops after `maxRops`, so one Execute can't queue unbounded work.
@@ -105,8 +122,7 @@ export async function dispatchRops(
             if (!handler) {
                 throw new DecodeError(`RopDispatcher: unsupported RopId 0x${ropId.toString(16)}.`);
             }
-            const remaining = maxOutputBytes - writer.length;
-            context.ropOutputRemaining = Math.max(0, remaining);
+            remaining = maxOutputBytes - writer.length;
 
             let response: Buffer;
             try {
@@ -120,12 +136,8 @@ export async function dispatchRops(
                 response = failureResponse(handler, ropsList, start, err instanceof WorkBudgetExceededError ? ERROR_TOO_COMPLEX : ERROR_CALL_FAILED);
             }
 
-            if (response.length > remaining) {
-                if (BUFFER_TOO_SMALL_HEADER_BYTES + (ropsList.length - start) > remaining) {
-                    // Not even RopBufferTooSmall fits: the client couldn't be told which ROPs went unprocessed, so the
-                    // whole Execute fails instead of dropping them silently.
-                    throw new ExecuteBufferTooSmallError();
-                }
+            if (response.length + reserveFrom(reader.position) > remaining) {
+                // The reserve kept for this ROP guarantees this fits.
                 writer
                     .writeUInt8(ROP_ID_BUFFER_TOO_SMALL)
                     .writeUInt16LE(Math.min(response.length, 0xffff)) // SizeNeeded

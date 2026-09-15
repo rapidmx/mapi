@@ -478,6 +478,11 @@ export function sessionKey(sessionId: string): string {
     return SESSION_KEY_PREFIX + encodeURIComponent(sessionId) + SESSION_KEY_SUFFIX;
 }
 
+/** The `.last` value marking `requestId` as running. Always serialized the same way, so it can be compared as a string. */
+function inProgressMarker(requestId: string): string {
+    return JSON.stringify({ requestId });
+}
+
 function versionKey(key: string): string {
     return `${key}.version`;
 }
@@ -610,15 +615,20 @@ export class MapiSessionManager {
     /** Records that `requestId` is running on this session, for `SESSION_LOCK_TTL_MS` (renewed along with the lock). A
      * retry of it is then answered as busy instead of running a second time. */
     public async markInProgress(sessionId: string, requestId: string): Promise<void> {
-        await this.store!.putValue(`${sessionKey(sessionId)}.last`, JSON.stringify({ requestId }), SESSION_LOCK_TTL_MS / 1000);
+        await this.store!.putValue(`${sessionKey(sessionId)}.last`, inProgressMarker(requestId), SESSION_LOCK_TTL_MS / 1000);
+    }
+
+    /** Extends the in-progress marker of `requestId` by another `SESSION_LOCK_TTL_MS`, only while it is still that marker:
+     * once the request's response (or anything else) has replaced it, nothing is written. `false` when it wasn't there. */
+    public async renewInProgress(sessionId: string, requestId: string): Promise<boolean> {
+        // The lock scripts are exactly "extend/delete only while the value is still this one".
+        return this.store!.renewLock(`${sessionKey(sessionId)}.last`, inProgressMarker(requestId), SESSION_LOCK_TTL_MS);
     }
 
     /** Drops the in-progress marker of `requestId` when it is still there (the request ended without storing a
-     * response), so a retry runs. */
+     * response), so a retry runs. Atomic, so it never deletes a response stored meanwhile. */
     public async clearInProgress(sessionId: string, requestId: string): Promise<void> {
-        if ((await this.storedResponse(sessionId, requestId)) === "inProgress") {
-            await this.store!.delete(`${sessionKey(sessionId)}.last`);
-        }
+        await this.store!.releaseLock(`${sessionKey(sessionId)}.last`, inProgressMarker(requestId));
     }
 
     /** Remembers `body` as this session's answer to `requestId`. Only the latest request is kept. */

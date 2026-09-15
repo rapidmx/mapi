@@ -195,7 +195,7 @@ describe.each([
         expect(await store.get("b")).toBeUndefined();
         expect(await store.set("b", Buffer.alloc(4), 60, [{ index: "session.s2", maxBytes: 10 }, { index: "user.u1", maxBytes: 11 }])).toBe(false);
 
-        await store.delete("a");
+        await store.delete("a", owners(10, 100));
         expect(await store.set("b", Buffer.alloc(10), 60, owners(10, 100))).toBe(true);
         expect(await store.set("c", Buffer.alloc(1), 60)).toBe(true); // no owners: no quota
     });
@@ -210,7 +210,7 @@ describe.each([
         expect(await store.readChunks("w", 10)).toEqual(Buffer.alloc(10));
         expect(await store.putChunk("x", 0, Buffer.alloc(1), 60)).toBe(true);
 
-        await store.delete("w");
+        await store.delete("w", owners(10, 100));
         expect(await store.readChunks("w", 10)).toBeUndefined();
         expect(await store.set("v", Buffer.alloc(10), 60, owners(10, 100))).toBe(true);
     });
@@ -253,7 +253,7 @@ describe("HandleDataStore quota details", () => {
         await store.set("k", Buffer.from("abc"), 600, handleDataOwners("s1", "u1"));
         expect(client.eval).toHaveBeenLastCalledWith(expect.stringContaining("SETEX"), {
             keys: ["mapi.handle.k", ownerKey("session.s1"), ownerKey("user.u1")],
-            arguments: ["YWJj", "600", "3", String(24 * 60 * 60), "mapi.handle.", "k", String(MAX_HANDLE_DATA_BYTES_PER_SESSION), String(MAX_HANDLE_DATA_BYTES_PER_USER)],
+            arguments: ["mapi.handle.", "k", String(24 * 60 * 60), "1000", "YWJj", "600", "3", String(MAX_HANDLE_DATA_BYTES_PER_SESSION), String(MAX_HANDLE_DATA_BYTES_PER_USER)],
         });
         expect(client.ttls.get(ownerKey("user.u1"))).toBe(24 * 60 * 60);
 

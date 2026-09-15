@@ -31,7 +31,7 @@ import {
 import { assignOrGetMid } from "./MessageTarget.js";
 import { resolveNamedProperty } from "./NamedPropertyRegistry.js";
 import { MAX_RECIPIENTS_PER_MESSAGE } from "./AddressList.js";
-import { asEntity } from "./RestapiRules.js";
+import { asEntity, isInvitePending } from "./RestapiRules.js";
 import { parseAddressList } from "./RopSubmitMessageHandler.js";
 import type { RopContext, RopHandler } from "./RopHandler.js";
 
@@ -81,9 +81,10 @@ const MESSAGE_CLASS_APPOINTMENT_PREFIX = "IPM.Appointment";
  * `"calendarEvent:<uid>"`) a real `CalendarEvent` row, so a subsequent `RopGetPropertiesSpecific` can read it
  * back before `RopSubmitMessage` is ever called (a calendar item must exist as soon as it's saved, the same way
  * a real Exchange server behaves - unlike a mail draft, which this pragmatic subset never persists at all until
- * Submit). Attendees of a saved meeting are invited by restapi's `MeetingSchedulingJob` (see
- * `RopSubmitMessageHandler.submitAppointment`), which is why a meeting is capped at `MAX_RECIPIENTS_PER_MESSAGE`
- * attendees here. Client-supplied times and reminder minutes that don't parse are ignored (the field keeps its
+ * Submit). Saving never invites anyone: a saved revision is stamped as already handled (`inviteSequenceSent =
+ * sequence`), so restapi's `MeetingSchedulingJob` skips it until `RopSubmitMessageHandler.submitAppointment` asks for
+ * invites. Attendees of a submitted meeting are then mailed by that job, which is why a meeting is capped at
+ * `MAX_RECIPIENTS_PER_MESSAGE` attendees here. Client-supplied times and reminder minutes that don't parse are ignored (the field keeps its
  * existing or default value) rather than stored as `Invalid Date`/`NaN`, and an update is versioned (`asEntity`).
  *
  * @author Jean-Philippe Steinmetz
@@ -174,8 +175,15 @@ export class RopSaveChangesMessageHandler implements RopHandler {
                               )
                             : existing.attendees,
                 };
+                const sequence: number = (existing.sequence ?? 0) + (isSchedulingRelevantChange(existing, updated) ? 1 : 0);
                 await context.calendarEventRepo.update(
-                    { ...updated, sequence: (existing.sequence ?? 0) + (isSchedulingRelevantChange(existing, updated) ? 1 : 0) },
+                    {
+                        ...updated,
+                        sequence,
+                        // Saving sends nothing, so this revision counts as handled - unless a submitted revision is still
+                        // waiting for the job, which then sends the meeting as it now stands rather than not at all.
+                        inviteSequenceSent: isInvitePending(existing) ? (existing.inviteSequenceSent ?? null) : sequence,
+                    },
                     asEntity(context.calendarEventRepo, existing),
                     { ignoreACL: true },
                 );
@@ -204,6 +212,8 @@ export class RopSaveChangesMessageHandler implements RopHandler {
                 reminderMinutesBeforeStart: decoded.reminderMinutesBeforeStart,
                 icalUid: `${crypto.randomUUID()}@mapi`,
                 sequence: 0,
+                // Handled until submitted: saving a meeting doesn't invite its attendees.
+                inviteSequenceSent: 0,
             }),
             { ignoreACL: true },
         );

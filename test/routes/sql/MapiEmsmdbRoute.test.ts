@@ -9,7 +9,7 @@ import { Server, ObjectFactory, ConnectionManager, isSqlDataSource, ACLAction, A
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
 import { Repository } from "typeorm";
-import { ContactSQL, FolderSQL, LabelSQL, MailboxSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
+import { ContactSQL, FolderSQL, LabelSQL, MailboxSQL, MeetingSchedulingJobSQL, MessageSQL, TaskSQL } from "@rapidmx/restapi/sql";
 import { FolderType, MessageImportance, RecipientType } from "@rapidmx/restapi";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
 import { cookieHeaderFrom, mapiRequest } from "../../mapiTestClient.js";
@@ -1132,6 +1132,47 @@ describe("Route:MapiEmsmdbRouteSQL Tests", () => {
         expect(sentMessage?.recipients).toEqual([{ address: "recipient@example.com", type: RecipientType.TO }]);
         const savedRaw = await blobStore().get(sentMessage!.bodyBlobKey);
         expect(savedRaw.toString("utf-8")).toContain(bodyText);
+    });
+
+    it("Invites a meeting's attendees only for revisions the client submitted, once each (restapi's MeetingSchedulingJob).", async () => {
+        mailTransport().sent = [];
+        await createMailbox(owner.uid);
+        const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+        const job: any = await objectFactory.newInstance(MeetingSchedulingJobSQL, { name: "MeetingSchedulingJobSQL" });
+        const attendee = `${uuid.v4()}@example.com`;
+        const invites = () => mailTransport().sent.filter((message) => message.envelopeTo.includes(attendee)).length;
+        const run = async (rops: Buffer): Promise<number> => {
+            const result = await execute(cookie, encodeRopBuffer({ ropsList: rops, handleTable: [0xffffffff, 0xffffffff] }));
+            const reader = new BufferReader(result.body);
+            reader.readBytes(12);
+            return decodeRopBuffer(reader.readBytes(reader.readUInt32LE())).ropsList.readUInt32LE(2);
+        };
+        const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+        const create = new BufferWriter().writeUInt8(0x06).writeUInt8(0).writeUInt8(0).writeUInt8(3).writeUInt16LE(0).writeBigUInt64LE(5n).writeUInt8(0).toBuffer();
+        const values = new BufferWriter();
+        writeTaggedPropertyValue(values, { propertyId: 0x001a, propertyType: PropertyType.PtypString, value: "IPM.Appointment" });
+        writeTaggedPropertyValue(values, { propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Planning" });
+        writeTaggedPropertyValue(values, { propertyId: 0x0e04, propertyType: PropertyType.PtypString, value: attendee });
+        const valueBytes = values.toBuffer();
+        const setProperties = new BufferWriter().writeUInt8(0x0a).writeUInt8(0).writeUInt8(3).writeUInt16LE(2 + valueBytes.length).writeUInt16LE(3).writeBytes(valueBytes).toBuffer();
+        const save = new BufferWriter().writeUInt8(0x0c).writeUInt8(0).writeUInt8(7).writeUInt8(3).writeUInt8(0).toBuffer();
+        const submit = new BufferWriter().writeUInt8(0x32).writeUInt8(0).writeUInt8(3).writeUInt8(0).toBuffer();
+
+        await execute(cookie, encodeRopBuffer({ ropsList: logon, handleTable: [0xffffffff] }));
+        expect(await run(create)).toBe(0);
+        expect(await run(setProperties)).toBe(0);
+        expect(await run(save)).toBe(0);
+        await job.run();
+        expect(invites()).toBe(0); // saved, never sent
+
+        expect(await run(submit)).toBe(0);
+        await job.run();
+        await job.run();
+        expect(invites()).toBe(1);
+
+        expect(await run(save)).toBe(0); // saved again without sending
+        await job.run();
+        expect(invites()).toBe(1);
     });
 
     it("Resolves named properties into stable, session-scoped numeric IDs starting at 0x8000 (RopGetPropertyIdsFromNames).", async () => {

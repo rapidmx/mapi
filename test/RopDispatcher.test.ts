@@ -86,24 +86,45 @@ describe("RopDispatcher Tests", () => {
         );
     });
 
-    it("Tells each handler the room left and answers RopBufferTooSmall, with the unprocessed request, when a response doesn't fit.", async () => {
+    it("Tells each handler the room left after the RopBufferTooSmall reserve, and answers RopBufferTooSmall, with the unprocessed request, when a response doesn't leave it.", async () => {
         const seen: number[] = [];
         const handlers = new Map<number, RopHandler>([
-            [0x40, { ropId: 0x40, handle: (reader, writer, context) => { seen.push(context.ropOutputRemaining!); writer.writeBytes(Buffer.alloc(reader.readUInt8())); } }],
+            [0x40, { ropId: 0x40, handle: (reader, writer, context) => { const size = reader.readUInt8(); seen.push(context.ropOutputRemaining!); writer.writeBytes(Buffer.alloc(size)); } }],
         ]);
         const context = makeContext();
 
         const response = await dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, context, { maxOutputBytes: 13 });
 
-        expect(seen).toEqual([13, 7]);
+        // 13 less a RopBufferTooSmall for the 4 bytes after the first ROP (7) leaves 6; then 7 less 5 leaves 2.
+        expect(seen).toEqual([6, 2]);
         expect(response).toEqual(Buffer.concat([Buffer.alloc(6), Buffer.from([0xff, 8, 0, 0x40, 8, 0x40, 1])]));
         expect(context.ropOutputRemaining).toBeUndefined();
 
-        // No room even for RopBufferTooSmall: the whole Execute fails rather than dropping ROPs silently.
+        // The last ROP needs no reserve after it.
+        const last = await dispatchRops(Buffer.from([0x40, 6, 0x40, 2]), handlers, makeContext(), { maxOutputBytes: 13 });
+        expect(last).toEqual(Buffer.alloc(8));
+
+        // No room for a RopBufferTooSmall of the whole request: the Execute fails before any ROP runs.
+        seen.length = 0;
         await expect(dispatchRops(Buffer.from([0x40, 6, 0x40, 8, 0x40, 1]), handlers, makeContext(), { maxOutputBytes: 8 })).rejects.toBeInstanceOf(ExecuteBufferTooSmallError);
+        expect(seen).toEqual([]);
         // Never more than a 16-bit RopSize can describe.
         const huge = new Map<number, RopHandler>([[0x41, { ropId: 0x41, handle: (_reader, writer) => void writer.writeBytes(Buffer.alloc(70000)) }]]);
         expect(await dispatchRops(Buffer.from([0x41]), huge, makeContext(), { maxOutputBytes: 1 << 20 })).toEqual(Buffer.from([0xff, 0xff, 0xff, 0x41]));
+    });
+
+    it("Never fails an Execute after a ROP has run: a response that would eat the reserve becomes RopBufferTooSmall from that ROP.", async () => {
+        const ran: number[] = [];
+        const handlers = new Map<number, RopHandler>([
+            [0x42, { ropId: 0x42, handle: (reader, writer) => { const size = reader.readUInt8(); ran.push(size); writer.writeBytes(Buffer.alloc(size)); } }],
+        ]);
+        // 20 bytes of room; the request is 8 bytes, so 11 must stay free before the first ROP runs.
+        const request = Buffer.from([0x42, 4, 0x42, 10, 0x42, 1, 0x42, 1]);
+        const response = await dispatchRops(request, handlers, makeContext(), { maxOutputBytes: 20 });
+        // ROP 1 (4 bytes) leaves 16 >= 3 + 6. ROP 2 (10 bytes) would leave 6 < 3 + 4, so it is resent from there.
+        expect(ran).toEqual([4, 10]);
+        expect(response).toEqual(Buffer.concat([Buffer.alloc(4), Buffer.from([0xff, 10, 0]), request.subarray(2)]));
+        expect(response.length).toBeLessThanOrEqual(20);
     });
 
     it("Returns an empty buffer for an empty ropsList.", async () => {

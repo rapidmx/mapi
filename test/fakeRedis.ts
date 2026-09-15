@@ -11,7 +11,7 @@ import {
     RENEW_LOCK_SCRIPT,
     TOUCH_USER_INDEX_SCRIPT,
 } from "../src/MapiSessionManager.js";
-import { DELETE_OWNED_SCRIPT, PUT_CHUNK_WITH_QUOTA_SCRIPT, SET_WITH_QUOTA_SCRIPT } from "../src/rop/HandleDataCache.js";
+import { DELETE_OWNED_SCRIPT, DELETE_WITH_OWNERS_SCRIPT, PUT_CHUNK_WITH_QUOTA_SCRIPT, SET_WITH_QUOTA_SCRIPT } from "../src/rop/HandleDataCache.js";
 
 /** A node-redis stand-in holding values in Maps. `eval` applies the semantics of each script the store runs, so the
  * store's handling of each result can be exercised without a Redis server. Scripts run synchronously, like Redis. */
@@ -87,27 +87,44 @@ export class FakeRedisClient {
                 return 1;
             }
             case SET_WITH_QUOTA_SCRIPT: {
-                const size = Number(args[2]);
-                if (keys.slice(1).some((index, i) => this.ownerTotal(index, args[4], args[5]) + size > Number(args[6 + i]))) {
+                const [prefix, member, indexTtl, recountMs] = args;
+                const size = Number(args[6]);
+                if (keys.slice(1).some((index, i) => !this.admits(index, member, size, Number(args[7 + i]), prefix, Number(recountMs)))) {
                     return 0;
                 }
-                this.setValue(keys[0], args[0], Number(args[1]));
-                this.recordOwners(keys.slice(1), args[5], size, Number(args[3]));
+                this.setValue(keys[0], args[4], Number(args[5]));
+                this.recordOwners(keys.slice(1), member, size, Number(indexTtl));
                 return 1;
             }
             case PUT_CHUNK_WITH_QUOTA_SCRIPT: {
+                const [prefix, member, indexTtl, recountMs] = args;
                 const hash = this.hashes.get(keys[0]) ?? new Map<string, string>();
-                let size = Number(args[2]);
-                for (const [field, value] of hash) {
-                    size += field === args[6] ? 0 : Math.floor((value.length * 3) / 4);
-                }
-                if (keys.slice(1).some((index, i) => this.ownerTotal(index, args[4], args[5]) + size > Number(args[7 + i]))) {
+                const field = args[7];
+                if (!hash.has(field) && hash.size > Number(args[8])) {
                     return 0;
                 }
-                hash.set(args[6], args[0]);
+                const size = Math.max(Number(hash.get("size") ?? 0), Number(field) + Number(args[6]));
+                if (keys.slice(1).some((index, i) => !this.admits(index, member, size, Number(args[9 + i]), prefix, Number(recountMs)))) {
+                    return 0;
+                }
+                hash.set(field, args[4]);
+                hash.set("size", String(size));
                 this.hashes.set(keys[0], hash);
-                this.ttls.set(keys[0], Number(args[1]));
-                this.recordOwners(keys.slice(1), args[5], size, Number(args[3]));
+                this.ttls.set(keys[0], Number(args[5]));
+                this.recordOwners(keys.slice(1), member, size, Number(indexTtl));
+                return 1;
+            }
+            case DELETE_WITH_OWNERS_SCRIPT: {
+                await this.del(keys[0]);
+                for (const index of keys.slice(1)) {
+                    const old = this.sortedSets.get(index)?.get(args[0]);
+                    if (old !== undefined) {
+                        this.sortedSets.get(index)!.delete(args[0]);
+                        if (this.values.has(`${index}.total`)) {
+                            this.values.set(`${index}.total`, String(Number(this.values.get(`${index}.total`)) - old));
+                        }
+                    }
+                }
                 return 1;
             }
             case DELETE_OWNED_SCRIPT: {
@@ -116,6 +133,8 @@ export class FakeRedisClient {
                     await this.del(args[0] + member);
                 }
                 this.sortedSets.delete(keys[0]);
+                this.values.delete(`${keys[0]}.total`);
+                this.recountMarkers.delete(`${keys[0]}.recount`);
                 return members;
             }
             default:
@@ -152,23 +171,51 @@ export class FakeRedisClient {
         this.ttls.set(key, ttl);
     }
 
-    /** The live members' sizes in an owner index, dropping members whose data is gone, leaving out `member`. */
-    private ownerTotal(index: string, prefix: string, member: string): number {
+    /** Counts of how many times each owner index was recounted from its members, for tests. */
+    public readonly recounts = new Map<string, number>();
+    /** Recount rate limit markers (`<index>.recount`) -> when they expire (ms). */
+    public readonly recountMarkers = new Map<string, number>();
+
+    /** Rebuilds an owner index's total from its members whose data still exists. */
+    private recount(index: string, prefix: string): number {
+        this.recounts.set(index, (this.recounts.get(index) ?? 0) + 1);
         const set = this.sortedSets.get(index) ?? new Map<string, number>();
         let total = 0;
         for (const [name, size] of set) {
             if (!this.values.has(prefix + name) && !this.hashes.has(prefix + name)) {
                 set.delete(name);
-            } else if (name !== member) {
+            } else {
                 total += size;
             }
         }
+        this.values.set(`${index}.total`, String(total));
         return total;
+    }
+
+    /** The script's `admits`: the running total decides, recounted (rate limited) only when it would refuse. */
+    private admits(index: string, member: string, bytes: number, maxBytes: number, prefix: string, recountMs: number): boolean {
+        const stored = this.values.get(`${index}.total`);
+        let total = stored !== undefined ? Number(stored) : this.recount(index, prefix);
+        let old = this.sortedSets.get(index)?.get(member) ?? 0;
+        if (total - old + bytes <= maxBytes) {
+            return true;
+        }
+        const marker = `${index}.recount`;
+        if (stored === undefined || (this.recountMarkers.get(marker) ?? 0) > Date.now()) {
+            return false;
+        }
+        this.recountMarkers.set(marker, Date.now() + recountMs);
+        total = this.recount(index, prefix);
+        old = this.sortedSets.get(index)?.get(member) ?? 0;
+        return total - old + bytes <= maxBytes;
     }
 
     private recordOwners(indexes: string[], member: string, size: number, ttl: number): void {
         for (const index of indexes) {
-            this.sortedSets.set(index, (this.sortedSets.get(index) ?? new Map<string, number>()).set(member, size));
+            const set = this.sortedSets.get(index) ?? new Map<string, number>();
+            const old = set.get(member) ?? 0;
+            this.sortedSets.set(index, set.set(member, size));
+            this.values.set(`${index}.total`, String(Number(this.values.get(`${index}.total`) ?? 0) + size - old));
             this.ttls.set(index, ttl);
         }
     }

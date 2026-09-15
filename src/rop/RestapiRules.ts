@@ -46,3 +46,12 @@ export function asEntity<T>(repo: RepoUtils<any>, row: T): T {
 export function literalQueryValue(value: string): QueryLiteral {
     return ModelUtils.literal(value);
 }
+
+/**
+ * restapi `MeetingSchedulingJob`'s eligibility rule (`jobs/MeetingSchedulingJob.ts`, `processInviteCandidates`): `true`
+ * while the job will still send invites for `event`'s current revision, i.e. its `inviteSequenceSent` is unset or
+ * differs from its `sequence`. Keep in sync with that job.
+ */
+export function isInvitePending(event: { sequence?: number; inviteSequenceSent?: number | null }): boolean {
+    return event.inviteSequenceSent == null || event.inviteSequenceSent !== event.sequence;
+}

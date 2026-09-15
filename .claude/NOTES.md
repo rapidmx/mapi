@@ -600,3 +600,55 @@ Not committed; package version unchanged. `@rapidmx/restapi` and the other `@rap
 - `asEntity` kept (doc comment updated): 2.1.0 locks plain documents too, so it is now defence in depth.
 - Final: `yarn lint` and `npx tsc --noEmit -p .` clean; `yarn vitest run --coverage` 680/680, 100%
   statements/functions/lines, 98.95% branches.
+
+### 2026-09-14 (7) — Round-6 review fixes (quota accounting, RopBufferTooSmall reserve, invites, markers)
+
+All 4 findings were checked against the code and were real; none skipped. Not committed; no version or peerDependency
+changes. 707 tests pass (was 680); coverage 100% statements/functions/lines, 98.97% branches; `yarn lint` and
+`npx tsc --noEmit -p .` clean.
+
+- **Quota accounting is O(1) (1, HIGH).** The chunk script walked every chunk (HKEYS + HSTRLEN) and every owner member
+  (EXISTS) on each write, inside Redis's thread. Now (`HandleDataCache.ts`):
+  - A write stream's hash keeps a `size` field (end of its furthest chunk). The stream is charged that size, so a retried
+    write at the same offset still replaces its chunk and isn't charged twice. `MAX_CHUNKS_PER_STREAM = 8192` (HLEN
+    check; a rewrite of an existing offset is still accepted). Chunks are still unpadded base64url, no longer needed for
+    sizing.
+  - Each owner index keeps a running total in `<index>.total` (always the sum of the zset's scores). `admits` checks it
+    and only when it would refuse does a full recount (prunes members whose data key is gone), rate limited by
+    `SET <index>.recount NX PX OWNER_RECOUNT_INTERVAL_MS (1000)`. An index without a total (pre-round-6 data, expiry)
+    is recounted first. Totals only over-count.
+  - `HandleDataStore.delete(key, owners?)`: with owners, `DELETE_WITH_OWNERS_SCRIPT` subtracts the key right away. The
+    route's released-handle cleanup and Submit's chunk delete pass `handleDataOwners`. `deleteOwnedBy` also deletes the
+    index's total and marker; the user index isn't touched (healed by the next recount).
+  - Script ARGV now starts with prefix, member, index ttl, recount ms (`ownerScriptArguments`). The memory store mirrors
+    it (per-stream size/offsets, per-index total + `recountAfter`; a stream counts as live while its first chunk is).
+  - `test/fakeRedis.ts` emulates the new scripts, exposes `recounts`, and honors the recount marker with `Date.now()`.
+- **RopBufferTooSmall reserve (2).** `dispatchRops` keeps room for a RopBufferTooSmall covering the next ROP and the rest
+  of the request (`3 + remaining request bytes`). `context.ropOutputRemaining` is now a getter: room left minus the reserve
+  from the reader's current position (so after a handler reads its request it excludes its own bytes). A response that
+  doesn't leave the reserve becomes RopBufferTooSmall from that ROP, which always fits. `ExecuteBufferTooSmallError` is
+  thrown only before any ROP runs (MaxRopOut can't hold a RopBufferTooSmall of the whole request), so ecBufferTooSmall
+  never follows saved state and nothing is stored for its X-RequestId. This reinstates a pre-run check that round 5
+  rejected: an Execute whose request is bigger than its MaxRopOut room now fails even if its responses would have fit
+  (real clients send MaxRopOut ~0x10008 with requests <= 32767, so this doesn't arise in practice). ReadStream/QueryRows/
+  GetBuffer size to the getter, so they are never replaced after moving a cursor.
+- **Invites only for submitted revisions (3).** `RopSaveChangesMessage` creates meetings with `inviteSequenceSent: 0` and
+  stamps an update with the new `sequence`, unless a submitted revision is still waiting for the job
+  (`isInvitePending(existing)`, in `RestapiRules.ts`, mirrors the job's check), in which case the existing value (or
+  null) is kept so the job still sends, now the edited meeting. Deliberate: dropping a submitted-but-unsent invite was
+  judged worse than sending the edit. `submitAppointment` (organizer copy only): pending -> nothing; else versioned
+  update `{uid, version, inviteSequenceSent: null}` (`asEntity`). The job only claims pending rows, so a version
+  conflict is another edit (attendee reply, REST): re-read and retry, `MAX_INVITE_REQUEST_ATTEMPTS = 3`, then throw
+  (MAPI_E_CALL_FAILED); a row gone on re-read -> `MAPI_E_NOT_FOUND`. Re-submitting a revision the job already sent
+  sends it again. Integration tests run restapi's real `MeetingSchedulingJobMongo`/`SQL` (`objectFactory.newInstance`)
+  against save-only, repeated submit, save-then-submit and edit-save-without-send; null writes work on both backends.
+- **In-progress markers (4).** The renewal timer chains renewals (`renewing` promise, awaited in `finally` before
+  `clearInProgress`), stops the interval when `renewLock` returns false (errors keep it going), and calls the new
+  `MapiSessionManager.renewInProgress`, which extends `.last` only while it still equals this request's marker (reuses
+  `renewLock`'s compare-and-PEXPIRE with the marker JSON as token). `clearInProgress` is now atomic via `releaseLock`
+  (compare-and-delete). `markInProgress` stays unconditional (it replaces the previous request's stored response).
+- Tests: new `test/Round6Review.test.ts`; updated `RopDispatcher.test.ts` (reserve-adjusted room), `Round5Review.test.ts`
+  (deletes pass owners, new ARGV order), Mongo route tests (renewal sequencing, lost-lock stop, pre-run ecBufferTooSmall
+  with nothing stored, ReadStream -> RopBufferTooSmall replayed from the store, meeting invite flow) and a SQL invite flow.
+- Lesson: mongo route test's renewal test needs a real `setTimeout` pause after the fake ticks, since renewals are now
+  sequential and the request can finish before the second one runs.

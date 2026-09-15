@@ -16,7 +16,7 @@ import { BufferReader, BufferWriter, DecodeError } from "./codec/BufferCursor.js
 import { decodeRopBuffer, encodeRopBuffer, type RopBuffer } from "./codec/RopBuffer.js";
 import { MapiSessionContext, MapiSessionManager, SESSION_LOCK_RENEW_MS, takeReleasedHandleData } from "./MapiSessionManager.js";
 import { dispatchRops, ExecuteBufferTooSmallError, MAX_ROPS_LIST_BYTES } from "./RopDispatcher.js";
-import type { HandleDataStore } from "./rop/HandleDataCache.js";
+import { handleDataOwners, type HandleDataStore } from "./rop/HandleDataCache.js";
 import { handleDataStoreOf, type RopContext, type RopHandler } from "./rop/RopHandler.js";
 import { ScanPipeline } from "@rapidmx/restapi/scan";
 import { Folder, Mailbox, RecoverableRepoUtils, recordAuditLog, resolveCallerMailboxUid, type BlobStore } from "@rapidmx/restapi";
@@ -39,8 +39,8 @@ const ERROR_SESSION_TOO_BIG = 0x80040305;
  * session context. Sent when the session changed underneath this request (see `MapiSessionManager.save()`). */
 const RESPONSE_CODE_INVALID_SEQUENCE = 15;
 
-/** `ecBufferTooSmall` ([MS-OXCRPC]), the body `ErrorCode` when even a `RopBufferTooSmall` response doesn't fit in the
- * client's `MaxRopOut`. */
+/** `ecBufferTooSmall` ([MS-OXCRPC]), the body `ErrorCode` when the client's `MaxRopOut` can't even hold a
+ * `RopBufferTooSmall` carrying the whole request. No ROP has run by then. */
 const ERROR_BUFFER_TOO_SMALL = 0x0000047d;
 
 /** The largest `RopBufferSize` accepted - the `[MS-OXCRPC]` ROP input buffer limit. */
@@ -305,8 +305,10 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
      * instead of running its ROPs twice. A request that ends without a stored response drops its marker.
      * `MapiSequence` isn't validated - the lock and the replay cache cover what it guards against here.
      * - **Output size.** ROP responses are held to the client's `MaxRopOut`, less the `RopSize` field and handle
-     * table, and to what a 16-bit `RopSize` can describe (see `dispatchRops`). When not even a `RopBufferTooSmall`
-     * fits, the whole `Execute` answers `ecBufferTooSmall` in the body `ErrorCode`.
+     * table, and to what a 16-bit `RopSize` can describe (see `dispatchRops`). Room for a `RopBufferTooSmall` covering
+     * the rest of the request is kept free as ROPs run, so a response that doesn't fit is always answered that way (a
+     * normal, stored response). Only a `MaxRopOut` too small for a `RopBufferTooSmall` of the whole request answers
+     * `ecBufferTooSmall` in the body `ErrorCode`, before any ROP runs, so nothing is stored and a retry changes nothing.
      * - **Released handles.** Once the session is saved, the FastTransfer streams and write-stream chunks of handles
      * the request released are deleted from the shared store; `Disconnect` and session eviction delete a session's
      * whole set.
@@ -332,17 +334,27 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         }
         const running: { requestId?: string } = {};
         // Renewed while the request runs, so a slow Execute never loses its lock (or its in-progress marker) to a retry.
+        // Renewals run one after another, and stop once the lock is lost. The marker is only extended while it is still
+        // this request's marker, so a renewal landing after the response was stored never turns it back into a marker.
+        let renewing: Promise<void> = Promise.resolve();
         const renewal = setInterval(() => {
-            void this.sessionManager!.renewLock(sessionId, lockToken).catch(() => undefined);
-            if (running.requestId) {
-                void this.sessionManager!.markInProgress(sessionId, running.requestId).catch(() => undefined);
-            }
+            renewing = renewing.then(async () => {
+                const held: boolean = await this.sessionManager!.renewLock(sessionId, lockToken).catch(() => true);
+                if (!held) {
+                    clearInterval(renewal);
+                    return;
+                }
+                if (running.requestId) {
+                    await this.sessionManager!.renewInProgress(sessionId, running.requestId).catch(() => undefined);
+                }
+            });
         }, SESSION_LOCK_RENEW_MS);
         renewal.unref();
         try {
             await this.executeLocked(req, res, user, running);
         } finally {
             clearInterval(renewal);
+            await renewing;
             if (running.requestId) {
                 await this.sessionManager!.clearInProgress(sessionId, running.requestId).catch(() => undefined);
             }
@@ -415,7 +427,8 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
         if (saved === "saved") {
             // Streams and write chunks of handles this request released; best effort, they expire anyway.
             const store: HandleDataStore = handleDataStoreOf(context);
-            await Promise.all(released.map((key) => store.delete(key).catch(() => undefined)));
+            const owners = handleDataOwners(session.uid, session.userUid);
+            await Promise.all(released.map((key) => store.delete(key, owners).catch(() => undefined)));
         }
         if (!Buffer.isBuffer(dispatched) && !(dispatched.error instanceof ExecuteBufferTooSmallError)) {
             throw dispatched.error instanceof DecodeError ? new ApiError(ApiErrors.INVALID_REQUEST, 400, ApiErrorMessages.INVALID_REQUEST) : dispatched.error;
@@ -434,7 +447,7 @@ export abstract class BaseMapiEmsmdbRoute<M extends Mailbox> {
             return;
         }
         if (!Buffer.isBuffer(dispatched)) {
-            // [MS-OXCRPC] ecBufferTooSmall: not even a RopBufferTooSmall response fits in what the client allows.
+            // [MS-OXCRPC] ecBufferTooSmall: not even a RopBufferTooSmall of the whole request fits, so no ROP ran.
             this.sendExecuteFailure(res, 0, ERROR_BUFFER_TOO_SMALL);
             return;
         }

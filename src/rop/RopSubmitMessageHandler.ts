@@ -4,6 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as crypto from "crypto";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
+import { ApiErrors } from "@rapidrest/service-core";
 import {
     findOrCreateWellKnownFolder,
     FolderType,
@@ -15,10 +16,11 @@ import {
 import type { BufferReader, BufferWriter } from "../codec/BufferCursor.js";
 import type { MapiObjectHandle } from "../MapiSessionManager.js";
 import { MAX_RECIPIENTS_PER_MESSAGE, parseRecipientList, resolveRecipientList, type ResolvedRecipient } from "./AddressList.js";
-import { writeStreamKey } from "./HandleDataCache.js";
+import { handleDataOwners, writeStreamKey } from "./HandleDataCache.js";
 import { submitMeetingResponse } from "./MeetingMessageClassHandler.js";
 import { handleDataStoreOf, type RopContext, type RopHandler } from "./RopHandler.js";
 import { readWriteStream } from "./RopWriteStreamHandler.js";
+import { asEntity, isInvitePending } from "./RestapiRules.js";
 
 const ROP_ID_SUBMIT_MESSAGE = 0x32;
 
@@ -291,17 +293,20 @@ export class RopSubmitMessageHandler implements RopHandler {
      * is nothing left to store and nothing is sent from here.
      *
      * **Invites are restapi's `MeetingSchedulingJob`'s job.** That job sends an iTIP `REQUEST` for every
-     * organizer-owned event whose `inviteSequenceSent` differs from its `sequence`, which includes every meeting saved
-     * through MAPI (created at sequence 0, bumped on scheduling-relevant edits). It claims each revision with a
-     * versioned update before sending, builds the invite with restapi's own `buildEventIcs` (so a recurring meeting's
-     * invite carries its `RRULE` and exceptions), and sends each revision once. An earlier version also sent its own
-     * single-instance `REQUEST` here without stamping `inviteSequenceSent`, so attendees got two invites (one wrong
-     * for a recurring meeting), and every repeated Submit relayed another. Letting the job send is the only way to get
-     * one correct invite; the trade-off is that a saved meeting's invites go out on the job's next run even if the
-     * client never submits it, which is also how a meeting created through REST behaves.
+     * organizer-owned event whose `inviteSequenceSent` differs from its `sequence`, claiming each revision with a
+     * versioned update before sending and building the invite with restapi's own `buildEventIcs` (so a recurring
+     * meeting's invite carries its `RRULE` and exceptions). Saving stamps `inviteSequenceSent = sequence`, so a meeting
+     * that is only saved ("Save & Close", or "save changes but don't send") invites no one. Submitting clears the stamp
+     * (`inviteSequenceSent: null`) with a versioned update, which makes the job send the current revision exactly once.
+     * - A revision that is already waiting for the job (submitted and not yet sent, or never stamped) is left alone, so
+     * submitting it again before the job runs doesn't cause a second invite.
+     * - The update is versioned (`asEntity`). The job only ever claims a waiting revision, so a conflict here comes from
+     * some other edit (an attendee's reply updating the row, a REST edit); the row is read again and the check repeated,
+     * up to `MAX_INVITE_REQUEST_ATTEMPTS` times, after which the ROP fails (`MAPI_E_CALL_FAILED`).
+     * - Submitting a revision the job has already sent sends it again: the client asked to send.
      *
      * Only the organizer's own copy may be submitted (an attendee's copy of someone else's meeting answers
-     * `MAPI_E_INVALID_OBJECT`, as before), and a success response is returned either way for the organizer.
+     * `MAPI_E_INVALID_OBJECT`, as before, and nothing is changed).
      */
     private async submitAppointment(handle: MapiObjectHandle, context: RopContext, writer: BufferWriter, inputHandleIndex: number): Promise<void> {
         const uid = handle.entityUid.startsWith("calendarEvent:") ? handle.entityUid.slice("calendarEvent:".length) : undefined;
@@ -309,8 +314,43 @@ export class RopSubmitMessageHandler implements RopHandler {
         const mailbox = event?.mailboxUid === context.mailboxUid ? await context.mailboxRepo.findOne(context.mailboxUid, { ignoreACL: true }) : undefined;
         const callerAddresses: string[] = mailbox ? [mailbox.primarySmtpAddress, ...(mailbox.aliasAddresses ?? [])].map((a: string) => a.toLowerCase()) : [];
         const isOrganizer = !!event && callerAddresses.includes((event.organizer?.address ?? "").toLowerCase());
-        writeResult(writer, inputHandleIndex, isOrganizer ? 0 : ERROR_INVALID_OBJECT);
+        if (!isOrganizer) {
+            writeResult(writer, inputHandleIndex, ERROR_INVALID_OBJECT);
+            return;
+        }
+        writeResult(writer, inputHandleIndex, (await requestInvites(context, uid!, event)) ? 0 : ERROR_NOT_FOUND);
     }
+}
+
+/** How many times `requestInvites` re-reads a row whose versioned update lost to another edit before giving up. */
+export const MAX_INVITE_REQUEST_ATTEMPTS = 3;
+
+/** Makes restapi's `MeetingSchedulingJob` send invites for the organizer copy `event`'s current revision (see
+ * `submitAppointment`). `false` when the row disappeared meanwhile. */
+async function requestInvites(context: RopContext, uid: string, event: CalendarEvent): Promise<boolean> {
+    let row: CalendarEvent | undefined = event;
+    for (let attempt = 0; attempt < MAX_INVITE_REQUEST_ATTEMPTS; attempt++) {
+        if (!row) {
+            return false;
+        }
+        if (isInvitePending(row)) {
+            return true;
+        }
+        try {
+            await context.calendarEventRepo.update(
+                { uid: (row as any).uid, version: (row as any).version, inviteSequenceSent: null } as any,
+                asEntity(context.calendarEventRepo, row),
+                { ignoreACL: true },
+            );
+            return true;
+        } catch (err: any) {
+            if (err?.code !== ApiErrors.INVALID_OBJECT_VERSION) {
+                throw err;
+            }
+            row = await context.calendarEventRepo.findOne(uid, { ignoreACL: true });
+        }
+    }
+    throw new Error("RopSubmitMessage: the meeting kept changing while its invites were requested.");
 }
 
 /** A recipient as nodemailer's `MailComposer` takes it: a display name only when there is one. */
@@ -341,7 +381,7 @@ async function resolveDraftBody(context: RopContext, messageHandleIndex: number,
             const raw = await readWriteStream(context, Number(index), candidate);
             // The chunks are only needed for this one submit; best effort, they expire anyway.
             await handleDataStoreOf(context)
-                .delete(writeStreamKey(context.session.uid, Number(index), candidate.generation))
+                .delete(writeStreamKey(context.session.uid, Number(index), candidate.generation), handleDataOwners(context.session.uid, context.session.userUid))
                 .catch(() => undefined);
             return raw?.toString("utf16le").replace(/\0+$/, "");
         }

@@ -15,7 +15,7 @@ import config from "../../config.js";
 import { MongoConnection, MongoRepository, Server, ObjectFactory, ConnectionManager, ACLAction } from "@rapidrest/service-core";
 import { JWTUtils, Logger } from "@rapidrest/core";
 import * as uuid from "uuid";
-import { ContactMongo, FolderMongo, LabelMongo, MailboxMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
+import { ContactMongo, FolderMongo, LabelMongo, MailboxMongo, MeetingSchedulingJobMongo, MessageMongo, TaskMongo } from "@rapidmx/restapi/mongo";
 import { FolderType, MessageImportance, RecipientType } from "@rapidmx/restapi";
 import { MongoMemoryServer } from "mongodb-memory-server";
 import { InMemoryBlobStore, RecordingMailTransport, registerTestDoubles } from "../../testDoubles.js";
@@ -25,7 +25,7 @@ import { decodeGuid, encodeGuid } from "../../../src/codec/MapiGuid.js";
 import { PropertyType, readPropertyValue, writePropertyTag, writeTaggedPropertyValue, type TaggedPropertyValue } from "../../../src/codec/PropertyValue.js";
 import { decodeRopBuffer, encodeRopBuffer } from "../../../src/codec/RopBuffer.js";
 import { MapiSessionManager, SESSION_LOCK_RENEW_MS } from "../../../src/MapiSessionManager.js";
-import { MemoryHandleDataStore } from "../../../src/rop/HandleDataCache.js";
+import { handleDataCache, handleDataKey, MemoryHandleDataStore } from "../../../src/rop/HandleDataCache.js";
 
 const mongod: MongoMemoryServer = new MongoMemoryServer({
     instance: {
@@ -444,6 +444,84 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             expect(result.body.readUInt32LE(12)).toBe(0); // no RopBuffer
         });
 
+        it("Checks MaxRopOut before running any ROP, so an ecBufferTooSmall answer leaves nothing changed or stored.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const logon = new BufferWriter().writeUInt8(0xfe).writeUInt8(0).writeUInt8(0).writeUInt8(0x01).writeUInt32LE(0).writeUInt32LE(0).writeUInt16LE(0).toBuffer();
+            const ropBuffer = encodeRopBuffer({ ropsList: logon, handleTable: [0xffffffff] });
+            const send = (maxRopOut: number) =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:21" },
+                    new BufferWriter().writeUInt32LE(0).writeUInt32LE(ropBuffer.length).writeBytes(ropBuffer).writeUInt32LE(maxRopOut).writeUInt32LE(0).toBuffer(),
+                );
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            const storeResponse = vi.spyOn(MapiSessionManager.prototype, "storeResponse");
+            try {
+                const tooSmall = await send(16);
+                expect(tooSmall.body.readUInt32LE(4)).toBe(0x47d);
+                expect(save.mock.calls[0][0].handles[0]).toBeUndefined(); // RopLogon never ran
+                expect(storeResponse).not.toHaveBeenCalled();
+
+                // A retry of the same request id with room runs normally.
+                const retry = await send(0x10008);
+                expect(retry.body.readUInt32LE(4)).toBe(0);
+                expect(save.mock.calls[1][0].handles[0]).toMatchObject({ type: "logon" });
+                expect(storeResponse).toHaveBeenCalledTimes(1);
+            } finally {
+                save.mockRestore();
+                storeResponse.mockRestore();
+            }
+        });
+
+        it("Answers RopBufferTooSmall for a RopReadStream with no room, storing that response for a retry and keeping the stream position.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const sessionId = decodeURIComponent(/MapiContext=([^;]+)/.exec(cookie)![1]);
+            const readStream = new BufferWriter().writeUInt8(0x2c).writeUInt8(0).writeUInt8(6).writeUInt16LE(10).toBuffer();
+            const loadSession = MapiSessionManager.prototype.load;
+            const load = vi.spyOn(MapiSessionManager.prototype, "load").mockImplementation(async function (this: MapiSessionManager, id: string) {
+                const session = await loadSession.call(this, id);
+                if (session && !session.handles[6]) {
+                    session.handles[6] = { type: "stream", entityUid: "", streamPosition: 0, generation: "g" };
+                }
+                return session;
+            });
+            handleDataCache.set(handleDataKey(sessionId, 6, "g"), Buffer.from("stream body bytes"));
+            const ropBuffer = encodeRopBuffer({ ropsList: readStream, handleTable: [0xffffffff] });
+            // RopSize (2) and one handle (4) leave 8 bytes: exactly a RopBufferTooSmall for the 5-byte request, and no data.
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(ropBuffer.length).writeBytes(ropBuffer).writeUInt32LE(14).writeUInt32LE(0).toBuffer();
+            const send = () =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:22" },
+                    body,
+                );
+            const save = vi.spyOn(MapiSessionManager.prototype, "save");
+            try {
+                const result = await send();
+                expect(result.headers["x-responsecode"]).toBe("0");
+                expect(result.body.readUInt32LE(4)).toBe(0);
+                const reader = new BufferReader(result.body);
+                reader.readBytes(12);
+                const responseRops = decodeRopBuffer(reader.readBytes(reader.readUInt32LE())).ropsList;
+                expect(responseRops[0]).toBe(0xff);
+                expect(responseRops.readUInt16LE(1)).toBe(8 + 10); // SizeNeeded: the header plus the 10 bytes asked for
+                expect(responseRops.subarray(3)).toEqual(readStream);
+                expect(save.mock.calls[0][0].handles[6].streamPosition).toBe(0);
+
+                const retry = await send();
+                expect(retry.body.equals(result.body)).toBe(true);
+                expect(save).toHaveBeenCalledTimes(1);
+            } finally {
+                load.mockRestore();
+                save.mockRestore();
+                handleDataCache.delete(handleDataKey(sessionId, 6, "g"));
+            }
+        });
+
         it("Checks session ownership before taking the lock, and refreshes the session's place in the per-user cap.", async () => {
             await createMailbox(owner.uid);
             const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
@@ -535,7 +613,7 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             }
         });
 
-        it("Renews the session lock and the in-progress marker while a request runs, best effort.", async () => {
+        it("Renews the session lock and the in-progress marker while a request runs, best effort, one renewal at a time.", async () => {
             await createMailbox(owner.uid);
             const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
             const empty = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
@@ -550,31 +628,92 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             }) as any);
             const renewLock = vi.spyOn(MapiSessionManager.prototype, "renewLock").mockRejectedValueOnce(new Error("redis down"));
             const markInProgress = vi.spyOn(MapiSessionManager.prototype, "markInProgress");
+            const renewInProgress = vi.spyOn(MapiSessionManager.prototype, "renewInProgress");
             const originalSave = MapiSessionManager.prototype.save;
             // The renewal fires while the request is still running (during its save): once failing, once succeeding.
             const save = vi.spyOn(MapiSessionManager.prototype, "save").mockImplementationOnce(async function (this: MapiSessionManager, session: any) {
-                markInProgress.mockRejectedValueOnce(new Error("redis down"));
+                renewInProgress.mockRejectedValueOnce(new Error("redis down"));
                 tick!();
                 tick!();
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                return originalSave.call(this, session);
+            });
+            const send = () =>
+                mapiRequest(
+                    server.getApplication(),
+                    baseUrl,
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:9" },
+                    body,
+                );
+            try {
+                const result = await send();
+                expect(result.headers["x-responsecode"]).toBe("0");
+                expect(renewLock).toHaveBeenCalledTimes(2);
+                expect(markInProgress).toHaveBeenCalledTimes(1); // only at the start
+                expect(renewInProgress).toHaveBeenCalledTimes(2);
+
+                // A renewal landing after the response was stored finds the lock released and writes nothing, so a retry
+                // still gets the stored response instead of an in-progress answer.
+                tick!();
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                expect(renewLock).toHaveBeenCalledTimes(3);
+                expect(renewInProgress).toHaveBeenCalledTimes(2);
+                const retry = await send();
+                expect(retry.headers["x-responsecode"]).toBe("0");
+                expect(retry.body.equals(result.body)).toBe(true);
+            } finally {
+                interval.mockRestore();
+                renewLock.mockRestore();
+                markInProgress.mockRestore();
+                renewInProgress.mockRestore();
+                save.mockRestore();
+            }
+        });
+
+        it("Stops renewing once the lock is lost.", async () => {
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const empty = encodeRopBuffer({ ropsList: Buffer.alloc(0), handleTable: [] });
+            const body = new BufferWriter().writeUInt32LE(0).writeUInt32LE(empty.length).writeBytes(empty).writeUInt32LE(0x10008).writeUInt32LE(0).toBuffer();
+            const realSetInterval = global.setInterval;
+            let tick: (() => void) | undefined;
+            let renewalTimer: any;
+            const interval = vi.spyOn(global, "setInterval").mockImplementation(((callback: () => void, ms: number) => {
+                const timer = realSetInterval(() => undefined, 1 << 30);
+                if (ms === SESSION_LOCK_RENEW_MS) {
+                    tick = callback;
+                    renewalTimer = timer;
+                }
+                return timer;
+            }) as any);
+            const clear = vi.spyOn(global, "clearInterval");
+            const renewLock = vi.spyOn(MapiSessionManager.prototype, "renewLock").mockResolvedValueOnce(false);
+            const renewInProgress = vi.spyOn(MapiSessionManager.prototype, "renewInProgress");
+            const originalSave = MapiSessionManager.prototype.save;
+            let stoppedEarly = false;
+            const save = vi.spyOn(MapiSessionManager.prototype, "save").mockImplementationOnce(async function (this: MapiSessionManager, session: any) {
+                tick!();
+                await new Promise((resolve) => setTimeout(resolve, 20));
+                // Stopped as soon as the renewal saw the lock gone, before the request finished.
+                stoppedEarly = clear.mock.calls.some(([timer]) => timer === renewalTimer);
                 return originalSave.call(this, session);
             });
             try {
                 const result = await mapiRequest(
                     server.getApplication(),
                     baseUrl,
-                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:9" },
+                    { Authorization: "jwt " + ownerToken, "X-RequestType": "Execute", "Content-Type": "application/mapi-http", Cookie: cookie, "X-RequestId": "{guid}:11" },
                     body,
                 );
                 expect(result.headers["x-responsecode"]).toBe("0");
-                expect(renewLock).toHaveBeenCalledTimes(2);
-                expect(markInProgress).toHaveBeenCalledTimes(3); // once at the start, twice renewed
-                // Once the response is stored the marker isn't renewed any more.
-                tick!();
-                expect(markInProgress).toHaveBeenCalledTimes(3);
+                expect(stoppedEarly).toBe(true);
+                expect(renewLock).toHaveBeenCalledTimes(1);
+                expect(renewInProgress).not.toHaveBeenCalled();
             } finally {
                 interval.mockRestore();
+                clear.mockRestore();
                 renewLock.mockRestore();
-                markInProgress.mockRestore();
+                renewInProgress.mockRestore();
                 save.mockRestore();
             }
         });
@@ -1792,6 +1931,58 @@ describe("Route:MapiEmsmdbRouteMongo Tests", () => {
             } finally {
                 del.mockRestore();
             }
+        });
+
+        it("Invites a meeting's attendees only for revisions the client submitted, once each (restapi's MeetingSchedulingJob).", async () => {
+            mailTransport().sent = [];
+            await createMailbox(owner.uid);
+            const cookie = cookieHeaderFrom((await connect()).headers["set-cookie"]);
+            const job: any = await objectFactory.newInstance(MeetingSchedulingJobMongo, { name: "MeetingSchedulingJobMongo" });
+            const first = `${uuid.v4()}@example.com`;
+            const second = `${uuid.v4()}@example.com`;
+            const invitesTo = (address: string) => mailTransport().sent.filter((message) => message.envelopeTo.includes(address)).length;
+            const run = async (rops: Buffer): Promise<number> => {
+                const result = await execute(cookie, encodeRopBuffer({ ropsList: rops, handleTable: [0xffffffff, 0xffffffff] }));
+                const reader = new BufferReader(result.body);
+                reader.readBytes(12);
+                return decodeRopBuffer(reader.readBytes(reader.readUInt32LE())).ropsList.readUInt32LE(2);
+            };
+            const attendees = (list: string) => buildSetPropertiesRops(3, [
+                { propertyId: 0x001a, propertyType: PropertyType.PtypString, value: "IPM.Appointment" },
+                { propertyId: 0x0037, propertyType: PropertyType.PtypString, value: "Planning" },
+                { propertyId: 0x0e04, propertyType: PropertyType.PtypString, value: list },
+            ]);
+
+            await execute(cookie, encodeRopBuffer({ ropsList: buildLogonRops(0), handleTable: [0xffffffff] }));
+            expect(await run(buildCreateMessageRops(0, 3, 5n))).toBe(0);
+            expect(await run(attendees(first))).toBe(0);
+
+            // Save & Close without sending: nobody is invited.
+            expect(await run(buildSaveChangesMessageRops(7, 3))).toBe(0);
+            await job.run();
+            expect(invitesTo(first)).toBe(0);
+
+            // Submitting the saved meeting invites once, however often the job runs or the client repeats the submit
+            // before it does.
+            expect(await run(buildSubmitMessageRops(3))).toBe(0);
+            expect(await run(buildSubmitMessageRops(3))).toBe(0);
+            await job.run();
+            await job.run();
+            expect(invitesTo(first)).toBe(1);
+
+            // An edit saved without sending (a new attendee bumps the sequence) invites nobody.
+            expect(await run(attendees(`${first}; ${second}`))).toBe(0);
+            expect(await run(buildSaveChangesMessageRops(7, 3))).toBe(0);
+            await job.run();
+            expect(invitesTo(first)).toBe(1);
+            expect(invitesTo(second)).toBe(0);
+
+            // Sending that edit later sends the edited meeting once.
+            expect(await run(buildSubmitMessageRops(3))).toBe(0);
+            await job.run();
+            await job.run();
+            expect(invitesTo(first)).toBe(2);
+            expect(invitesTo(second)).toBe(1);
         });
 
         it("Composes and sends a real message end to end, saving a Sent Items copy.", async () => {
