@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0-beta.4] - 2026-09-15
+
+### Changed
+- Update the README to the @rapidmx/mapi-plugin package name
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Only use an EMSMDB session for Execute and Disconnect when it belongs to the signed-in user
+- Bound NSPI GetMatches search patterns to the regex length limit and limit queries to the requested row count
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Reject oversized or truncated ROP buffers with 400, cap handle tables at 255 and property tag arrays at 256, and limit ROPs per Execute
+- Load MAPI sessions from Redis on every request with compare-and-set saves, cap sessions per user and session lifetime, and re-check mailbox ownership each Execute
+- Keep MAPI hard deletes recoverable and audited since legal holds can't be checked from the plugin, walk folder deletes iteratively within the caller's mailbox with depth and size limits
+- Page folder and contents table queries explicitly instead of the silent 100-row default, and cache parsed message bodies and FastTransfer streams outside the session
+- Cap write streams, FastTransfer data and named properties, bump meeting sequence on meaningful changes, and only let organizers send invites
+- Update only the caller's own copy on meeting responses and send an iTIP reply, and store the relayed Message-ID and raw message in Sent Items
+- Keep minute precision in time zone decoding with a UTC fallback, reject CR/LF in recipient addresses, and release streams with their handles
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Keep FastTransfer streams in a shared store and fail the ROP instead of paging a rebuilt, different stream
+- Enforce MaxRopOut and the 16-bit RopSize limit, trimming ReadStream/GetBuffer/QueryRows output and answering RopBufferTooSmall
+- Use random handle generations, cap session size and tracked MIDs, and store write-stream chunks outside the session
+- Decline a single occurrence as a recurrence exception with a RECURRENCE-ID reply instead of deleting the series
+- Isolate a failing ROP to its own error response and decode recurrence blobs with exceptions
+- Lock each session during Execute and replay the stored response for a repeated X-RequestId
+- Cap per-Execute rows and built bytes, decode native Outlook GlobalObjectIds, and return NOT_FOUND on no match
+- Parse resolved display names in recipient lists, return X-ResponseCode 10 for a missing session, and enforce the per-user session cap atomically
+- Fail meeting replies the transport rejects
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Mark mail and meeting-response drafts submitted after any submit attempt and refuse further submits or edits, capping submits per Execute and recipients per message
+- Charge folder walks, hierarchy fetches, contents windows and deletes against new per-Execute query and row budgets, and charge message bodies before parsing
+- Delete FastTransfer and write-stream data from Redis on release and session end, cap stored bytes per session and user, and dedupe CopyProperties tags
+- Look meetings up by bounded, exact-matched iCalendar UID, version-check updates of plain rows, and leave invites to restapi's MeetingSchedulingJob
+- Answer ecBufferTooSmall when RopBufferTooSmall itself can't fit, and add declined override occurrences to the series exceptions
+- Check session ownership before locking, renew the lock while running, and answer busy for a request id already in progress
+- Stop ReadStream reporting a false end of stream, match recipient display names literally, evict the least recently used session, ignore unparseable dates and reminders, and pick the oldest well-known folder at logon
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Updated @rapidrest/service-core to ^2.1.0 as both the dev dependency and the peer range
+- Use ModelUtils.literal() for client-supplied contact display names and meeting iCalendar UIDs instead of eq() query strings
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Charge write-stream chunks and owner byte quotas in constant time with running totals, a chunk cap per stream and rate-limited recounts, so repeated tiny writes can't stall Redis
+- Reserve room for a RopBufferTooSmall response before each ROP so a response that doesn't fit is answered in place instead of discarding already-saved work
+- Stamp inviteSequenceSent on appointment saves and request exactly one invite per submitted revision, so meetings that are only saved don't mail attendees
+- Renew the in-progress marker only while it is still this request's, run renewals sequentially and stop them when the lock is lost
+- Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
+- Upgraded restapi dep
+
 ## [1.0.0-beta.3] - 2026-09-14
 
 ### Added
@@ -107,7 +151,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - Removed unused files
 
-[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.3...HEAD
+[Unreleased]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.4...HEAD
+[1.0.0-beta.4]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.3...v1.0.0-beta.4
 [1.0.0-beta.3]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/RapidMX/mapi/compare/v1.0.0-beta.0...v1.0.0-beta.1
