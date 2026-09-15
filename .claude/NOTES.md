@@ -576,3 +576,27 @@ out of scope and not touched. Not committed; no version or peerDependency change
 - Lesson: the Bash tool also rejects some heredocs containing apostrophes inside a quoted `'PYEOF'` block; the Write tool
   plus a script file is reliable. Some test files flip to CRLF on disk after edits, so string-replace scripts should
   normalize `\r\n` first.
+
+### 2026-09-14 (6) — `@rapidrest/service-core` 2.1.0 migration
+
+Not committed; package version unchanged. `@rapidmx/restapi` and the other `@rapidmx` deps left at `^0.9.0`.
+
+- **Deps.** service-core devDependency `^2.0.0` -> `^2.1.0`, peerDependency `2.x` -> `^2.1.0`; `yarn install`
+  installed 2.1.0.
+- **Suite before any code change: 680/680 passing** (57 files), coverage thresholds met. None of the 2.1.0 breaking
+  changes (allowExistingACL on creates, stricter dates, 400 for `$or`/`$and`/`$` keys, plain-doc locking, duplicate
+  key 400/409, recordACL truncate cap, Redis error handlers, auth fallthrough, per-IP anonymous `@RateLimit`, SQL
+  `insert()`) broke a test. restapi 0.9.0's code paths this plugin reaches (`findOrCreateWellKnownFolder`, which
+  creates the folder ACL at the new folder's own uid, Sent Items/Outbox `messageRepo.create`) did not hit
+  `IDENTIFIER_EXISTS`; no restapi blocker for mapi.
+- **Simplification.** `RestapiRules.literalQueryValue()` now returns `ModelUtils.literal(value)` instead of the
+  hand-built `eq(${value})` string (used for the client-supplied contact display name in `AddressList` and the
+  meeting `icalUid` in `MeetingMessageClassHandler`). Same result for every value that could match before; the only
+  difference is that `me`, `null` and numeric-looking strings are no longer substituted/coerced (previously they
+  matched nothing or threw and were treated as no match), so e.g. a contact literally named `me` now resolves. The
+  in-memory exact re-check and the try/catch stay. Unit tests that asserted the `eq(...)` string now assert
+  `ModelUtils.literal(...)` (`MeetingMessageClassHandler.test.ts`, `RopSubmitMessageHandler.test.ts`,
+  `Round5Review.test.ts`).
+- `asEntity` kept (doc comment updated): 2.1.0 locks plain documents too, so it is now defence in depth.
+- Final: `yarn lint` and `npx tsc --noEmit -p .` clean; `yarn vitest run --coverage` 680/680, 100%
+  statements/functions/lines, 98.95% branches.

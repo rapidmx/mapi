@@ -9,6 +9,7 @@ import { assignOrGetNamedPropertyId } from "../../src/rop/NamedPropertyRegistry.
 import { submitMeetingResponse } from "../../src/rop/MeetingMessageClassHandler.js";
 import type { RopContext } from "../../src/rop/RopHandler.js";
 import { AttendeeResponseStatus, AttendeeRole } from "@rapidmx/restapi";
+import { ModelUtils } from "@rapidrest/service-core";
 
 const PSETID_MEETING = "6ed8da90-450b-101b-98da-00aa003f1305";
 const LID_GLOBAL_OBJECT_ID = 0x00000003;
@@ -68,7 +69,7 @@ describe("submitMeetingResponse Tests", () => {
         await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context);
 
         expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith(
-            { icalUid: "eq(evt-uid@example.com)", mailboxUid: "mailbox-1", limit: 100 },
+            { icalUid: ModelUtils.literal("evt-uid@example.com"), mailboxUid: "mailbox-1", limit: 100 },
             { ignoreACL: true, limit: 100 },
         );
     });
@@ -80,7 +81,7 @@ describe("submitMeetingResponse Tests", () => {
         expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", properties, context)).toBe(0x8004010f);
 
         expect((context.calendarEventRepo as any).find).toHaveBeenCalledWith(
-            { icalUid: "eq(unknown@example.com)", mailboxUid: "mailbox-1", limit: 100 },
+            { icalUid: ModelUtils.literal("unknown@example.com"), mailboxUid: "mailbox-1", limit: 100 },
             { ignoreACL: true, limit: 100 },
         );
     });
@@ -425,7 +426,7 @@ describe("submitMeetingResponse Tests", () => {
         zeroed.fill(0, 16, 20);
         const hexUid = zeroed.toString("hex").toUpperCase();
         const event = { uid: "evt1", version: 1, icalUid: hexUid.toLowerCase(), attendees: [{ address: "caller@example.com" }] };
-        const find = vi.fn().mockImplementation((query: any) => Promise.resolve(query.icalUid === `eq(${hexUid.toLowerCase()})` ? [event] : []));
+        const find = vi.fn().mockImplementation((query: any) => Promise.resolve(query.icalUid?.value === hexUid.toLowerCase() ? [event] : []));
         const context = makeContext({
             calendarEventRepo: { find, update: vi.fn().mockResolvedValue(undefined) } as any,
             mailboxRepo: { findOne: vi.fn().mockResolvedValue({ primarySmtpAddress: "caller@example.com", aliasAddresses: [] }) } as any,
@@ -434,7 +435,7 @@ describe("submitMeetingResponse Tests", () => {
 
         expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", { [String(id)]: blob.toString("base64") }, context)).toBe(0);
 
-        expect(find.mock.calls.map((call) => call[0].icalUid)).toEqual([`eq(${hexUid})`, `eq(${hexUid.toLowerCase()})`]);
+        expect(find.mock.calls.map((call) => call[0].icalUid)).toEqual([ModelUtils.literal(hexUid), ModelUtils.literal(hexUid.toLowerCase())]);
         expect((context.calendarEventRepo as any).update).toHaveBeenCalledTimes(1);
     });
 
@@ -466,7 +467,7 @@ describe("submitMeetingResponse Tests", () => {
 
             expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Neg", globalObjectIdProperty(context.session, "ne(x)"), context)).toBe(0x8004010f);
 
-            expect(find.mock.calls[0][0].icalUid).toBe("eq(ne(x))");
+            expect(find.mock.calls[0][0].icalUid).toEqual(ModelUtils.literal("ne(x)"));
             expect((context.calendarEventRepo as any).delete).not.toHaveBeenCalled();
         });
 
@@ -479,7 +480,7 @@ describe("submitMeetingResponse Tests", () => {
             const context = makeContext({ calendarEventRepo: { find, update: vi.fn().mockResolvedValue(undefined) } as any, mailboxRepo: mailboxRepo() as any });
 
             expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(context.session, longUid), context)).toBe(0);
-            expect(find.mock.calls[0][0].icalUid).toBe(`eq(${stored})`);
+            expect(find.mock.calls[0][0].icalUid).toEqual(ModelUtils.literal(stored));
 
             const rejecting = makeContext({ calendarEventRepo: { find: vi.fn().mockRejectedValue(new Error("unknown operator")) } as any, mailboxRepo: mailboxRepo() as any });
             expect(await submitMeetingResponse("IPM.Schedule.Meeting.Resp.Pos", globalObjectIdProperty(rejecting.session, "Me"), rejecting)).toBe(0x8004010f);

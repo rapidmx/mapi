@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 // Round-5 review fixes below the route: the query/fetch/submit work budget, handle data quotas and cleanup, session
 // lock renewal and least-recently-used eviction, submitted drafts, draft value validation and literal lookups.
-import { BaseEntity } from "@rapidrest/service-core";
+import { BaseEntity, ModelUtils } from "@rapidrest/service-core";
 import { FolderType } from "@rapidmx/restapi";
 import { BufferReader, BufferWriter } from "../src/codec/BufferCursor.js";
 import { PropertyType, writeTaggedPropertyValue } from "../src/codec/PropertyValue.js";
@@ -536,7 +536,7 @@ describe("Literal lookups and restapi rules", () => {
         const first = await resolveRecipientList("ne(x)", { mailboxUid: "m", contactRepo: { find } as any });
         const second = await resolveRecipientList("me", { mailboxUid: "m", contactRepo: { find } as any });
 
-        expect(find.mock.calls[0][0].displayName).toBe("eq(ne(x))");
+        expect(find.mock.calls[0][0].displayName).toEqual(ModelUtils.literal("ne(x)"));
         expect(first).toEqual({ recipients: [], unresolved: ["ne(x)"], invalid: [] });
         expect(second.unresolved).toEqual(["me"]);
     });
@@ -547,7 +547,7 @@ describe("Literal lookups and restapi rules", () => {
         const long = "x".repeat(MAX_INDEXED_VALUE_LENGTH + 1);
         expect(boundIndexedValue(long)).toMatch(/^sha256:[0-9a-f]{64}$/);
         expect(boundIndexedValue(boundIndexedValue(long))).toBe(boundIndexedValue(long));
-        expect(literalQueryValue("a(b)")).toBe("eq(a(b))");
+        expect(literalQueryValue("a(b)")).toEqual(ModelUtils.literal("a(b)"));
 
         class Entity extends BaseEntity {}
         const instance = new Entity({ uid: "u" });

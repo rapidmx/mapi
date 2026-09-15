@@ -8,6 +8,7 @@ import { RopSubmitMessageHandler } from "../../src/rop/RopSubmitMessageHandler.j
 import { handleDataStoreOf, type RopContext } from "../../src/rop/RopHandler.js";
 import { MapiSessionContext } from "../../src/MapiSessionManager.js";
 import { AvVerdict, FolderType, SpamVerdict } from "@rapidmx/restapi";
+import { ModelUtils } from "@rapidrest/service-core";
 import { InMemoryBlobStore } from "../testDoubles.js";
 import { writeStreamKey } from "../../src/rop/RopWriteStreamHandler.js";
 import { MAX_RECIPIENTS_PER_MESSAGE } from "../../src/rop/AddressList.js";
@@ -252,7 +253,7 @@ describe("RopSubmitMessageHandler Tests", () => {
 
     it("Sends to resolved 'Name <address>' recipients (split on ';' only) and to bare display names matching one contact.", async () => {
         const contactFind = vi.fn().mockImplementation((query: any) =>
-            Promise.resolve(query.displayName === "eq(Ada Lovelace)" ? [{ displayName: "Ada Lovelace", emails: [{ address: "not valid" }, { address: "ada@example.com" }] }] : []),
+            Promise.resolve(query.displayName?.value === "Ada Lovelace" ? [{ displayName: "Ada Lovelace", emails: [{ address: "not valid" }, { address: "ada@example.com" }] }] : []),
         );
         const context = makeContext({ contactRepo: { find: contactFind } as any });
         context.session.handles[5] = {
@@ -268,7 +269,7 @@ describe("RopSubmitMessageHandler Tests", () => {
         response.readUInt8();
         response.readUInt8();
         expect(response.readUInt32LE()).toBe(0);
-        expect(contactFind).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: "eq(Ada Lovelace)", limit: 2 }, { ignoreACL: true, limit: 2 });
+        expect(contactFind).toHaveBeenCalledWith({ mailboxUid: "mailbox-1", displayName: ModelUtils.literal("Ada Lovelace"), limit: 2 }, { ignoreACL: true, limit: 2 });
         const [rawSent, envelope] = (context.scanPipeline as any).run.mock.calls[0];
         expect(envelope.to).toEqual(["jane@example.com", "ada@example.com", "john@example.com"]);
         const parsed = await simpleParser(rawSent as Buffer);

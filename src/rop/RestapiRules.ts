@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
 import { createHash } from "crypto";
-import { BaseEntity, type RepoUtils } from "@rapidrest/service-core";
+import { BaseEntity, ModelUtils, type QueryLiteral, type RepoUtils } from "@rapidrest/service-core";
 
 // Copies of restapi rules that @rapidmx/restapi 0.9.0 doesn't export from its package root. Keep them in sync with
 // restapi's `util/ConversationUtils.ts` (`boundIndexedValue`) and `util/EntityUtils.ts` (`asEntity`).
@@ -24,10 +24,11 @@ export function boundIndexedValue<T extends string | null | undefined>(value: T)
 }
 
 /**
- * restapi's `asEntity`: `row` as an instance of `repo`'s model class. `RepoUtils.update()` only enforces its optimistic
- * lock when `existing instanceof BaseEntity`, and the Mongo backend's `find()`/`findOne()` return plain documents, so
- * passing one straight through turns a versioned update into an unconditional overwrite. SQL rows are already
- * instances and pass through as they are.
+ * restapi's `asEntity`: `row` as an instance of `repo`'s model class. Before service-core 2.1.0, `RepoUtils.update()`
+ * only enforced its optimistic lock when `existing instanceof BaseEntity`, and the Mongo backend's `find()`/`findOne()`
+ * return plain documents, so passing one straight through turned a versioned update into an unconditional overwrite.
+ * 2.1.0 also locks plain documents carrying a numeric `version`, so this is now defence in depth, kept while restapi
+ * keeps its own copy. SQL rows are already instances and pass through as they are.
  */
 export function asEntity<T>(repo: RepoUtils<any>, row: T): T {
     if (row instanceof BaseEntity) {
@@ -38,12 +39,10 @@ export function asEntity<T>(repo: RepoUtils<any>, row: T): T {
 }
 
 /**
- * A string for a `RepoUtils` query that always matches `value` literally. A bare query string of the form `op(x)`
- * (`ne(x)`, `regex(x)`, ...) is read by service-core as an operator, so a client- or sender-supplied value is wrapped in
- * `eq(...)`, service-core's literal escape (its operator pattern is greedy, so `eq(ne(x))` compares against `ne(x)`).
- * service-core may still coerce the operand (`null`, numbers, `me`), so callers also compare the returned rows'
- * field against `value` themselves.
+ * A `RepoUtils` query value that always matches `value` literally: service-core's `ModelUtils.literal()`, so a
+ * client- or sender-supplied value like `ne(x)` is never read as an operator and `me`/`null`/numeric strings are not
+ * substituted or coerced. Callers still compare the returned rows' field against `value` themselves.
  */
-export function literalQueryValue(value: string): string {
-    return `eq(${value})`;
+export function literalQueryValue(value: string): QueryLiteral {
+    return ModelUtils.literal(value);
 }
